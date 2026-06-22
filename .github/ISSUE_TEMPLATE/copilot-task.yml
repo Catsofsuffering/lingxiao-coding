@@ -1,0 +1,72 @@
+name: Copilot Task
+description: Create a well-scoped task for GitHub Copilot cloud agent.
+title: "[Copilot Task] "
+labels:
+  - copilot-task
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for tasks you may assign to GitHub Copilot cloud agent.
+        Keep the task narrow, concrete, and independently verifiable.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or goal
+      description: Describe the bug, gap, or change request in plain language.
+      placeholder: What should Copilot fix or implement?
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List the concrete conditions that define done.
+      placeholder: |
+        - The workflow behaves as ...
+        - A regression test is added or updated
+        - The UI shows ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Expected files or areas to touch
+      description: Point Copilot toward the likely parts of the repository.
+      placeholder: |
+        - src/web-server/...
+        - web/src/stores/...
+        - scripts/build.mjs
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation steps
+      description: Tell Copilot how to verify the change.
+      placeholder: |
+        - npm run build:server
+        - npm test
+        - npx tsx --test web/src/...
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and non-goals
+      description: Record boundaries, exclusions, or implementation preferences.
+      placeholder: |
+        - Keep changes scoped
+        - Do not change unrelated UI copy
+        - Avoid new dependencies unless necessary
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Optional links, screenshots, logs, or related issues/PRs.
