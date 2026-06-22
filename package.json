@@ -135,7 +135,7 @@
     "string-width": "^8.2.0",
     "strip-ansi": "^7.2.0",
     "tesseract.js": "^7.0.0",
-    "undici": "^8.0.2",
+    "undici": "^8.5.0",
     "unzipper": "^0.12.3",
     "wrap-ansi": "^10.0.0",
     "yaml": "^2.9.0",
