@@ -31,3 +31,4 @@ When working in this repository, keep changes narrow and finish with clear verif
 
 - Summarize user-visible impact, key files changed, and exact validation performed.
 - Call out any follow-up manual GitHub settings work if code alone does not complete the task.
+- For GitHub Project automation changes, keep field names, project numbers, and GraphQL mutations aligned with the live Project configuration and mention any required secrets or Project-side setup in the PR.

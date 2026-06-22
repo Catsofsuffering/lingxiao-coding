@@ -1,0 +1,284 @@
+name: Sync Project Roadmap
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+      - assigned
+      - unassigned
+      - closed
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to sync into the GitHub Project roadmap fields
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  sync-project-item:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: project-roadmap-sync-${{ github.event.issue.number || inputs.issue_number }}
+      cancel-in-progress: false
+    env:
+      PROJECT_OWNER: hexian2001
+      PROJECT_NUMBER: "3"
+      STATUS_FIELD_NAME: Status
+      START_DATE_FIELD_NAME: Start date
+      TARGET_DATE_FIELD_NAME: Target date
+      DEFAULT_TARGET_OFFSET_DAYS: "7"
+    steps:
+      - name: Ensure Projects token is configured
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "PROJECTS_TOKEN is not configured."
+            echo "Add a classic personal access token with at least repo and project scopes."
+            exit 1
+          fi
+
+      - name: Resolve issue number
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ISSUE_NUMBER=${{ inputs.issue_number }}" >> "$GITHUB_ENV"
+          else
+            echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Load project metadata and issue item state
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='
+            query(
+              $owner: String!
+              $repo: String!
+              $projectNumber: Int!
+              $issueNumber: Int!
+            ) {
+              user(login: $owner) {
+                projectV2(number: $projectNumber) {
+                  id
+                  fields(first: 50) {
+                    nodes {
+                      ... on ProjectV2Field {
+                        id
+                        name
+                        dataType
+                      }
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        dataType
+                        options {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              repository(owner: $owner, name: $repo) {
+                issue(number: $issueNumber) {
+                  id
+                  state
+                  assignees(first: 20) {
+                    totalCount
+                  }
+                  projectItems(first: 20) {
+                    nodes {
+                      id
+                      project {
+                        number
+                      }
+                      fieldValues(first: 30) {
+                        nodes {
+                          ... on ProjectV2ItemFieldDateValue {
+                            date
+                            field {
+                              ... on ProjectV2FieldCommon {
+                                id
+                                name
+                              }
+                            }
+                          }
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                            optionId
+                            field {
+                              ... on ProjectV2FieldCommon {
+                                id
+                                name
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' \
+            -F owner="$PROJECT_OWNER" \
+            -F repo="$REPOSITORY_NAME" \
+            -F projectNumber="$PROJECT_NUMBER" \
+            -F issueNumber="$ISSUE_NUMBER" \
+            > project_sync_data.json
+
+          echo "PROJECT_ID=$(jq -r '.data.user.projectV2.id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "STATUS_FIELD_ID=$(jq -r --arg name "$STATUS_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "START_DATE_FIELD_ID=$(jq -r --arg name "$START_DATE_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "TARGET_DATE_FIELD_ID=$(jq -r --arg name "$TARGET_DATE_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "TODO_OPTION_ID=$(jq -r --arg name "$STATUS_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .options[] | select(.name == "Todo") | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "IN_PROGRESS_OPTION_ID=$(jq -r --arg name "$STATUS_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .options[] | select(.name == "In Progress") | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "DONE_OPTION_ID=$(jq -r --arg name "$STATUS_FIELD_NAME" '.data.user.projectV2.fields.nodes[] | select(.name == $name) | .options[] | select(.name == "Done") | .id' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "ISSUE_STATE=$(jq -r '.data.repository.issue.state' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "ASSIGNEE_COUNT=$(jq -r '.data.repository.issue.assignees.totalCount' project_sync_data.json)" >> "$GITHUB_ENV"
+          echo "ITEM_ID=$(jq -r --argjson projectNumber "$PROJECT_NUMBER" '.data.repository.issue.projectItems.nodes[] | select(.project.number == $projectNumber) | .id' project_sync_data.json | head -n 1)" >> "$GITHUB_ENV"
+          echo "CURRENT_START_DATE=$(jq -r --arg fieldName "$START_DATE_FIELD_NAME" '.data.repository.issue.projectItems.nodes[]?.fieldValues.nodes[]? | select(.field.name == $fieldName) | .date' project_sync_data.json | head -n 1)" >> "$GITHUB_ENV"
+          echo "CURRENT_TARGET_DATE=$(jq -r --arg fieldName "$TARGET_DATE_FIELD_NAME" '.data.repository.issue.projectItems.nodes[]?.fieldValues.nodes[]? | select(.field.name == $fieldName) | .date' project_sync_data.json | head -n 1)" >> "$GITHUB_ENV"
+
+      - name: Validate project metadata
+        if: ${{ env.ITEM_ID != '' }}
+        run: |
+          set -euo pipefail
+          for value_name in \
+            PROJECT_ID \
+            STATUS_FIELD_ID \
+            START_DATE_FIELD_ID \
+            TARGET_DATE_FIELD_ID \
+            TODO_OPTION_ID \
+            IN_PROGRESS_OPTION_ID \
+            DONE_OPTION_ID
+          do
+            value="${!value_name:-}"
+            if [ -z "$value" ] || [ "$value" = "null" ]; then
+              echo "Missing required project metadata: $value_name"
+              exit 1
+            fi
+          done
+
+      - name: Skip issues outside the tracked project
+        if: ${{ env.ITEM_ID == '' }}
+        run: echo "Issue #$ISSUE_NUMBER is not in project #$PROJECT_NUMBER; skipping."
+
+      - name: Compute desired roadmap values
+        if: ${{ env.ITEM_ID != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$ISSUE_STATE" = "CLOSED" ]; then
+            echo "STATUS_OPTION_ID=$DONE_OPTION_ID" >> "$GITHUB_ENV"
+          elif [ "${ASSIGNEE_COUNT:-0}" -gt 0 ]; then
+            echo "STATUS_OPTION_ID=$IN_PROGRESS_OPTION_ID" >> "$GITHUB_ENV"
+          else
+            echo "STATUS_OPTION_ID=$TODO_OPTION_ID" >> "$GITHUB_ENV"
+          fi
+
+          if [ "${ASSIGNEE_COUNT:-0}" -gt 0 ] && [ -z "$CURRENT_START_DATE" ]; then
+            echo "DESIRED_START_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
+          fi
+
+          if [ "${ASSIGNEE_COUNT:-0}" -gt 0 ] && [ -z "$CURRENT_TARGET_DATE" ]; then
+            echo "DESIRED_TARGET_DATE=$(date -u -d "+${DEFAULT_TARGET_OFFSET_DAYS} days" +%F)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Sync status field
+        if: ${{ env.ITEM_ID != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='
+            mutation(
+              $project: ID!
+              $item: ID!
+              $field: ID!
+              $value: String!
+            ) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { singleSelectOptionId: $value }
+              }) {
+                projectV2Item {
+                  id
+                }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f item="$ITEM_ID" \
+            -f field="$STATUS_FIELD_ID" \
+            -f value="$STATUS_OPTION_ID" \
+            --silent
+
+      - name: Seed start date
+        if: ${{ env.ITEM_ID != '' && env.DESIRED_START_DATE != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='
+            mutation(
+              $project: ID!
+              $item: ID!
+              $field: ID!
+              $value: Date!
+            ) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { date: $value }
+              }) {
+                projectV2Item {
+                  id
+                }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f item="$ITEM_ID" \
+            -f field="$START_DATE_FIELD_ID" \
+            -f value="$DESIRED_START_DATE" \
+            --silent
+
+      - name: Seed target date
+        if: ${{ env.ITEM_ID != '' && env.DESIRED_TARGET_DATE != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api graphql -f query='
+            mutation(
+              $project: ID!
+              $item: ID!
+              $field: ID!
+              $value: Date!
+            ) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { date: $value }
+              }) {
+                projectV2Item {
+                  id
+                }
+              }
+            }' \
+            -f project="$PROJECT_ID" \
+            -f item="$ITEM_ID" \
+            -f field="$TARGET_DATE_FIELD_ID" \
+            -f value="$DESIRED_TARGET_DATE" \
+            --silent
