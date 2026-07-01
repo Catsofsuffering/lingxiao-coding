@@ -289,7 +289,38 @@ export class HierarchicalContextManager {
       const safeProtectedCount = Math.min(Math.max(0, protectedCount), maxMessages);
       const removableIndex = result.findIndex((message, index) => index >= safeProtectedCount && message.role !== 'system');
       if (removableIndex < 0) break;
-      result.splice(removableIndex, 1);
+      // 配对安全：删除 tool 消息时，连带删除其配对的 assistant(tool_calls)；
+      // 删除 assistant(tool_calls) 时，连带删除其所有 tool results。
+      // 这防止 compaction 拆散配对导致 provider 报 [tool result missing]。
+      const msg = result[removableIndex];
+      if (msg.role === 'tool') {
+        // 向前查找配对的 assistant(tool_calls)
+        const assistantIdx = result.slice(0, removableIndex).reverse().findIndex(
+          (m) => m.role === 'assistant' && m.tool_calls?.some((tc) => tc.id === msg.tool_call_id),
+        );
+        if (assistantIdx >= 0) {
+          const actualAssistantIdx = removableIndex - 1 - assistantIdx;
+          // 先删 tool，再删 assistant（从后往前删避免索引偏移）
+          result.splice(removableIndex, 1);
+          result.splice(actualAssistantIdx, 1);
+          continue;
+        }
+        // 无配对 assistant 的孤儿 tool 直接删
+        result.splice(removableIndex, 1);
+      } else if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        // 删除 assistant(tool_calls) 时连带删其所有 tool results
+        const toolCallIds = new Set(msg.tool_calls.map((tc) => tc.id));
+        result.splice(removableIndex, 1);
+        // 从删除点向后删除所有配对的 tool results
+        for (let i = result.length - 1; i >= removableIndex; i--) {
+          const tcid = result[i].tool_call_id;
+          if (result[i].role === 'tool' && tcid && toolCallIds.has(tcid)) {
+            result.splice(i, 1);
+          }
+        }
+      } else {
+        result.splice(removableIndex, 1);
+      }
     }
     return result.slice(-maxMessages);
   }

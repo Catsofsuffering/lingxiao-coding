@@ -33,8 +33,9 @@
  */
 
 import { Agent as UndiciAgent, ProxyAgent, fetch as undiciFetch } from 'undici';
-import { getScopedProxyFetch } from '../core/ProxyConfig.js';
+import { getScopedProxyFetch, getConfiguredProxyUrl } from '../core/ProxyConfig.js';
 import { withUserAgentHeader } from '../core/UserAgent.js';
+import { onConfigReload } from '../config.js';
 
 const DEFAULT_HEADERS_TIMEOUT_MS = 300_000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 30_000;
@@ -43,6 +44,8 @@ const DEFAULT_CONNECTIONS_PER_HOST = 8;
 
 let _cachedCustomFetch: typeof fetch | undefined | null = null; // null = 未初始化
 let _cachedDispatcher: UndiciAgent | ProxyAgent | undefined;
+let _cachedProxyUrl: string | null | undefined = undefined; // undefined = 未初始化
+let _proxyReloadRegistered = false;
 
 function readNumberEnv(key: string, fallback: number): number {
   const raw = process.env[key];
@@ -71,11 +74,15 @@ function buildAgentOptions() {
 export function getSharedFetch(): typeof fetch | undefined {
   if (_cachedCustomFetch !== null) return _cachedCustomFetch;
   try {
+    // 记录当前生效的代理 URL，用于热加载时检测变更
+    _cachedProxyUrl = getConfiguredProxyUrl('llm');
+
     const configuredProxyFetch = getScopedProxyFetch('llm');
     if (configuredProxyFetch) {
       _cachedCustomFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
         return configuredProxyFetch(input, withUserAgentHeader(input, init));
       }) as typeof fetch;
+      registerProxyReloadWatcher();
       return _cachedCustomFetch;
     }
 
@@ -97,6 +104,7 @@ export function getSharedFetch(): typeof fetch | undefined {
     _cachedCustomFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       return undiciFetch(input as unknown as Parameters<typeof undiciFetch>[0], { ...withUserAgentHeader(input, init), dispatcher } as unknown as Parameters<typeof undiciFetch>[1]) as unknown as ReturnType<typeof fetch>;
     }) as typeof fetch;
+    registerProxyReloadWatcher();
     return _cachedCustomFetch;
   } catch {
     // undici 不可用（极少发生），回退到默认 fetch
@@ -106,11 +114,29 @@ export function getSharedFetch(): typeof fetch | undefined {
 }
 
 /**
+ * 注册代理热加载监听：settings.json 中 network.proxy 变更时，
+ * 重建共享 dispatcher 使新代理配置立即生效。
+ * 幂等——仅注册一次。
+ */
+function registerProxyReloadWatcher(): void {
+  if (_proxyReloadRegistered) return;
+  _proxyReloadRegistered = true;
+  onConfigReload(() => {
+    const newProxyUrl = getConfiguredProxyUrl('llm');
+    if (newProxyUrl !== _cachedProxyUrl) {
+      rebuildSharedFetch();
+    }
+  });
+}
+
+/**
  * 仅用于测试：清除缓存，强制下次重新构造。
  */
 export function __resetSharedFetchForTest(): void {
   _cachedCustomFetch = null;
   _cachedDispatcher = undefined;
+  _cachedProxyUrl = undefined;
+  _proxyReloadRegistered = false;
 }
 
 /**
@@ -123,6 +149,8 @@ export function rebuildSharedFetch(): void {
   const old = _cachedDispatcher;
   _cachedCustomFetch = null;
   _cachedDispatcher = undefined;
+  _cachedProxyUrl = undefined; // 重置以便 getSharedFetch() 重新记录
+  // 注意：不重置 _proxyReloadRegistered，保持热加载监听器存活
   // 异步关闭旧 dispatcher，避免阻塞 caller
   if (old) {
     void Promise.resolve()

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { resolve, relative } from 'path';
 import { statSync } from 'fs';
+import { coreLogger } from '../../core/Log.js';
 
 const GlobSchema = z.object({
   pattern: z.string().describe('glob 模式，例如 "**/*.ts"、"src/**/*.{js,ts}"'),
@@ -49,7 +50,7 @@ export class GlobTool extends Tool {
           withMtime.push({ path: m, mtime: st.mtimeMs });
         } catch (err) {
           // 无法 stat（权限/IO/断链）：mtime 退 0 沉到排序底部；debug 记录路径，便于诊断为何文件不浮现。
-          console.debug(`[GlobTool] stat 失败，mtime 退 0: ${m}`, err instanceof Error ? err.message : String(err));
+          coreLogger.debug(`[GlobTool] stat 失败，mtime 退 0: ${m}`, err instanceof Error ? err.message : String(err));
           withMtime.push({ path: m, mtime: 0 });
         }
       }

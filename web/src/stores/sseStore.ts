@@ -3,6 +3,7 @@
 
 import { acpClient, type ConnectionStateEvent } from '../api/AcpClient';
 import { getServerToken } from '../api/headers';
+import { createLogger } from '../utils/logger';
 import i18n from '../i18n';
 import { appendMessage, updateMessage } from '../utils/historyDB';
 import type { ProjectBlueprint } from '../types/blueprint';
@@ -39,6 +40,7 @@ import type {
   AgentActivity,
   AgentConversation,
   AgentMessage,
+  HistoryMessageRow,
   Message,
   SessionRuntimeSnapshot,
   SessionState,
@@ -47,6 +49,7 @@ import type {
 } from './sessionStoreTypes.ts';
 import { usePermissionStore } from './permissionStore';
 import { useGitActivityStore, type GitActivityEvent } from './gitActivityStore';
+import { useAgentActivityStore, type AgentActivityEvent } from './agentActivityStore';
 import {
   applyConnectionStateForResync,
   applyRuntimeSnapshotPatch,
@@ -72,6 +75,8 @@ export function _injectSessionStore(store: typeof UseSessionStoreType) {
   _useSessionStore = store;
 }
 function getStore() { return _useSessionStore; }
+
+const log = createLogger('sseStore');
 
 type UnknownRecord = Record<string, unknown>;
 type EventToolCallFunction = { name?: unknown; arguments?: unknown };
@@ -190,7 +195,7 @@ type SessionEventPayloadFields = {
   threshold?: number;
   timestamp?: number;
   toTeam?: string;
-  tokenUsage?: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number };
+  tokenUsage?: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number; reasoning?: number; credit?: number };
   tokens?: unknown;
   tool: string;
   toolCalls?: EventToolCall[];
@@ -198,7 +203,7 @@ type SessionEventPayloadFields = {
   totalNodes?: number;
   trigger?: string;
   ts?: number;
-  usage?: { prompt?: number; completion?: number; total?: number; cache_read?: number; cache_creation?: number };
+  usage?: { prompt?: number; completion?: number; total?: number; cache_read?: number; cache_creation?: number; reasoning?: number; credit?: number };
   verdict?: string;
   workerName?: string;
   workingDirectory?: string;
@@ -615,7 +620,50 @@ const pendingToolOutputs: PendingToolOutput[] = [];
 let toolOutputFlushHandle: ReturnType<typeof requestAnimationFrame> | ReturnType<typeof setTimeout> | null = null;
 const pendingStream: { entries: PendingStreamEntry[] } = { entries: [] };
 let streamFlushHandle: ReturnType<typeof requestAnimationFrame> | ReturnType<typeof setTimeout> | null = null;
-const hasRAF = typeof requestAnimationFrame === 'function';
+
+// ── 性能优化 #7: toolCallId → messageIndex 缓存 ──
+// 替代 messages.map 全量遍历查找 callId，O(1) 查找替代 O(n)
+// 在 messages 数组变化时通过 invalidate 重建
+let _toolCallIndexCache: Map<string, number> | null = null;
+let _toolCallIndexCacheLen = -1;
+function getToolCallIndex(messages: Message[]): Map<string, number> {
+  if (_toolCallIndexCache && _toolCallIndexCacheLen === messages.length) return _toolCallIndexCache;
+  const map = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === 'assistant' && m.toolCalls) {
+      for (const tc of m.toolCalls) {
+        if (tc.id) map.set(tc.id, i);
+      }
+    }
+  }
+  _toolCallIndexCache = map;
+  _toolCallIndexCacheLen = messages.length;
+  return map;
+}
+function invalidateToolCallIndex() {
+  _toolCallIndexCache = null;
+  _toolCallIndexCacheLen = -1;
+}
+// ── 性能优化 #7: recentUserMessages 缓存 ──
+// 避免每条 SSE 事件都 filter 全量 messages
+let _recentUserMessagesCache: { len: number; result: Array<{ id: string; content: string; timestamp: number }> } | null = null;
+function getRecentUserMessages(messages: Message[], count = 3) {
+  if (_recentUserMessagesCache && _recentUserMessagesCache.len === messages.length) {
+    return _recentUserMessagesCache.result.slice(-count);
+  }
+  const result: Array<{ id: string; content: string; timestamp: number }> = [];
+  for (let i = messages.length - 1; i >= 0 && result.length < count; i--) {
+    if (messages[i].role === 'user') {
+      result.unshift({ id: messages[i].id, content: messages[i].content.substring(0, 50), timestamp: messages[i].timestamp });
+    }
+  }
+  _recentUserMessagesCache = { len: messages.length, result: [...result] };
+  return result;
+}
+function invalidateRecentUserMessages() {
+  _recentUserMessagesCache = null;
+}const hasRAF = typeof requestAnimationFrame === 'function';
 const scheduleRaf = (fn: () => void) => hasRAF ? requestAnimationFrame(fn) : setTimeout(fn, 16);
 const cancelRaf = (h: ReturnType<typeof requestAnimationFrame> | ReturnType<typeof setTimeout>) =>
   hasRAF ? cancelAnimationFrame(h as number) : clearTimeout(h as ReturnType<typeof setTimeout>);
@@ -641,6 +689,9 @@ export function clearPendingStreamBuffers(): void {
   pendingToolOutputs.length = 0;
   pendingStream.entries = [];
   resetThinkStreamState();
+  // #7: 清理 toolCall 索引缓存和 recentUserMessages 缓存
+  invalidateToolCallIndex();
+  invalidateRecentUserMessages();
   // Tear down the streaming-watchdog interval too: every session-lifecycle reset
   // (switch / connect / disconnect / reset) routes through this function, and the
   // 30s interval was previously created once and never cleared. setPhase re-enables
@@ -682,14 +733,24 @@ function flushToolOutputBuffers() {
   getStore().setState((s) => {
     let messages = s.messages;
     let changed = false;
+    // #7 优化：用 toolCallId → index 缓存替代 messages.map 全量遍历
+    const tcIndex = getToolCallIndex(messages);
     for (const batch of batches) {
       const combined = batch.chunks.join('');
-      messages = messages.map(m => {
-        if (m.role !== 'assistant' || !m.toolCalls?.some(tc => tc.id === batch.callId)) return m;
-        changed = true;
-        return { ...m, toolCalls: m.toolCalls!.map(tc => tc.id === batch.callId ? { ...tc, streamingOutput: appendStreamingOutput(tc.streamingOutput || '', combined) } : tc) };
-      });
+      const msgIdx = tcIndex.get(batch.callId);
+      if (msgIdx === undefined) continue;
+      const m = messages[msgIdx];
+      if (m.role !== 'assistant' || !m.toolCalls) continue;
+      const tcIdx = m.toolCalls.findIndex(tc => tc.id === batch.callId);
+      if (tcIdx < 0) continue;
+      changed = true;
+      const newToolCalls = [...m.toolCalls];
+      newToolCalls[tcIdx] = { ...newToolCalls[tcIdx], streamingOutput: appendStreamingOutput(newToolCalls[tcIdx].streamingOutput || '', combined) };
+      const newMessages = [...messages];
+      newMessages[msgIdx] = { ...m, toolCalls: newToolCalls };
+      messages = newMessages;
     }
+    if (changed) invalidateToolCallIndex();
     return changed ? { messages } : s;
   });
 }
@@ -787,7 +848,7 @@ async function resyncAgentsSnapshot(sessionId: string): Promise<void> {
     });
     if (controller.signal.aborted) return;
     if (!res.ok) {
-      console.warn('[resyncAgentsSnapshot] failed:', res.status, await res.text().catch(() => ''));
+      log.warn('[resyncAgentsSnapshot] failed:', res.status, await res.text().catch(() => ''));
       return;
     }
     const json = await res.json();
@@ -799,9 +860,44 @@ async function resyncAgentsSnapshot(sessionId: string): Promise<void> {
       getStore().setState((s) => mergeAgentHistoryIntoState(s, agentConvs));
     }
   } catch (e: unknown) {
-    if (e instanceof Error && e.name !== 'AbortError') { console.warn('[resyncAgentsSnapshot] failed:', e.message); }
+    if (e instanceof Error && e.name !== 'AbortError') { log.warn('[resyncAgentsSnapshot] failed:', e.message); }
   } finally {
     if (agentsSnapshotController === controller) agentsSnapshotController = null;
+  }
+}
+
+let messagesResyncController: AbortController | null = null;
+
+// Re-pull the main chat message history on RECONNECT. SSE is a pure incremental
+// stream: any leader/TUI messages produced while the socket was dead are lost and
+// never replayed on reconnect — manifesting as "web 不同步，要刷新才有". connectToSession
+// pulls /messages on a fresh connect/switch, but silent mid-session reconnects never did.
+// Guard with pendingStreamIsEmpty so we never clobber an in-flight streaming response.
+async function resyncMessagesHistory(sessionId: string): Promise<void> {
+  // Don't overwrite an actively streaming buffer; the stream itself stays authoritative.
+  if (!pendingStreamIsEmpty()) return;
+  if (messagesResyncController) messagesResyncController.abort();
+  const controller = new AbortController();
+  messagesResyncController = controller;
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      headers: { 'x-lingxiao-token': getServerToken() },
+      signal: controller.signal,
+    });
+    if (controller.signal.aborted) return;
+    if (!res.ok) return;
+    const history = await res.json();
+    if (controller.signal.aborted) return;
+    if (getStore().getState().sessionId !== sessionId) return;
+    // Re-check the streaming guard after the await — a stream may have started mid-fetch.
+    if (!pendingStreamIsEmpty()) return;
+    if (Array.isArray(history) && history.length > 0) {
+      getStore().getState().loadMessagesFromHistory(history as HistoryMessageRow[]);
+    }
+  } catch (e: unknown) {
+    if (e instanceof Error && e.name !== 'AbortError') { log.warn('[resyncMessagesHistory] failed:', e.message); }
+  } finally {
+    if (messagesResyncController === controller) messagesResyncController = null;
   }
 }
 
@@ -864,6 +960,11 @@ export function ensureSseListener() {
         agentResyncAcc = resyncDecision.acc;
         if (resyncDecision.resync) {
           resyncAgentsSnapshot(currentSessionId).catch(() => {});
+          // 同样在 RECONNECT 时补拉主聊天消息历史。SSE 是纯增量流，断连期间
+          // TUI 侧产生的聊天消息不会重放，重连后若不补拉就丢失 —— 表现为
+          // "web 与 TUI 不同步，要刷新才出现"。resyncMessagesHistory 内部有
+          // 流式安全闸门，正在流式输出时跳过，避免冲掉正在生成的内容。
+          resyncMessagesHistory(currentSessionId).catch(() => {});
         }
         syncRuntimeSnapshotFromAcp(currentSessionId).catch(() => {});
       }
@@ -876,15 +977,15 @@ export function ensureSseListener() {
 
   subscribeSessionUpdateEvents(acpClient, ({ eventData, envelope, eventType, kind, update, sessionId: eventSessionId }) => {
     const store = getStore().getState();
-    if (import.meta.env.DEV && update) console.log('[SSE recv]', eventType ?? kind ?? 'unknown', debugUpdateContent(update));
+    if (update) log.debug('[SSE recv]', eventType ?? kind ?? 'unknown', debugUpdateContent(update));
     const activeConnectionSessionId = acpClient.getSessionId?.() ?? acpClient.sessionId;
     if (activeConnectionSessionId && store.sessionId && activeConnectionSessionId !== store.sessionId) {
-      if (import.meta.env.DEV) console.warn('[SSE drop stale] conn=', activeConnectionSessionId?.slice(0,8), 'store=', store.sessionId?.slice(0,8));
+      log.debug('[SSE drop stale] conn=', activeConnectionSessionId?.slice(0,8), 'store=', store.sessionId?.slice(0,8));
       return;
     }
     if (!update) return;
     if (eventSessionId && store.sessionId && eventSessionId !== store.sessionId) {
-      if (import.meta.env.DEV) console.warn('[SSE drop session mismatch] event=', eventSessionId.slice(0,8), 'store=', store.sessionId.slice(0,8));
+      log.debug('[SSE drop session mismatch] event=', eventSessionId.slice(0,8), 'store=', store.sessionId.slice(0,8));
       return;
     }
 
@@ -919,6 +1020,30 @@ export function ensureSseListener() {
       };
       useGitActivityStore.getState().addEvent(gitEvent);
       GIT_ACTIVITY_LISTENERS.forEach(fn => fn(gitEvent));
+    }
+
+    // Generic agent activity events (file writes / shell / git / write+execute tools)
+    if (eventType === 'agent:activity' && update) {
+      const agentEvent: AgentActivityEvent = {
+        id: `${update.agentId || 'leader'}-${update.toolName || 'tool'}-${update.timestamp || Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        sessionId: String(update.sessionId || eventSessionId || ''),
+        agentId: String(update.agentId || 'leader'),
+        agentName: String(update.agentName || 'leader'),
+        taskId: typeof update.taskId === 'string' ? update.taskId : undefined,
+        toolName: typeof update.toolName === 'string' ? update.toolName : 'tool',
+        toolCategory: typeof update.toolCategory === 'string' ? update.toolCategory : undefined,
+        toolTier: typeof update.toolTier === 'string' ? update.toolTier : undefined,
+        action: typeof update.action === 'string' ? update.action : undefined,
+        success: update.success !== false,
+        timestamp: typeof update.timestamp === 'number' ? update.timestamp : Date.now(),
+        summary: typeof update.summary === 'string' ? update.summary : undefined,
+        target: typeof update.target === 'string' ? update.target : undefined,
+        files: Array.isArray(update.files) ? update.files.filter((item): item is string => typeof item === 'string') : undefined,
+        command: typeof update.command === 'string' ? update.command : undefined,
+        error: typeof update.error === 'string' ? update.error : undefined,
+      };
+      useAgentActivityStore.getState().addEvent(agentEvent);
+      AGENT_ACTIVITY_LISTENERS.forEach(fn => fn(agentEvent));
     }
   });
 }
@@ -965,8 +1090,42 @@ function handleSessionUpdate(store: SessionState, update: SessionEventPayload, d
       const umId = `remote-user-${umTimestamp}`;
       getStore().setState((s: SessionState) => {
         const msgs = [...s.messages];
-        const last = msgs[msgs.length - 1];
-        if (last && last.role === 'user' && last.content === umContent && Math.abs(last.timestamp - umTimestamp) < 5000) return s;
+        // Search backwards through recent messages for a duplicate, not just the
+        // last one — intermediate assistant placeholders or phase-change events
+        // can push the local optimistic user message out of the `last` position,
+        // causing a duplicate user bubble.
+        //
+        // 修复：对于附带附件的消息，前端 displayContent 包含 "[附件] filename" 后缀，
+        // 而后端 content 可能只有文本部分。使用宽松匹配：如果本地消息以后端消息开头，
+        // 且时间戳接近，则认为是重复。这解决了首条消息和附件消息重复渲染的问题。
+
+        // 调试：记录 SSE UserMessage 事件
+        log.debug('[SSE UserMessage] Received:', {
+          id: umId,
+          content: umContent.substring(0, 50),
+          timestamp: umTimestamp,
+          recentUserMessages: getRecentUserMessages(msgs),
+        });
+
+        for (let i = msgs.length - 1; i >= 0 && i >= msgs.length - 5; i--) {
+          const m = msgs[i];
+          if (m.role === 'user' && Math.abs(m.timestamp - umTimestamp) < 10000) {
+            // 精确匹配或前缀匹配（处理附件场景）
+            if (m.content === umContent ||
+                (umContent && m.content.startsWith(umContent)) ||
+                (m.content && umContent.startsWith(m.content))) {
+              log.debug('[SSE UserMessage] Duplicate detected, skipping:', {
+                existingId: m.id,
+                existingContent: m.content.substring(0, 50),
+                incomingContent: umContent.substring(0, 50),
+              });
+              return s;
+            }
+          }
+        }
+
+        log.debug('[SSE UserMessage] No duplicate found, adding message');
+
         return { messages: trimMessageWindow([...msgs, { id: umId, role: 'user' as const, content: umContent, timestamp: umTimestamp, isStreaming: false, retrying: false }]) };
       });
       break;
@@ -1068,8 +1227,14 @@ function handleSessionUpdate(store: SessionState, update: SessionEventPayload, d
         update.result, update.error ? 'failed' : 'completed', update.tool
       );
       const trUpdatedState = getStore().getState();
-      const trAssistantMsgs = [...trUpdatedState.messages].reverse().filter(m => m.role === 'assistant' && m.toolCalls?.length);
-      const trHasOpenTools = trAssistantMsgs.some(m => m.toolCalls!.some(t => isOpenToolCall(t.status)));
+      // #7 优化：从尾部反向扫描查找是否有 open tool calls，避免 [...messages].reverse().filter()
+      let trHasOpenTools = false;
+      for (let i = trUpdatedState.messages.length - 1; i >= 0; i--) {
+        const m = trUpdatedState.messages[i];
+        if (m.role === 'assistant' && m.toolCalls?.length) {
+          if (m.toolCalls.some(t => isOpenToolCall(t.status))) { trHasOpenTools = true; break; }
+        }
+      }
       if (!trHasOpenTools && shouldAcceptIdleTransition(trUpdatedState) === false) {
         store.setPhase(phaseForBusySignal(getStore().getState().phase));
       }
@@ -1398,10 +1563,10 @@ function handleSessionUpdatePart5(store: SessionState, update: SessionEventPaylo
       });
       break;
     case SessionUpdateKind.BlackboardDelta:
-      try { useBlackboardStore.getState().applyDelta({ changedNodes: update.changedNodes || [], changedEdges: update.changedEdges || [] }); } catch (err) { if (import.meta.env.DEV) console.warn('[blackboard_delta] applyDelta failed', err); }
+      try { useBlackboardStore.getState().applyDelta({ changedNodes: update.changedNodes || [], changedEdges: update.changedEdges || [] }); } catch (err) { log.debug('[blackboard_delta] applyDelta failed', err); }
       break;
     case SessionUpdateKind.BlackboardInitialized:
-      try { useBlackboardStore.setState({ enabled: !!update.enabled, error: update.enabled ? null : (update.reason || 'blackboard disabled') }); } catch (err) { if (import.meta.env.DEV) console.warn('[blackboard_initialized] setState failed', err); }
+      try { useBlackboardStore.setState({ enabled: !!update.enabled, error: update.enabled ? null : (update.reason || 'blackboard disabled') }); } catch (err) { log.debug('[blackboard_initialized] setState failed', err); }
       break;
     case SessionUpdateKind.SessionResyncFailed:
       // P4: SSE resync failure — set user-visible alert
@@ -1652,15 +1817,15 @@ function handleSessionUpdatePart8(store: SessionState, update: SessionEventPaylo
         getStore().setState((s) => {
           const conv = s.agentConversations[update.agentId];
           const incomingTs = (update.ts as number | undefined) ?? Date.now();
-          const u = update.usage as { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number };
+          const u = update.usage as { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number; reasoning?: number; credit?: number };
           let nextConversations = s.agentConversations;
           if (conv) {
             if (conv._lastTokenTs != null && incomingTs < conv._lastTokenTs) return s;
-            const prev = conv.tokenUsage ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
-            nextConversations = { ...s.agentConversations, [update.agentId]: { ...conv, _lastTokenTs: incomingTs, tokenUsage: { prompt: prev.prompt + (u.prompt || 0), completion: prev.completion + (u.completion || 0), total: prev.total + (u.total || 0), cache_read: (prev.cache_read ?? 0) + (u.cache_read ?? 0), cache_creation: (prev.cache_creation ?? 0) + (u.cache_creation ?? 0) }, contextRatio: update.contextRatio as number | undefined } };
+            const prev = conv.tokenUsage ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 };
+            nextConversations = { ...s.agentConversations, [update.agentId]: { ...conv, _lastTokenTs: incomingTs, tokenUsage: { prompt: prev.prompt + (u.prompt || 0), completion: prev.completion + (u.completion || 0), total: prev.total + (u.total || 0), cache_read: (prev.cache_read ?? 0) + (u.cache_read ?? 0), cache_creation: (prev.cache_creation ?? 0) + (u.cache_creation ?? 0), reasoning: (prev.reasoning ?? 0) + (u.reasoning ?? 0), credit: (prev.credit ?? 0) + (u.credit ?? 0) }, contextRatio: update.contextRatio as number | undefined } };
           } else {
-            const pending = s._pendingTokens?.[update.agentId] ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
-            const nextPending = { ...s._pendingTokens, [update.agentId]: { prompt: pending.prompt + (u.prompt || 0), completion: pending.completion + (u.completion || 0), total: pending.total + (u.total || 0), cache_read: (pending.cache_read ?? 0) + (u.cache_read ?? 0), cache_creation: (pending.cache_creation ?? 0) + (u.cache_creation ?? 0) } };
+            const pending = s._pendingTokens?.[update.agentId] ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 };
+            const nextPending = { ...s._pendingTokens, [update.agentId]: { prompt: pending.prompt + (u.prompt || 0), completion: pending.completion + (u.completion || 0), total: pending.total + (u.total || 0), cache_read: (pending.cache_read ?? 0) + (u.cache_read ?? 0), cache_creation: (pending.cache_creation ?? 0) + (u.cache_creation ?? 0), reasoning: (pending.reasoning ?? 0) + (u.reasoning ?? 0), credit: (pending.credit ?? 0) + (u.credit ?? 0) } };
             return { _pendingTokens: nextPending, tokenUsage: computeGlobalTokenUsage(nextConversations, nextPending) };
           }
           return { agentConversations: nextConversations, tokenUsage: computeGlobalTokenUsage(nextConversations, s._pendingTokens) };
@@ -1700,7 +1865,19 @@ function handleSessionUpdatePart8(store: SessionState, update: SessionEventPaylo
       markStreamingActivity();
       if (update.callId) {
         getStore().setState((s) => {
-          const messages = s.messages.map(m => { if (m.role !== 'assistant' || !m.toolCalls?.some(tc => tc.id === update.callId)) return m; return { ...m, toolCalls: m.toolCalls!.map(tc => tc.id === update.callId ? { ...tc, progressMessage: update.message } : tc) }; });
+          // #7 优化：用 toolCallId → index 缓存替代 messages.map 全量遍历
+          const tcIndex = getToolCallIndex(s.messages);
+          const msgIdx = tcIndex.get(update.callId!);
+          if (msgIdx === undefined) return s;
+          const m = s.messages[msgIdx];
+          if (m.role !== 'assistant' || !m.toolCalls) return s;
+          const tcIdx = m.toolCalls.findIndex(tc => tc.id === update.callId);
+          if (tcIdx < 0) return s;
+          const newToolCalls = [...m.toolCalls];
+          newToolCalls[tcIdx] = { ...newToolCalls[tcIdx], progressMessage: update.message };
+          const messages = [...s.messages];
+          messages[msgIdx] = { ...m, toolCalls: newToolCalls };
+          invalidateToolCallIndex();
           return { messages };
         });
       }
@@ -1840,6 +2017,13 @@ const GIT_ACTIVITY_LISTENERS = new Set<(event: GitActivityEvent) => void>();
 export function onGitActivity(fn: (event: GitActivityEvent) => void): () => void {
   GIT_ACTIVITY_LISTENERS.add(fn);
   return () => GIT_ACTIVITY_LISTENERS.delete(fn);
+}
+
+const AGENT_ACTIVITY_LISTENERS = new Set<(event: AgentActivityEvent) => void>();
+
+export function onAgentActivity(fn: (event: AgentActivityEvent) => void): () => void {
+  AGENT_ACTIVITY_LISTENERS.add(fn);
+  return () => AGENT_ACTIVITY_LISTENERS.delete(fn);
 }
 
 // Auto-register on import

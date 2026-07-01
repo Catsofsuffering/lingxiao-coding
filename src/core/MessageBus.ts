@@ -8,8 +8,6 @@ import { LocalTransport } from './transport/LocalTransport.js';
 
 const DEFAULT_HISTORY_LIMIT = 100;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
-/** Default byte budget for messageHistory (50 MB) */
-const DEFAULT_MAX_HISTORY_BYTES = 50 * 1024 * 1024;
 /** Inbox is considered stale if no dequeue (poll) for this duration */
 const STALE_INBOX_MS = 5 * 60 * 1000;
 // #49: idle 超此且无 waiter 视为真正死亡的收件人,P0/P1 也无消费者 → 整箱清理(含 P0/P1)。
@@ -189,7 +187,7 @@ export class MessageBus {
   private transport: Transport;
   private nextSeq = 1;
 
-  constructor(maxHistorySize = 1000, emitter?: EventEmitter, maxHistoryBytes = DEFAULT_MAX_HISTORY_BYTES, transport?: Transport) {
+  constructor(maxHistorySize = 1000, emitter?: EventEmitter, maxHistoryBytes = runtimeConfig.message_bus.max_history_bytes, transport?: Transport) {
     this.maxHistorySize = maxHistorySize;
     this.maxHistoryBytes = maxHistoryBytes;
     this.emitter = emitter || new EventEmitter();

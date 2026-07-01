@@ -14,6 +14,7 @@ import {
 } from '../../core/HardeningPolicy.js';
 import { withToolProxyEnv } from '../../core/ProxyConfig.js';
 import { validateCommandForProcessKill } from '../../core/ProcessSelfProtection.js';
+import { coreLogger } from '../../core/Log.js';
 
 export type SandboxNetworkMode = 'inherit' | 'disabled' | 'allowlisted';
 export type SandboxBackend = 'app-guard' | 'bubblewrap';
@@ -511,7 +512,7 @@ export function prepareExecutionSandbox(policy: ExecutionSandboxPolicy): Executi
 
   // Warn: app-guard mode does NOT isolate network or filesystem
   if (policy.networkMode === 'disabled') {
-    console.warn('[Sandbox] WARNING: app-guard backend does NOT enforce network isolation. ' +
+    coreLogger.warn('[Sandbox] WARNING: app-guard backend does NOT enforce network isolation. ' +
       'Use bubblewrap backend for true sandbox isolation.');
   }
 

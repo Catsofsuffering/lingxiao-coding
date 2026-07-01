@@ -1,5 +1,7 @@
 import type { WorkerBackend } from './Agent.js';
 import type { AgentRunStatus } from './Status.js';
+import type { CapabilityIntentProfile } from './Autonomy.js';
+import type { AutonomyDecision } from './AutonomyDecision.js';
 
 export type EventType =
   | 'leader:text'
@@ -11,6 +13,8 @@ export type EventType =
   | 'leader:status'
   | 'leader:error'
   | 'leader:route'
+  | 'leader:capability_intent'
+  | 'leader:autonomy_decision'
   | 'leader:control_mode_changed'
   | 'leader:blueprint_updated'
   | 'leader:phase_change'
@@ -37,6 +41,7 @@ export type EventType =
   | 'agent:tool_call_delta'
   | 'agent:tool_output'
   | 'agent:shell_state'
+  | 'agent:activity'
   | 'agent:tool_progress'
   | 'agent:text_chunk'
   | 'agent:thinking_chunk'
@@ -59,6 +64,9 @@ export type EventType =
   | 'session:completed'
   | 'session:interrupted'
   | 'session:runtime_state'
+  | 'session:collaboration_mode_changed'
+  | 'session:autonomy_mode_changed'
+  | 'session:execution_route_changed'
   | 'settings:changed'
   | 'chat:user_message'
   | 'conversation:message_saved'
@@ -66,6 +74,7 @@ export type EventType =
   | 'permission:request'
   | 'permission:resolved'
   | 'context:runtime_updated'
+  | 'context:mutation'
   | 'context:compressed'
   | 'context:compacting'
   | 'context:overflow'
@@ -132,7 +141,8 @@ export type EventType =
   | 'user:question_answered'
   | 'langfuse:trace'
   | 'session:resync_failed'
-  | 'git:activity';
+  | 'git:activity'
+  | 'canvas:version_pushed';
 
 export type EventPayloadBase = object & {
   sessionId?: string;
@@ -293,6 +303,34 @@ type OrchestrationRejectedPayload = EventPayloadBase & {
 
 type PermissionDecision = 'approved' | 'rejected' | 'allowAll';
 
+type LeaderCapabilityIntentPayload = EventPayloadBase & {
+  sessionId: string;
+  profile: CapabilityIntentProfile;
+};
+
+type LeaderAutonomyDecisionPayload = EventPayloadBase & {
+  sessionId: string;
+  toolName: string;
+  decision: AutonomyDecision;
+  gateResult: 'allow' | 'blocked' | 'confirmation_required';
+  gateKind?: 'forbidden' | 'confirmation_required' | null;
+  recordedAt: number;
+  source?: string;
+};
+
+type ContextMutationPayload = EventPayloadBase & {
+  sessionId: string;
+  source: string;
+  operation: 'append' | 'replace' | 'collapse' | 'noop' | 'compact' | 'cache_breakpoint';
+  slot?: string;
+  oldHash?: string | null;
+  newHash?: string | null;
+  oldLength?: number;
+  newLength?: number;
+  changed: boolean;
+  reason?: string;
+};
+
 type PermissionRequestPayload = EventPayloadBase & {
   requestId: string;
   source: 'leader' | 'worker';
@@ -379,6 +417,20 @@ export type EventPayloadMap = Record<EventType, EventPayloadBase> & {
   'agent:progress': AgentProgressPayload;
   'agent:heartbeat': AgentEventPayload & { agentName: string; taskId: string; phase?: string };
   'agent:interactive_state': AgentEventPayload & { agentName: string; taskId?: string; status?: string };
+  'agent:activity': AgentEventPayload & {
+    agentName: string;
+    taskId?: string;
+    toolName: string;
+    toolCategory?: string;
+    toolTier?: string;
+    action?: string;
+    success: boolean;
+    summary?: string;
+    target?: string;
+    files?: string[];
+    command?: string;
+    error?: string;
+  };
   'task:created': TaskEventPayload;
   'task:updated': TaskEventPayload;
   'task:assigned': TaskEventPayload & { agentId?: string };
@@ -391,8 +443,23 @@ export type EventPayloadMap = Record<EventType, EventPayloadBase> & {
   'session:failed': EventPayloadBase & { status?: 'failed'; error?: string; summary?: string };
   'session:interrupted': EventPayloadBase & { status?: 'interrupted'; statusKind?: 'interrupted'; reason?: string };
   'session:deleted': EventPayloadBase & { sessionId: string };
+  'session:collaboration_mode_changed': EventPayloadBase & { sessionId: string; mode: 'solo' | 'team' };
+  'session:autonomy_mode_changed': EventPayloadBase & {
+    sessionId: string;
+    previousMode: string;
+    nextMode: string;
+    previousGeneration: number;
+    nextGeneration: number;
+    lifecyclePhase: string;
+    updatedBy: 'web' | 'tui' | 'leader' | 'runtime_policy';
+    reason?: string;
+    effectivePolicyHash: string | null;
+  };
+  'session:execution_route_changed': EventPayloadBase & { sessionId: string; mode: 'auto' | 'direct' | 'hybrid' | 'delegate' };
   'session:focus': SessionFocusPayload;
   'leader:status': EventPayloadBase & { status: string; statusKind?: string; pollCount?: number; runningAgents?: string[] };
+  'leader:capability_intent': LeaderCapabilityIntentPayload;
+  'leader:autonomy_decision': LeaderAutonomyDecisionPayload;
   'leader:message_queued': EventPayloadBase & { count?: number; queueLength?: number };
   'leader:message_dequeued': EventPayloadBase & { count?: number; queueLength?: number };
   'chat:user_message': ChatUserMessagePayload;
@@ -401,6 +468,7 @@ export type EventPayloadMap = Record<EventType, EventPayloadBase> & {
   'settings:changed': SettingsChangedPayload;
   'permission:request': PermissionRequestPayload;
   'permission:resolved': PermissionResolvedPayload;
+  'context:mutation': ContextMutationPayload;
   'skills:loaded': EventPayloadBase & { sessionId: string; skills: SkillSummaryPayload[] };
   'skill:invoked': EventPayloadBase & { skills: SkillSummaryPayload[] };
   'notification:mark_read': EventPayloadBase & { notificationId?: string; markAllRead?: boolean };
@@ -491,6 +559,7 @@ export const EVENT_TYPES: readonly EventType[] = [
   'agent:tool_call_delta',
   'agent:tool_output',
   'agent:shell_state',
+  'agent:activity',
   'agent:tool_progress',
   'agent:text_chunk',
   'agent:thinking_chunk',
@@ -513,6 +582,9 @@ export const EVENT_TYPES: readonly EventType[] = [
   'session:completed',
   'session:interrupted',
   'session:runtime_state',
+  'session:collaboration_mode_changed',
+  'session:autonomy_mode_changed',
+  'session:execution_route_changed',
   'settings:changed',
   'chat:user_message',
   'conversation:message_saved',
@@ -520,6 +592,7 @@ export const EVENT_TYPES: readonly EventType[] = [
   'permission:request',
   'permission:resolved',
   'context:runtime_updated',
+  'context:mutation',
   'context:compressed',
   'context:compacting',
   'context:overflow',
@@ -529,6 +602,8 @@ export const EVENT_TYPES: readonly EventType[] = [
   'work_note:written',
   'team:message_sent',
   'team:message_read',
+  'leader:capability_intent',
+  'leader:autonomy_decision',
   'leader:message_queued',
   'leader:message_dequeued',
   'agent:crashed',
@@ -581,6 +656,7 @@ export const EVENT_TYPES: readonly EventType[] = [
   'user:input_needed',
   'user:question_answered',
   'langfuse:trace',
+  'canvas:version_pushed',
 ] as const;
 
 const EVENT_TYPE_SET: ReadonlySet<string> = new Set(EVENT_TYPES);

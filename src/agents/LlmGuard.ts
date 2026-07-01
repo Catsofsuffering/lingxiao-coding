@@ -165,6 +165,12 @@ export class LlmGuard {
   private readonly stopController = new AbortController();
   private retryCount = 0;
   private compactFired = false;
+  /**
+   * history 已被抛弃过一次的标记。true → 下一轮不可重试错误直接放弃，
+   * 避免在恶性请求上 compact → 抛历史 → compact → 抛历史 无限循环。
+   * 流程：compact 阶段 1 → history 阶段 2 → 仍失败 阶段 3 抛。
+   */
+  private historyDiscarded = false;
 
   constructor(options: LlmGuardOptions) {
     this.actorLabel = options.actorLabel;
@@ -360,25 +366,35 @@ export class LlmGuard {
         // （aborted / CircuitOpen / compact / 续写再中断 等所有出口都不会残留注入消息）
         rollbackContinuation();
 
-        // CircuitOpenError：CB 主动拒绝，立即抛出（不消耗 retryCount）
+        // CircuitOpenError：CB 主动拒绝（不消耗 retryCount）。
+        // 这类错误说明请求还没真正发出，如果继续在当前 call 内 sleep/backoff，UI 会刷
+        // "retry in ~1s" 并卡住。按 ESC 重请求语义处理：废弃旧 SDK client / keep-alive
+        // socket 池，重置该 provider 的 CB 状态，然后把 CircuitOpenError 抛给上层，
+        // 由 Leader 立即结束当前 attempt 并重新发起同模型请求。
         if (error instanceof CircuitOpenError) {
           gateway.finishAttempt(attempt, {
             status: 'failed',
-            errorKind: 'circuit_open',
+            errorKind: 'circuit_open_recycled',
             errorMessage: error.message,
-            retryable: true,
+            retryable: false,
           });
-          failedModels.add(currentModel);
-          const fallback = gateway.pickFallback(trace, failedModels);
-          if (fallback && !mergedSignal.aborted && trace.attempts.length < this.maxRetries) {
-            currentModel = fallback;
-            hooks?.onRetry?.(this.retryCount, this.classifyFn(error));
-            coreLogger.warn(`[LlmGuard:${this.actorLabel}] circuit open → fallback model="${fallback}"`);
-            continue;
+
+          try {
+            llm.recycle?.();
+            if (providerKey) {
+              resetCircuitBreakersForProvider(providerKey);
+            }
+            coreLogger.warn(
+              `[LlmGuard:${this.actorLabel}] circuit open → recycled LLM client and reset CB provider="${providerKey ?? error.providerKey}"; caller should re-request`,
+            );
+          } catch (recycleErr) {
+            coreLogger.warn(
+              `[LlmGuard:${this.actorLabel}] circuit-open recycle/reset 失败（已忽略）: ${recycleErr instanceof Error ? recycleErr.message : String(recycleErr)}`,
+            );
           }
+
           gateway.failTrace(trace);
-          this.onError?.(this.classifyFn(error));
-          this.finishLlmSpan(llmSpan, 'error', currentModel, callStartedAt, 'circuit_open', undefined, messages);
+          this.finishLlmSpan(llmSpan, 'error', currentModel, callStartedAt, 'circuit_open_recycled', undefined, messages);
           this.attachGatewayTrace(error, trace);
           throw error;
         }
@@ -421,6 +437,14 @@ export class LlmGuard {
         // 否则每次超时都被清零、阈值永远到不了、CB 永不熔断，挂起的 provider 会反复重试
         // ~180s×预算 直到烧光（历史回归）。CB 只在半开探测成功后由其内部复位。
         //
+        // recycle 后 CB 不需要手动 reset：HALF_OPEN 探针使用的是 recycle 后的新 client，
+        // 如果 provider 已恢复，探针成功 → onSuccess() → CB CLOSED；如果仍不可用，探针失败
+        // → CB 重新 OPEN。这正是 CircuitBreaker 设计的预期行为。
+        //
+        // 历史 bug：此前在 recycle 后调用 resetCircuitBreakersForProvider，导致 CB 失败计数
+        // 每次都被清零，FAILURE_THRESHOLD(8) 永远到不了，CB 形同虚设。provider 挂起时
+        // 系统反复跑完整超时预算（最坏 9×180s=27min），前端/TUI/后端全部表现为卡死。
+        //
         // 空流 / 空响应（provider 返回 200 但 body 全空）已在 errors.ts 归入 network_error。
         // 抖动靠 backoff（±20% jitter）+ CircuitBreaker 控制即可。
         if (
@@ -431,21 +455,32 @@ export class LlmGuard {
         ) {
           try {
             llm.recycle?.();
-            // recycle 已销毁旧 SDK client + undici Agent，旧失败计数不再适用于新 client。
-            // 重置该 provider 在所有 scope 下的 CB 状态，让新 client 从干净状态开始。
-            // 否则新 client 仍被旧失败计数熔断，HALF_OPEN 探针用的还是旧死连接。
-            if (providerKey) {
-              resetCircuitBreakersForProvider(providerKey);
-            }
             const trigger = firstTokenController.signal.aborted ? 'first-token-timeout' : classified.llmErrorKind;
             coreLogger.warn(
-              `[LlmGuard:${this.actorLabel}] ${trigger} retry=${this.retryCount + 1} → recycled LLM client + reset CB (fresh socket pool) provider="${providerKey ?? '?'}"`,
+              `[LlmGuard:${this.actorLabel}] ${trigger} retry=${this.retryCount + 1} → recycled LLM client (fresh socket pool, CB count preserved) provider="${providerKey ?? '?'}"`,
             );
           } catch (recycleErr) {
             coreLogger.warn(
               `[LlmGuard:${this.actorLabel}] recycle 调用失败（已忽略）: ${recycleErr instanceof Error ? recycleErr.message : String(recycleErr)}`,
             );
           }
+        }
+
+        // === 超时类错误：不重试，直接抛出 ===
+        // 上层 catch 据此走 ESC 中断 + 重新请求语义（continue/repeat），而非 LlmGuard 内部重试。
+        // CircuitBreaker 已在上方 onFailure 累积失败计数，持续超时最终熔断走 CircuitOpenError 停下。
+        // network_error 仍走重试（网络抖动重试合理）；超时意味着 provider 卡住，重试同上下文无意义。
+        if (
+          classified.llmErrorKind === 'request_timeout' ||
+          classified.llmErrorKind === 'connect_timeout' ||
+          classified.llmErrorKind === 'stream_timeout'
+        ) {
+          this.onError?.(classified);
+          gateway.failTrace(trace);
+          this.finishLlmSpan(llmSpan, 'error', currentModel, callStartedAt, classified.llmErrorKind, undefined, messages);
+          const timeoutError = this.buildFinalError(classified, 'timeout_no_retry', accumulatedPrefix);
+          this.attachGatewayTrace(timeoutError, trace);
+          throw timeoutError;
         }
 
         // ── 续写抢救：stream-interrupt 类错误 + 非空 partial → 注入 assistant prefill 续写 ──
@@ -500,26 +535,49 @@ export class LlmGuard {
           hooks?.onStreamRetry?.(this.retryCount, classified);
         }
 
-        // === 不可重试错误：立即终止，不做"剥离重试"的兼容补丁 ===
-        // 例外：unknown_error 或 400 provider_error 配套 onCompactNeeded 时，
-        // 可能是上下文碎片化/消息格式污染引起——不走重试（同上下文重试无意义、
-        // 纯浪费预算），而是 compact 一次给最后一次机会。
+        // === 不可重试错误：默认立即终止 ===
+        // 通用兜底：任何 retryable=false 的错误都应先尝试 compact（清理可能的
+        // 消息格式污染/上下文碎片化），而不是直接抛。原实现仅对 unknown_error
+        // 和 400 provider_error 启 compact，对 auth_error/quota_exhausted/
+        // context_overflow/parse_error（malformed tool args）等"未兜底"错误
+        // 直接抛，结果是编排层被这些错误卡死（rework、log 出 "被拒绝"，跟
+        // 上面的 RepairLimitReached 一起把任务拉成未定义状态）。
         //
-        // 400 provider_error 常见于 GLM/Qwen 等 OpenAI-compatible API 对消息序列格式的
-        // 严格要求（连续 user 消息、中间 system 消息等）。compact 清理历史后可能恢复。
+        // 两段式恢复：
+        //   1) 第一次任何非可重试错误 → onCompactNeeded() 清理上下文后重试
+        //   2) 第二次仍非可重试（compact 后仍裸）→ 抛弃历史：messages 仅留
+        //      system + 最后一轮 user，清空 accumulatedPrefix、contination 注入
+        //      和 toolCall 残留，last-ditch 重试
+        //   3) 第三次还失败 → 放弃（避免在恶性请求上无限循环）
+        //
+        // 例外：context_overflow 和 quota_exhausted 本身就是 "压缩/减量" 问题
+        // 的提示，只走 compact 路径，不走 "抛历史"，避免浪费一次抛弃重置。
         if (!classified.retryable) {
-          const shouldTryCompact =
-            this.onCompactNeeded &&
-            !this.compactFired &&
-            (classified.llmErrorKind === 'unknown_error' ||
-             (classified.llmErrorKind === 'provider_error' && classified.statusCode === 400));
-          if (shouldTryCompact) {
+          const isOverflowOrQuota =
+            classified.llmErrorKind === 'context_overflow' ||
+            classified.llmErrorKind === 'quota_exhausted';
+          const isAuthFatal =
+            classified.llmErrorKind === 'auth_error' && this.compactFired;
+          // parse_error 是消息格式/协议错误（如 TOOL_USE_RESULT_MISMATCH、malformed args），
+          // 压缩不会修复格式问题，反而会破坏消息序列结构，直接抛出。
+          const isFormatError = classified.llmErrorKind === 'parse_error';
+          // auth 错误 compact 一次后仍 auth → 凭证问题不可能靠丢历史恢复
+          const isLastResort =
+            this.compactFired && !isOverflowOrQuota && !isAuthFatal;
+
+          if (this.onCompactNeeded && !this.compactFired && isOverflowOrQuota) {
+            // === 阶段 1：compact 清理 ===
             this.compactFired = true;
+            this.historyDiscarded = false; // 重置下一阶段状态
             try {
               await this.onCompactNeeded();
-              coreLogger.info(`[LlmGuard:${this.actorLabel}] ${classified.llmErrorKind} (status=${classified.statusCode ?? '?'}) → compact 完成，给最后一次重试机会`);
+              coreLogger.info(
+                `[LlmGuard:${this.actorLabel}] ${classified.llmErrorKind} (status=${classified.statusCode ?? '?'}) → compact 完成，给最后一次重试机会`,
+              );
             } catch (compactErr) {
-              coreLogger.warn(`[LlmGuard:${this.actorLabel}] compact 失败: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`);
+              coreLogger.warn(
+                `[LlmGuard:${this.actorLabel}] compact 失败: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`,
+              );
             }
             this.retryCount++;
             this.onRetry?.(this.retryCount, classified);
@@ -527,9 +585,33 @@ export class LlmGuard {
             await this.backoff(this.retryCount, classified.retryAfterMs, mergedSignal);
             continue;
           }
+
+          if (isLastResort) {
+            // === 阶段 2：抛弃历史，last-ditch 重试 ===
+            this.historyDiscarded = true;
+            this.compactFired = true; // 不再走 compact
+            // 清空续写前缀：旧 partial 来自被抛弃的历史，保留会污染新一轮
+            accumulatedPrefix = '';
+            continuationInjectedCount = 0;
+            const discardedCount = this.discardHistory(messages, accumulatedPrefix);
+            this.retryCount++;
+            this.onRetry?.(this.retryCount, classified);
+            hooks?.onRetry?.(this.retryCount, classified);
+            coreLogger.warn(
+              `[LlmGuard:${this.actorLabel}] ${classified.llmErrorKind} (status=${classified.statusCode ?? '?'}) → compact 后仍失败，抛弃 ${discardedCount} 条历史，仅留 system + 最后 user，last-ditch retry=${this.retryCount}`,
+            );
+            await this.backoff(this.retryCount, classified.retryAfterMs, mergedSignal);
+            continue;
+          }
+
+          // 阶段 3：抛历史已丢过 / 溢出 / 配额 / 凭证已尝试过 → 放弃
           this.onError?.(classified);
           this.finishLlmSpan(llmSpan, 'error', currentModel, callStartedAt, classified.llmErrorKind, undefined, messages);
-          const nonRetryableError = this.buildFinalError(classified, 'non_retryable');
+          const nonRetryableError = this.buildFinalError(
+            classified,
+            this.historyDiscarded ? 'history_discarded_still_failed' : 'non_retryable',
+            accumulatedPrefix,
+          );
           this.attachGatewayTrace(nonRetryableError, trace);
           throw nonRetryableError;
         }
@@ -539,7 +621,7 @@ export class LlmGuard {
           this.onError?.(classified);
           gateway.failTrace(trace);
           this.finishLlmSpan(llmSpan, 'error', currentModel, callStartedAt, classified.llmErrorKind, undefined, messages);
-          const exhaustedError = this.buildFinalError(classified, `max_retries_exceeded(${this.maxRetries})`);
+          const exhaustedError = this.buildFinalError(classified, `max_retries_exceeded(${this.maxRetries})`, accumulatedPrefix);
           this.attachGatewayTrace(exhaustedError, trace);
           throw exhaustedError;
         }
@@ -698,12 +780,62 @@ export class LlmGuard {
     });
   }
 
-  private buildFinalError(classified: LLMError, reason: string): Error {
+  private buildFinalError(classified: LLMError, reason: string, accumulatedPrefix?: string): Error {
     const msg = `LLM ${formatLLMErrorLabel(classified)} ${reason} (${this.actorLabel}): ${classified.message}`;
     const error = new Error(msg);
     (error as unknown as Record<string, unknown>).classified = classified;
     (error as unknown as Record<string, unknown>).reason = reason;
+    // 附带已抢救的 partial content，让调用方可以注入对话历史而非完全丢失
+    if (accumulatedPrefix && accumulatedPrefix.trim()) {
+      (error as unknown as Record<string, unknown>).partialContent = accumulatedPrefix;
+    }
     return error;
+  }
+
+  /**
+   * Last-ditch 拋弃历史：仅保留 system prompt + 最后一轮 user 请求，其余全部丢弃。
+   *
+   * 背景：compact 阶段（onCompactNeeded）是"减量但保留语义"，对于消息格式被
+   * 污染 / tool_call id 不匹配 / 中间 system 错位之类问题，compact 后仍会复现。
+   * 这种情况下唯一可靠的恢复手段是"上轮上下文不再可信"，重置为最小集。
+   *
+   * 保留什么 / 丢什么：
+   *   - 保留：所有 system（系统提示是角色语义，不该丢）
+   *   - 保留：最后一个 user 消息（本轮请求语义必传）
+   *   - 丢弃：中间所有 assistant / tool / user，避免历史污染问题重发
+   *
+   * 改造者注意：messages 是引用型 inout，本函数原地修改。返回值是被丢弃的消息数。
+   */
+  private discardHistory(messages: ChatMessage[], accumulatedPrefix: string): number {
+    const originalLength = messages.length;
+    // 重新走一遍：末位 user 为 "keep as last"，其之前反向扫描，第一个出现的 user 即为"最后一轮请求"。
+    // 逻辑：扫到最后一个 user 时把它作为锚点；它之前的 assistant/tool/user/system 中，system 保留、其余丢。
+    const lastUserIdx = (() => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.role === 'user') return i;
+      }
+      return -1;
+    })();
+
+    if (lastUserIdx < 0) {
+      // 未找到 user (不可能：Leader/Agent 主路径调用前必填了 user)，但作防御处理
+      return 0;
+    }
+
+    // 保留所有 system + 最后一个 user
+    const kept: ChatMessage[] = [];
+    for (let i = 0; i < lastUserIdx; i++) {
+      if (messages[i]?.role === 'system') kept.push(messages[i]);
+    }
+    kept.push(messages[lastUserIdx]);
+
+    // 原地清空中间轮 messages，释放引用，让 GC 回收 toolCall 等大对象
+    messages.length = 0;
+    for (const m of kept) messages.push(m);
+
+    // 注意：调用方传入的 accumulatedPrefix 是闭包变量，本函数不能直接重置为 ''
+    // （需要上层控制 accumulatedPrefix 变量重置），所以本函数只动 messages。
+    return originalLength - messages.length;
   }
 }
 

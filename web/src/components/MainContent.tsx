@@ -1,6 +1,6 @@
 import { useViewStore } from '../stores/viewStore';
 import { lazy, Suspense, useState, type ComponentType, type LazyExoticComponent } from 'react';
-import ChatView from './chat/ChatView';
+const ChatView = lazy(() => import('./chat/ChatView'));
 import PlaceholderView from './PlaceholderView';
 
 const ChangesView = lazy(() => import('./changes/ChangesView'));
@@ -8,7 +8,6 @@ const TasksView = lazy(() => import('./tasks/TasksView'));
 const DaemonView = lazy(() => import('./daemon/DaemonView'));
 const MetricsView = lazy(() => import('./metrics/MetricsView'));
 const StatsView = lazy(() => import('./stats/StatsView'));
-const LogsView = lazy(() => import('./logs/LogsView'));
 const EditorView = lazy(() => import('./editor/EditorView'));
 const CanvasView = lazy(() => import('./canvas/CanvasView'));
 const ArtifactView = lazy(() => import('./artifacts/ArtifactView'));
@@ -27,6 +26,7 @@ const CommandCenterView = lazy(() => import('./agents/CommandCenterView'));
 const BlueprintView = lazy(() => import('./blueprint/BlueprintView'));
 const LangfuseView = lazy(() => import('./langfuse/LangfuseView'));
 const GitActivityView = lazy(() => import('./git/GitActivityView'));
+const AgentActivityView = lazy(() => import('./git/AgentActivityView'));
 
 type ViewComponent = ComponentType | LazyExoticComponent<ComponentType>;
 
@@ -62,7 +62,6 @@ const viewComponents: Record<string, ViewComponent> = {
   workers: DaemonView,
   metrics: MetricsView,
   stats: StatsView,
-  logs: LogsView,
   editor: EditorView,
   canvas: CanvasView,
   artifact: ArtifactView,
@@ -81,6 +80,7 @@ const viewComponents: Record<string, ViewComponent> = {
   blueprint: BlueprintView,
   langfuse: LangfuseView,
   'git-activity': GitActivityView,
+  'agent-activity': AgentActivityView,
 };
 
 export default function MainContent() {

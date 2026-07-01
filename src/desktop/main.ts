@@ -7,9 +7,34 @@ import { generateDefaultSettings, config as runtimeConfig } from '../config.js';
 import { createServer, findAvailablePort, removePortFile, warnIfInsecureHostBinding, writePortFile } from '../server.js';
 import { registerCleanup, runAllCleanups } from '../core/index.js';
 import { isHardenedMode } from '../core/HardeningPolicy.js';
-
-let mainWindow: BrowserWindow | null = null;
+import { createLogger } from '../core/Log.js';
+const desktopLogger = createLogger('lingxiao.desktop');let mainWindow: BrowserWindow | null = null;
 let shutdownStarted = false;
+
+const TRUTHY_ENV_VALUES = new Set(['1', 'true', 'yes', 'on']);
+const FALSY_ENV_VALUES = new Set(['0', 'false', 'no', 'off']);
+
+function hasArg(name: string): boolean {
+  return process.argv.some((arg) => arg === name || arg.startsWith(`${name}=`));
+}
+
+function shouldUseReducedEffects(): boolean {
+  const envValue = process.env.LINGXIAO_REDUCED_EFFECTS?.trim().toLowerCase();
+  if (envValue && TRUTHY_ENV_VALUES.has(envValue)) return true;
+  if (envValue && FALSY_ENV_VALUES.has(envValue)) return false;
+
+  if (hasArg('--lingxiao-full-effects')) return false;
+  if (hasArg('--lingxiao-reduced-effects') || hasArg('--low-effects')) return true;
+
+  // Windows MSI/NSIS/portable 包默认启用低特效，降低 Electron 渲染端在高频日志/聊天刷新时的重绘成本。
+  return app.isPackaged && process.platform === 'win32';
+}
+
+function appendUrlParam(url: string, key: string, value: string): string {
+  const parsed = new URL(url);
+  parsed.searchParams.set(key, value);
+  return parsed.toString();
+}
 
 // ── Auto-updater ──────────────────────────────────────────────────────────────
 // electron-updater 在打包后的 MSI/NSIS 安装版中自动检查 GitHub Releases。
@@ -25,7 +50,7 @@ async function setupAutoUpdater(): Promise<void> {
     const mod = await import('electron-updater');
     autoUpdater = mod.autoUpdater;
   } catch {
-    console.warn('[Updater] electron-updater 不可用，跳过自动更新。');
+    desktopLogger.warn('[Updater] electron-updater unavailable, skipping auto-update');
     return;
   }
 
@@ -33,24 +58,24 @@ async function setupAutoUpdater(): Promise<void> {
   autoUpdater.autoInstallOnAppQuit = true;
 
   autoUpdater.on('checking-for-update', () => {
-    console.log('[Updater] 正在检查更新...');
+    desktopLogger.info('[Updater] 正在检查更新...');
   });
 
   autoUpdater.on('update-available', (info) => {
-    console.log(`[Updater] 发现新版本: ${info.version}，开始下载...`);
+    desktopLogger.info('[Updater] 发现新版本，开始下载...', { version: info.version });
   });
 
   autoUpdater.on('update-not-available', () => {
-    console.log('[Updater] 当前版本已是最新。');
+    desktopLogger.info('[Updater] 当前版本已是最新。');
   });
 
   autoUpdater.on('download-progress', (progress) => {
     const percent = progress.percent.toFixed(1);
-    console.log(`[Updater] 下载中: ${percent}% (${progress.transferred}/${progress.total} bytes)`);
+    desktopLogger.info('[Updater] 下载中', { percent, transferred: progress.transferred, total: progress.total });
   });
 
   autoUpdater.on('update-downloaded', () => {
-    console.log('[Updater] 更新已下载，将在退出时自动安装。');
+    desktopLogger.info('[Updater] 更新已下载，将在退出时自动安装。');
     // 通知主窗口展示更新提示（通过 webContents executeJavaScript 注入 toast）
     if (mainWindow && !updateNotificationShown) {
       updateNotificationShown = true;
@@ -61,17 +86,19 @@ async function setupAutoUpdater(): Promise<void> {
   });
 
   autoUpdater.on('error', (err) => {
-    console.error('[Updater] 检查更新失败:', err?.message || err);
+    desktopLogger.error('[Updater] 检查更新失败', { error: err?.message || String(err) });
   });
 
   // 启动后 5 秒检查更新，之后每 4 小时检查一次
-  setTimeout(() => {
+  const initialCheck = setTimeout(() => {
     autoUpdater.checkForUpdates().catch(() => {/* 静默失败 */});
   }, 5_000);
+  initialCheck.unref?.();
 
-  setInterval(() => {
+  const periodicCheck = setInterval(() => {
     autoUpdater.checkForUpdates().catch(() => {/* 静默失败 */});
   }, 4 * 60 * 60 * 1000);
+  periodicCheck.unref?.();
 }
 
 function resolveIconPath(): string | undefined {
@@ -123,7 +150,8 @@ async function startDesktopServer(): Promise<string> {
 
   const displayHost = webHost === '0.0.0.0' ? 'localhost' : webHost;
   const baseUrl = `http://${displayHost}:${actualPort}`;
-  return token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl;
+  const webUrl = token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl;
+  return shouldUseReducedEffects() ? appendUrlParam(webUrl, 'reducedEffects', '1') : webUrl;
 }
 
 function createMainWindow(url: string): BrowserWindow {
@@ -187,6 +215,6 @@ void app.whenReady().then(async () => {
     }
   });
 }).catch((err: unknown) => {
-  console.error('[Desktop] Failed to start:', err);
+  desktopLogger.error('[Desktop] Failed to start', { error: String(err) });
   app.quit();
 });

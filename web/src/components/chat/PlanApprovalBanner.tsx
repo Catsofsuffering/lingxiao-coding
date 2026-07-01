@@ -10,6 +10,9 @@ import { useTranslation } from 'react-i18next';
 import { AlertCircle, Check, MessageSquare, ChevronDown, ChevronUp, Loader2, X } from 'lucide-react';
 import { acpClient } from '../../api/AcpClient';
 import { useSessionStore } from '../../stores/sessionStore';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('PlanApprovalBanner');
+
 
 type JsonRecord = Record<string, unknown>;
 
@@ -103,7 +106,7 @@ export function PlanApprovalBanner() {
       await acpClient.sendJsonRpc('session/approvePlan', { sessionId });
       useSessionStore.setState({ pendingPlan: null });
     } catch (e) {
-      console.error('[PlanApproval] approve failed', e);
+      log.error('[PlanApproval] approve failed', e);
       setError(e instanceof Error ? e.message : String(e || 'approve failed'));
     } finally {
       setLoading(null);
@@ -120,7 +123,7 @@ export function PlanApprovalBanner() {
       setFeedback('');
       setShowFeedback(false);
     } catch (e) {
-      console.error('[PlanApproval] reject failed', e);
+      log.error('[PlanApproval] reject failed', e);
       setError(e instanceof Error ? e.message : String(e || 'reject failed'));
     } finally {
       setLoading(null);

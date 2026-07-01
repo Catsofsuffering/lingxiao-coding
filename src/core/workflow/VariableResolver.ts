@@ -12,6 +12,7 @@
  */
 
 import type { VariableScope } from './types.js';
+import { coreLogger } from '../Log.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -51,7 +52,7 @@ export class VariableResolver {
         return value !== undefined && value !== null ? String(value) : '';
       } catch (error) {
         // 变量解析失败时保留原始语法
-        console.warn(`[VariableResolver] Failed to resolve: ${match}`, error);
+        coreLogger.warn(`[VariableResolver] Failed to resolve: ${match}`, error);
         return match;
       }
     });

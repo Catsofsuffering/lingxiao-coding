@@ -21,11 +21,22 @@
 import type { ToolCall } from '../../llm/types.js';
 
 export interface ToolLoopDetectorOptions {
+  /** 显式开启重复工具调用探针；默认读取 LINGXIAO_TOOL_LOOP_DETECTOR，未设置时关闭。 */
+  enabled?: boolean;
   /** 连续相同的轮数阈值；超过此值返回 isLooping=true */
   threshold?: number;
 }
 
 const DEFAULT_THRESHOLD = 4;
+
+function isTruthyEnv(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? '').trim());
+}
+
+/** Disabled by default; enable only for diagnostics with LINGXIAO_TOOL_LOOP_DETECTOR=1. */
+export function isToolLoopDetectorEnabled(): boolean {
+  return isTruthyEnv(process.env.LINGXIAO_TOOL_LOOP_DETECTOR);
+}
 
 /** 把任意 JSON 值序列化为稳定字符串（递归排序对象 key） */
 function stableJson(value: unknown): string {
@@ -64,16 +75,19 @@ export function fingerprintToolCall(tc: ToolCall): string {
 }
 
 export class ToolLoopDetector {
+  private readonly enabled: boolean;
   private readonly threshold: number;
   private lastSignature: string | null = null;
   private streak = 0;
 
   constructor(options: ToolLoopDetectorOptions = {}) {
+    this.enabled = options.enabled ?? isToolLoopDetectorEnabled();
     this.threshold = Math.max(2, options.threshold ?? DEFAULT_THRESHOLD);
   }
 
   /** 对单轮的工具调用集合做一次观察 */
   observe(toolCalls: ToolCall[] | null | undefined): void {
+    if (!this.enabled) return;
     if (!toolCalls || toolCalls.length === 0) {
       // 没有工具调用 → 不算 streak 也不重置（让纯文本轮不影响判定）
       return;
@@ -90,7 +104,7 @@ export class ToolLoopDetector {
 
   /** 判断当前是否已超过阈值 */
   get isLooping(): boolean {
-    return this.streak >= this.threshold;
+    return this.enabled && this.streak >= this.threshold;
   }
 
   /** 返回当前累计连续次数 */

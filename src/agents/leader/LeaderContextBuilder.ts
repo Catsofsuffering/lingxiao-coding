@@ -30,14 +30,14 @@ import {
 } from '../../core/ContractPack.js';
 import { parseBlueprint, renderBlueprintOverview, isBlueprintActive, computeBlueprintCoverage, getReadySubsystems, type SubsystemContractStatus } from '../../core/ProjectBlueprint.js';
 import { computeScopeOrthogonality } from '../../core/ContractAllowedScope.js';
-import { buildOfficeModeProtocol } from '../office/OfficeModeProtocol.js';
+import { resolveActiveModes, MODE_REGISTRY, ALL_MODE_IDS } from '../../contracts/modes.js';
 import { resolveModeRuntimeProjection, resolveEffectiveRoutePreference } from '../../core/ModeRuntimeProjection.js';
 import { getTeamMemberRegistry } from '../../core/TeamMailbox.js';
 import { getPromptLocale } from '../prompts/i18n/catalog.js';
 import { MemoryManager } from '../../memory/MemoryManager.js';
 import { SESSION_KEYS } from '../../core/SessionStateKeys.js';
 import { readPersistedEternalGoal } from '../../core/EternalGoal.js';
-import { config as globalConfig } from '../../config.js';
+import { config as globalConfig, refreshRuntimeConfig } from '../../config.js';
 import { getEncodingForModel, getCachedEncoder } from '../../core/TiktokenCache.js';
 import { getModelDevInfo } from '../../llm/ModelsDevRegistry.js';
 import { getContextWindowSizeFromProvider } from '../../llm/model_capabilities.js';
@@ -183,6 +183,25 @@ export class LeaderContextBuilder {
 
     const pool = this.deps.getPool() as unknown as { getAll?: () => AgentHandle[] };
     const allAgents = typeof pool.getAll === 'function' ? pool.getAll.call(pool) : [];
+    const now = Date.now();
+    const activeAgents = allAgents
+      .filter((agent) => agent.status !== 'stopped')
+      .sort((a, b) => (b.lastProgress ?? b.lastHeartbeat ?? b.startTime ?? 0) - (a.lastProgress ?? a.lastHeartbeat ?? a.startTime ?? 0))
+      .slice(0, 8);
+    if (activeAgents.length > 0) {
+      lines.push(
+        `active_runtime_agents: ${activeAgents.map((agent) => {
+          const lastProgress = agent.lastProgress
+            ? ` progress=${Math.max(0, Math.round((now - agent.lastProgress) / 1000))}s_ago`
+            : '';
+          const currentTool = agent.currentToolName ? ` tool=${agent.currentToolName}` : '';
+          const lineage = agent.recoveryLineage ? ` lineage=${agent.recoveryLineage}` : '';
+          const failures = agent.consecutiveRespawnFailures ? ` respawn_failures=${agent.consecutiveRespawnFailures}` : '';
+          return `@${agent.name}:${agent.taskId}:${agent.status}${lastProgress}${currentTool}${lineage}${failures}`;
+        }).join(' | ')}${allAgents.filter((agent) => agent.status !== 'stopped').length > activeAgents.length ? ' | +more' : ''}`,
+      );
+    }
+
     const stoppedAgents = allAgents
       .filter((agent) => agent.status === 'stopped')
       .sort((a, b) => (b.endTime ?? b.startTime ?? 0) - (a.endTime ?? a.startTime ?? 0))
@@ -225,9 +244,11 @@ export class LeaderContextBuilder {
       warningLevel: runtime.warningLevel,
       consecutiveFailures: runtime.consecutiveFailures,
       lastArchivePath: runtime.lastArchivePath || null,
+      // Deliberately omit timestamp-only fields from the cache-relevant fingerprint.
+      // They belong in runtime/UI state, not in the decision to rewrite the LLM
+      // context manifest system slot.
       lastCompact: runtime.lastCompact
         ? {
-          timestamp: runtime.lastCompact.timestamp,
           oldTokens: runtime.lastCompact.oldTokens,
           newTokens: runtime.lastCompact.newTokens,
           archivePath: runtime.lastCompact.archivePath || null,
@@ -235,7 +256,6 @@ export class LeaderContextBuilder {
         : null,
       recentFiles: runtime.recentFiles.map((file) => ({
         path: file.path,
-        timestamp: file.timestamp,
         charCount: file.charCount,
         tokenEstimate: file.tokenEstimate,
       })),
@@ -345,7 +365,6 @@ export class LeaderContextBuilder {
   getDynamicContext(): string | null {
     const db = this.deps.getDb();
     const sessionId = this.deps.sessionId;
-    const officeMode = db.getSessionState(sessionId, SESSION_KEYS.OFFICE_MODE_ACTIVE) === 'true';
     const contractPack = this.deps.getLeaderBlackboard()?.getContractPack() ?? null;
     const contractSystemMessage = renderContractPackSystemMessage(contractPack);
     const contractManifest = renderContractPackManifestSection(contractPack);
@@ -374,12 +393,26 @@ export class LeaderContextBuilder {
         priority: FragmentPriority.ContractManifest,
       });
     }
-    if (officeMode) {
+    // 全模式隔离：遍历激活模式，对声明了 promptBuilder.leader 的模式注入其 prompt。
+    // 替换原 office 单点 if——任何模式（office/bughunt/...）只要声明 leader 注入器，
+    // 激活时即注入；关闭时其 prompt 文本完全不进 Leader 上下文。
+    const activeModes = resolveActiveModes(db, sessionId);
+    for (const modeId of ALL_MODE_IDS) {
+      if (!activeModes[modeId]) continue;
+      const leaderBuilder = MODE_REGISTRY[modeId].promptBuilder?.leader;
+      if (!leaderBuilder) continue;
+      const content = leaderBuilder();
+      if (!content) continue;
       sections.push({
-        section: { title: 'Office Mode Protocol', content: buildOfficeModeProtocol() },
+        section: { title: `${modeId} Mode Protocol`, content },
         priority: FragmentPriority.OfficeMode,
       });
     }
+    const runtimePolicySection = this.buildRuntimePolicySection();
+    if (runtimePolicySection) {
+      sections.push({ section: runtimePolicySection, priority: FragmentPriority.Blueprint });
+    }
+
     if (blueprint) {
       // B-C: 从 ContractPack 构建子系统契约状态映射,让蓝图概览显示契约三态(已物化/收敛中/真缺口)。
       const contractStatusBySubsystem = new Map<string, SubsystemContractStatus>();
@@ -484,6 +517,40 @@ export class LeaderContextBuilder {
     return kept;
   }
 
+  private buildRuntimePolicySection(): ContextManifestSection | null {
+    const modes = resolveModeRuntimeProjection({
+      sessionId: this.deps.sessionId,
+      db: this.deps.getDb(),
+      blackboardAvailable: this.deps.isBlackboardEnabled(),
+      permissionSummary: this.deps.getPermissionSummary(),
+    });
+    const profile = modes.intentProfile;
+    const constraints = profile.constraints && Object.keys(profile.constraints).length > 0
+      ? JSON.stringify(profile.constraints)
+      : '{}';
+    const locale = getPromptLocale();
+    const content = locale === 'zh'
+      ? [
+        `confirmation_policy: ${modes.autonomy}（只作为执行主动性/打扰频率提示，不是工具权限边界）`,
+        `route_preference: ${modes.route.preference}; current_route: ${modes.route.mode}`,
+        `permission_mode: ${modes.permission.mode}${modes.permission.summary ? ` (${modes.permission.summary})` : ''}`,
+        `capability_profile: ${profile.primaryIntent}/${profile.phase}/${profile.scope.kind} confidence=${profile.confidence.toFixed(2)}`,
+        `grants: ${profile.grants.join(',') || 'none'}; denies: ${profile.denies.join(',') || 'none'}; required_gates_hint: ${profile.requiredGates.join(',') || 'none'}`,
+        `constraints_hint: ${constraints}`,
+        '规则: read/write/shell/task/dispatch 都是当前用户意图 hint；不要把 confirmation_policy 当硬权限；真正权限由工具权限系统和用户显式批准决定。',
+      ].join('\n')
+      : [
+        `confirmation_policy: ${modes.autonomy} (initiative/interruption hint only, not a tool permission boundary)`,
+        `route_preference: ${modes.route.preference}; current_route: ${modes.route.mode}`,
+        `permission_mode: ${modes.permission.mode}${modes.permission.summary ? ` (${modes.permission.summary})` : ''}`,
+        `capability_profile: ${profile.primaryIntent}/${profile.phase}/${profile.scope.kind} confidence=${profile.confidence.toFixed(2)}`,
+        `grants: ${profile.grants.join(',') || 'none'}; denies: ${profile.denies.join(',') || 'none'}; required_gates_hint: ${profile.requiredGates.join(',') || 'none'}`,
+        `constraints_hint: ${constraints}`,
+        'Rule: read/write/shell/task/dispatch are user-intent hints; do not treat confirmation_policy as hard permission; actual permission is handled by the tool permission system and explicit user approval.',
+      ].join('\n');
+    return { title: locale === 'zh' ? '运行时策略提示' : 'Runtime Policy Hint', content };
+  }
+
   /**
    * 并发概览(每轮注入 getTeamModeHint):把"并行度 = scope 正交宽度"这个确定性
    * 关系投影给 Leader——当前槽位占用、running worker 角色分布、待派发任务的
@@ -495,7 +562,8 @@ export class LeaderContextBuilder {
     const running = allAgents.filter((a) => a.status === 'running');
 
     const board = this.deps.getBoard();
-    const maxConcurrent = (globalConfig.agents?.max_concurrent as number | undefined) ?? 5;
+    const liveConfig = refreshRuntimeConfig();
+    const maxConcurrent = (liveConfig.agents?.max_concurrent as number | undefined) ?? globalConfig.agents?.max_concurrent ?? 5;
 
     // 写作用域相对 workspace + 截断,控制 token
     const shorten = (p: string): string => {
@@ -554,7 +622,14 @@ export class LeaderContextBuilder {
     const collaborationHint = this.buildCollaborationHint();
     const routeSection = this.buildRoutePreferenceSection();
     const blueprintSection = this.buildBlueprintModeSection();
-    return [collaborationHint, routeSection, blueprintSection].filter(Boolean).join('\n') || null;
+    const runtimePolicyHint = this.buildRuntimePolicyModeHint();
+    return [collaborationHint, routeSection, runtimePolicyHint, blueprintSection].filter(Boolean).join('\n') || null;
+  }
+
+  private buildRuntimePolicyModeHint(): string | null {
+    const section = this.buildRuntimePolicySection();
+    if (!section) return null;
+    return `[${section.title}]\n${section.content}`;
   }
 
   /**

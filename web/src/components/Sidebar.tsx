@@ -11,7 +11,7 @@ import { SidebarVersionBadge } from './sidebar/SidebarVersionBadge';
 import { BetaBadge } from './sidebar/BetaBadge';
 import {
   MessageCircle, Server, ListTodo, Terminal, LayoutDashboard,
-  FileCode, FileEdit, Puzzle, BarChart3, Activity, Cpu, ScrollText,
+  FileCode, FileEdit, Puzzle, BarChart3, Activity, Cpu,
   Settings, Keyboard, BookOpen, ChevronLeft, ChevronRight, Sun, Moon,
   Monitor, AlertCircle, Languages, Plus, RefreshCw, BookMarked, GitBranch,
   Network, GalleryVerticalEnd, Users, Palette, Brain, LayoutGrid,
@@ -33,20 +33,26 @@ const topNav: NavItem[] = [
   { view: 'workers', icon: <Server size={16} />, labelKey: 'sidebar.daemon' },
 ];
 
+// 核心工作区：高频稳定入口，默认常驻可见
 const workspaceNav: NavItem[] = [
   { view: 'tasks', icon: <ListTodo size={16} />, labelKey: 'sidebar.tasks' },
+  { view: 'git', icon: <GitBranch size={16} />, labelKey: 'sidebar.git' },
+  { view: 'editor', icon: <FileCode size={16} />, labelKey: 'sidebar.editor' },
+  { view: 'artifact', icon: <GalleryVerticalEnd size={16} />, labelKey: 'sidebar.artifacts' },
+  { view: 'terminal', icon: <Terminal size={16} />, labelKey: 'sidebar.terminalMode' },
+];
+
+// 更多工具：次要/进阶/实验性入口，默认折叠，减少首屏认知负担
+const moreToolsNav: NavItem[] = [
+  { view: 'changes', icon: <FileEdit size={16} />, labelKey: 'sidebar.changes' },
   { view: 'blueprint', icon: <LayoutGrid size={16} />, labelKey: 'sidebar.blueprint' },
   { view: 'blackboard', icon: <Network size={16} />, labelKey: 'sidebar.blackboard' },
-  { view: 'terminal', icon: <Terminal size={16} />, labelKey: 'sidebar.terminalMode' },
-  { view: 'canvas', icon: <LayoutDashboard size={16} />, labelKey: 'sidebar.canvas', isBeta: true },
-  { view: 'artifact', icon: <GalleryVerticalEnd size={16} />, labelKey: 'sidebar.artifacts' },
-  { view: 'editor', icon: <FileCode size={16} />, labelKey: 'sidebar.editor' },
-  { view: 'changes', icon: <FileEdit size={16} />, labelKey: 'sidebar.changes' },
-  { view: 'git', icon: <GitBranch size={16} />, labelKey: 'sidebar.git' },
-  { view: 'git-activity', icon: <GitCommitHorizontal size={16} />, labelKey: 'sidebar.gitActivity', isBeta: true },
+  { view: 'agent-activity', icon: <Activity size={16} />, labelKey: 'sidebar.agentActivity' },
   { view: 'wiki', icon: <BookMarked size={16} />, labelKey: 'sidebar.wiki' },
   { view: 'memory', icon: <Brain size={16} />, labelKey: 'sidebar.memory' },
   { view: 'plugins', icon: <Puzzle size={16} />, labelKey: 'sidebar.plugins' },
+  { view: 'canvas', icon: <LayoutDashboard size={16} />, labelKey: 'sidebar.canvas', isBeta: true },
+  { view: 'git-activity', icon: <GitCommitHorizontal size={16} />, labelKey: 'sidebar.gitActivity', isBeta: true },
   { view: 'design-market', icon: <Palette size={16} />, labelKey: 'sidebar.designMarket', isBeta: true },
 ];
 
@@ -55,7 +61,6 @@ const observabilityNav: NavItem[] = [
   { view: 'traces', icon: <Activity size={16} />, labelKey: 'sidebar.traces' },
   { view: 'team', icon: <Users size={16} />, labelKey: 'sidebar.team' },
   { view: 'metrics', icon: <Cpu size={16} />, labelKey: 'sidebar.metrics' },
-  { view: 'logs', icon: <ScrollText size={16} />, labelKey: 'sidebar.logs' },
   { view: 'langfuse', icon: <Radar size={16} />, labelKey: 'sidebar.langfuse' },
 ];
 
@@ -70,7 +75,7 @@ const appVersion = typeof __APP_VERSION__ === 'string' && __APP_VERSION__.length
   : 'dev';
 const logoSrc = `/logo.svg?v=${appVersion}`;
 
-function NavSection({ title, items, id }: { title: string; items: NavItem[]; id?: string }) {
+function NavSection({ title, items, id, defaultCollapsed = false }: { title: string; items: NavItem[]; id?: string; defaultCollapsed?: boolean }) {
   const { t } = useTranslation();
   const mainView = useViewStore((s) => s.mainView);
   const setMainView = useViewStore((s) => s.setMainView);
@@ -81,8 +86,12 @@ function NavSection({ title, items, id }: { title: string; items: NavItem[]; id?
   const collapsible = !!title;
   const storageKey = collapsible ? `lx.nav.collapsed.${id ?? title}` : null;
   const [collapsed, setCollapsed] = useState<boolean>(() => {
-    if (!storageKey) return false;
-    try { return localStorage.getItem(storageKey) === '1'; } catch { return false; }
+    if (!storageKey) return defaultCollapsed;
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved === null) return defaultCollapsed; // 首次按默认折叠态
+      return saved === '1';
+    } catch { return defaultCollapsed; }
   });
   const toggle = () => {
     setCollapsed((c) => {
@@ -265,6 +274,7 @@ export default function Sidebar() {
         <NavSection title="" items={topNav.slice(1)} />
         <div className="cyber-divider my-1" />
         <NavSection title={t('sidebar.workspace')} id="workspace" items={workspaceNav} />
+        <NavSection title={t('sidebar.group.more', '更多工具')} id="more" items={moreToolsNav} defaultCollapsed />
         <div className="cyber-divider my-1" />
         <NavSection title={t('sidebar.group.observability', 'OBSERVABILITY')} id="observability" items={observabilityNav} />
         <UsageCard />

@@ -12,6 +12,7 @@
 
 import { classifyLLMError } from './errors.js';
 import { sleep } from '../utils/sleep.js';
+import { llmLogger } from '../core/Log.js';
 
 const DEBUG_LLM_RETRY = process.env.LINGXIAO_DEBUG_LLM_RETRY === '1';
 
@@ -131,7 +132,7 @@ export class RetryEngine {
         // 回调通知
         callbacks?.onRetry?.(attempt + 1, classified, delayMs);
         if (DEBUG_LLM_RETRY) {
-          console.warn(`${logPrefix}，第 ${attempt + 1} 次重试 (${delayMs}ms): ${classified.message}`);
+          llmLogger.warn(`${logPrefix}，第 ${attempt + 1} 次重试 (${delayMs}ms): ${classified.message}`);
         }
 
         // 等待后重试

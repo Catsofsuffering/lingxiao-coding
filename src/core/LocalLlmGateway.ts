@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { getConfigValue, saveSettings, setConfigValue, config as runtimeConfig } from '../config.js';
 import { getModelManager } from '../config/ModelManager.js';
 
@@ -76,6 +76,19 @@ type GatewayQuotaBucket = {
 };
 
 const quotaBuckets = new Map<string, GatewayQuotaBucket>();
+
+// ── 运行时网关端点（进程绑定后由 startLocalLlmGatewayServer 设置）──
+// 替代旧的 gateway.json 共享复用机制：每个进程自己绑定随机端口，
+// 启动后把实际 host:port 写入此变量，resolveLocalLlmGateway() 优先读取。
+let _runtimeGatewayEndpoint: { host: string; port: number } | null = null;
+
+export function setRuntimeGatewayEndpoint(host: string, port: number): void {
+  _runtimeGatewayEndpoint = { host: normalizeHost(host), port };
+}
+
+export function clearRuntimeGatewayEndpoint(): void {
+  _runtimeGatewayEndpoint = null;
+}
 
 export function normalizeHost(host: string): string {
   if (!host || host === '0.0.0.0' || host === '::') return '127.0.0.1';
@@ -186,9 +199,10 @@ export function resolveLocalLlmGateway(): LocalLlmGatewayResolved | null {
   const model = getModelManager().getModelByIdStrict(modelId);
   const apiModel = model.model || modelId;
   const token = ensureGatewayToken();
-  // 网关在专用固定端口上监听（llm_gateway.host/port），地址不再随 Web 服务器端口文件漂移。
-  const host = normalizeHost(String(getConfigValue('llm_gateway.host') || '127.0.0.1'));
-  const port = readPositiveInt('llm_gateway.port', 62000);
+  // 网关端口：优先用运行时绑定的实际端口（随机分配），
+  // 回退到配置端口（用于未启动时显示默认地址或外部直连场景）。
+  const host = _runtimeGatewayEndpoint?.host || normalizeHost(String(getConfigValue('llm_gateway.host') || '127.0.0.1'));
+  const port = _runtimeGatewayEndpoint?.port || readPositiveInt('llm_gateway.port', 62000);
   const origin = `http://${host}:${port}`;
 
   return {
@@ -244,7 +258,11 @@ export function authorizeLocalLlmGatewayToken(token: string): LocalLlmGatewayAut
     };
   }
 
-  if (presented === gateway.token) {
+  // Use timingSafeEqual to prevent timing side-channel attacks on token comparison.
+  const expected = gateway.token;
+  const presentedBuf = Buffer.from(presented);
+  const expectedBuf = Buffer.from(expected);
+  if (presentedBuf.length === expectedBuf.length && timingSafeEqual(presentedBuf, expectedBuf)) {
     try {
       return {
         ok: true,
@@ -475,10 +493,11 @@ export function buildLocalLlmGatewayPromptSection(): string {
   return [
     '**【本地 LLM 测试网关】**',
     `- 当前会话启用了凌霄本地 LLM Gateway；固定地址 \`${gateway.origin}\`，默认 provider: \`${gateway.provider}\`，默认模型: \`${gateway.apiModel}\`。`,
+    `- OpenAI 兼容端点完整 base URL: \`${gateway.openaiBaseUrl}\` — chat completions 路径为 \`${gateway.openaiBaseUrl}/chat/completions\`，embeddings 路径为 \`${gateway.openaiBaseUrl}/embeddings\`。`,
     `- 如果正在开发/测试用户项目的 LLM 接入，且用户没有提供项目专属 LLM 配置，可使用已注入的 ${providerVars}。`,
     '- 模型名以已注入配置为准，直接使用该模型开展开发/测试。',
     `- ${alternateEndpoint}；仅当项目代码明确使用另一套 SDK/API 格式时再切换。`,
-    `- 根秘钥（sk- 格式，仅作开发/测试用）: \`${gateway.token}\` —— 用作 \`Authorization: Bearer <sk-…>\` 或 \`x-api-key\`。`,
+    `- 根秘钥已通过环境变量 \`${providerVars}\` 注入；请直接使用环境变量获取 token，不要在代码中硬编码。`,
     '- Gateway 地址、token 和模型配置仅作为当前会话测试环境变量使用；生产配置和部署文档引用项目自己的配置入口。',
   ].join('\n');
 }

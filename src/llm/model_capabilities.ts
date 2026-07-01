@@ -5,7 +5,7 @@
  * 支持动态匹配模型、配置参数、响应字段映射
  */
 
-import { getConfigValue } from '../config.js';
+import { getConfigValue, isLlmConfigUserSet } from '../config.js';
 import {
   type ModelCapabilityConfig,
   type ModelCapabilitiesMap,
@@ -80,6 +80,33 @@ const EFFORT_TO_BUDGET: Record<string, number> = {
   xhigh: 48_000,
   max: 64_000,
 };
+
+/**
+ * Anthropic 顶层 output_config.effort 的合法档位（低 → 高）。
+ * 见 @anthropic-ai/sdk OutputConfig.effort: 'low' | 'medium' | 'high' | 'max'。
+ * 凌霄 effort 含 minimal/xhigh/adaptive/none 等扩展档，需映射到这 4 个合法值。
+ */
+const ANTHROPIC_EFFORT_ORDER = ['low', 'medium', 'high', 'max'] as const;
+type AnthropicEffort = typeof ANTHROPIC_EFFORT_ORDER[number];
+
+/**
+ * 把凌霄通用 effort 档位映射到 Anthropic output_config.effort 合法值。
+ * 规则（确定性，无启发式）：
+ *   - adaptive / none → undefined（不发 effort，由模型/网关自行决定思考强度）
+ *   - minimal → low（向下收敛到最近合法档）
+ *   - low/medium/high/max → 直接命中
+ *   - xhigh → max（向上收敛到最近合法档，保留「比 high 更强」的语义）
+ *   - 未知档位 → undefined（保守不发，避免触发 400）
+ */
+export function toAnthropicEffort(effort: string): AnthropicEffort | undefined {
+  if (effort === 'adaptive' || effort === 'none') return undefined;
+  if (effort === 'minimal') return 'low';
+  if (effort === 'xhigh') return 'max';
+  if ((ANTHROPIC_EFFORT_ORDER as readonly string[]).includes(effort)) {
+    return effort as AnthropicEffort;
+  }
+  return undefined;
+}
 
 /**
  * 把用户配置的 effort 档位映射到模型实际支持的档位值（来自 models.dev
@@ -328,8 +355,21 @@ export class ModelCapabilities {
       if (effort === 'adaptive') {
         return { [paramName]: { type: 'adaptive' } };
       }
-      const explicitBudget = getConfigValue('llm.thinking_budget_tokens');
-      const budget = typeof explicitBudget === 'number' ? explicitBudget : (EFFORT_TO_BUDGET[effort] ?? 32_000);
+      // 2026-06-23 修复「强度未传递」：anthropic thinking 的预算必须由 effort 驱动，
+      // 否则用户配置的 reasoning_effort（如 xhigh/max/medium）对 Anthropic 完全失效——
+      // 旧实现只要 llm.thinking_budget_tokens（schema 默认 32000）存在就直接采用，
+      // 把 effort 旁路掉，导致强度档位被静默丢弃，且与 JSON 驱动路径行为不一致。
+      // 现在与 JSON 驱动路径（见上文 getThinkingParams anthropic 分支）对齐：
+      //   base = EFFORT_TO_BUDGET[effort]
+      //   仅当用户在 settings.json/env 显式设定了 thinking_budget_tokens 时，
+      //   才用该精确预算覆盖 effort 估算（提供「我要精确控制预算」的逃生口）。
+      const effortBudget = EFFORT_TO_BUDGET[effort] ?? 32_000;
+      const explicitBudget = isLlmConfigUserSet('llm.thinking_budget_tokens')
+        ? getConfigValue('llm.thinking_budget_tokens')
+        : undefined;
+      const budget = typeof explicitBudget === 'number' && explicitBudget >= 0
+        ? explicitBudget
+        : effortBudget;
       if (budget <= 0) {
         return { [paramName]: { type: 'disabled' } };
       }

@@ -11,14 +11,22 @@
 
 import { coreLogger } from '../core/Log.js';
 import { getConfigValue } from '../config.js';
-import { isLlmGatewaySkKey } from '../core/LocalLlmGateway.js';
+import { isLlmGatewaySkKey, resolveLocalLlmGateway } from '../core/LocalLlmGateway.js';
 
 function getGatewayKey(): string {
   const key = String(getConfigValue('llm_gateway.api_key') || '').trim();
   return isLlmGatewaySkKey(key) ? key : '';
 }
 const DEFAULT_EMBEDDING_DIMENSIONS = 256;
-const GATEWAY_URL = 'http://127.0.0.1:62000';
+
+/** 获取网关基础 URL：优先运行时绑定的随机端口，回退到配置端口 */
+function getGatewayUrl(): string {
+  try {
+    const gateway = resolveLocalLlmGateway();
+    if (gateway) return gateway.origin;
+  } catch { /* expected */ }
+  return 'http://127.0.0.1:62000'; // 最终回退
+}
 
 
 export interface EmbeddingResult {
@@ -37,7 +45,7 @@ export async function generateEmbedding(
   dimensions: number = DEFAULT_EMBEDDING_DIMENSIONS,
 ): Promise<EmbeddingResult> {
   try {
-    const response = await fetch(`${GATEWAY_URL}/llm/openai/v1/embeddings`, {
+    const response = await fetch(`${getGatewayUrl()}/llm/openai/v1/embeddings`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

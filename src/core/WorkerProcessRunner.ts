@@ -19,7 +19,6 @@ import type { BusMessage } from './MessageBus.js';
 import type { WorkerContractComplianceProof } from './AgentProtocol.js';
 import type { SpeculativeOrchestrationPlan } from './SpeculativeOrchestrationPlanner.js';
 import type { SpeculativeWinnerEvidence } from './SpeculativeExecutionController.js';
-import type { AdaptiveStrategyPlan } from './AdaptiveHarness.js';
 import type { ContractPack } from './ContractPack.js';
 import type { ContractAllowedScope } from './ContractAllowedScope.js';
 import { coreLogger } from './Log.js';
@@ -34,6 +33,7 @@ import {
 import { registerProtectedPid, unregisterProtectedPid } from './ProcessSelfProtection.js';
 import { PidRegistry, isOrphanedEntry } from './PidRegistry.js';
 import { IPCDrainQueue } from './ipc/IPCDrainQueue.js';
+import { RESOURCE_BUDGET } from '../config/defaults.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -65,8 +65,8 @@ export interface WorkerTaskPayload {
   contractPack?: Pick<ContractPack, 'sessionId' | 'contractsDir' | 'generatedAt' | 'entries'>;
   /** Deterministic speculative branch plan derived from orchestration metadata and trace memory. */
   speculativePlan?: SpeculativeOrchestrationPlan;
-  /** Deterministic adaptive execution strategy derived from structural signals and trace memory. */
-  adaptiveStrategy?: AdaptiveStrategyPlan;
+  /** @deprecated v1.0.4: adaptive strategy removed, kept for payload compat */
+  adaptiveStrategy?: { strategy: string; params: { maxRounds: number; timeoutMs: number; parallelToolCalls: boolean }; signals: Record<string, unknown> };
   /** Prior conversation history for respawn — full agent conversation from DB */
   conversationHistory?: Array<{ role: string; content: unknown; tool_calls?: unknown[]; tool_call_id?: string; thinking?: unknown[]; timestamp?: number }>;
   /**
@@ -170,6 +170,7 @@ export interface WorkerHandle {
   error?: Error;
   lastHeartbeat: number;
   result?: string;
+  lastRss?: number;
   recentStdout: string[];
   recentStderr: string[];
   timeoutReason?: 'spawn_timeout' | 'heartbeat_timeout' | 'max_runtime' | 'zombie_detected';
@@ -207,7 +208,7 @@ export interface WorkerProcessRunnerOptions {
 const DEFAULT_OPTIONS: Required<WorkerProcessRunnerOptions> = {
   heartbeatTimeoutMs: 90000,  // 3x heartbeat interval (30s) — 容忍偶尔延迟
   spawnTimeoutMs: 30000,
-  maxRuntimeMs: 600000, // 10 minutes
+  maxRuntimeMs: 480 * 60 * 1000, // 8 hours — 与 defaults.ts WORKER_MAX_RUNTIME_MS 一致
   debug: false,
   workerScriptPath: resolve(__dirname, '../agents/WorkerProcessEntry.js'),
   heartbeatMonitorIntervalMs: 5000,
@@ -367,7 +368,7 @@ export class WorkerProcessRunner extends EventEmitter {
       const text = data.toString();
       this.appendRecentOutput(handle.recentStderr, text);
       if (this.options.debug) {
-        console.error(`[Worker ${workerId} stderr] ${text.trim()}`);
+        coreLogger.debug(`[Worker ${workerId} stderr] ${text.trim()}`);
       }
       this.emit('worker:stderr', { workerId, data: text });
     });
@@ -511,7 +512,7 @@ export class WorkerProcessRunner extends EventEmitter {
         break;
 
       case 'heartbeat':
-        this.emit('worker:heartbeat', workerId, msg.payload);
+        this.recordWorkerRss(handle, msg.payload); this.emit('worker:heartbeat', workerId, msg.payload);
         break;
 
       case 'bus_message':
@@ -632,6 +633,20 @@ export class WorkerProcessRunner extends EventEmitter {
     const handle = this.workers.get(workerId);
     if (!handle) return;
 
+    // EPIPE / ECONNRESET on IPC channel after child exit is benign —
+    // the exit handler already processes the real failure.
+    // Without this guard, the async 'error' event from a dead pipe
+    // would mark the worker as failed and emit session.agent.failed,
+    // even though handleWorkerExit has already (or will) handle it.
+    const errMsg = (error.message || '').toLowerCase();
+    const isPipeError = /epipe|econnreset|ipc channel closed/i.test(errMsg) ||
+      (error as NodeJS.ErrnoException).code === 'EPIPE' ||
+      (error as NodeJS.ErrnoException).code === 'ECONNRESET';
+    if (isPipeError && (handle.endTime !== undefined || handle.process.exitCode !== null || !handle.process.connected)) {
+      coreLogger.debug(`[WorkerProcessRunner] Benign ${(error as NodeJS.ErrnoException).code || ''} pipe error on dead worker ${workerId}, ignoring`);
+      return;
+    }
+
     handle.error = error;
     if (!isCoreWorkerActiveStatus(handle.status)) {
       return;
@@ -643,6 +658,20 @@ export class WorkerProcessRunner extends EventEmitter {
   /**
    * 启动心跳监控
    */
+  /**
+   * 记录 Worker 自报的 RSS（来自 heartbeat payload.rss）。
+   * Worker 进程内 process.memoryUsage().rss 最准确，零跨平台成本。
+   * 心跳监控循环据此做内存温控：超 WORKER_MAX_RSS_MB 则按 max_runtime 同口径 kill + 可恢复重派。
+   */
+  private recordWorkerRss(handle: WorkerHandle, payload: unknown): void {
+    if (payload && typeof payload === 'object' && 'rss' in payload) {
+      const rss = (payload as { rss?: unknown }).rss;
+      if (typeof rss === 'number' && Number.isFinite(rss) && rss >= 0) {
+        handle.lastRss = rss;
+      }
+    }
+  }
+
   private startHeartbeatMonitor(): void {
     this.heartbeatInterval = setInterval(() => {
       const now = Date.now();
@@ -692,6 +721,16 @@ export class WorkerProcessRunner extends EventEmitter {
           coreLogger.warn(`Worker ${workerId} max runtime exceeded`);
           this.markWorkerTimeout(workerId, 'max_runtime', `max runtime exceeded after ${runtime}ms`);
           this.killWorker(workerId, 'max runtime exceeded');
+        }
+
+        // 内存温控：worker 自报 RSS 超上限 → 按 max_runtime 同口径 kill + 可恢复重派，
+        // 防止失控/泄漏的子进程吃光宿主内存拖死主进程。0 表示禁用。
+        const rssLimitBytes = RESOURCE_BUDGET.WORKER_MAX_RSS_MB * 1024 * 1024;
+        if (rssLimitBytes > 0 && handle.lastRss !== undefined && handle.lastRss > rssLimitBytes) {
+          const rssMb = Math.round(handle.lastRss / 1024 / 1024);
+          coreLogger.warn(`Worker ${workerId} RSS ${rssMb}MB exceeds limit ${RESOURCE_BUDGET.WORKER_MAX_RSS_MB}MB — killing (memory throttle)`);
+          this.markWorkerTimeout(workerId, 'max_runtime', `rss ${rssMb}MB exceeds ${RESOURCE_BUDGET.WORKER_MAX_RSS_MB}MB`);
+          this.killWorker(workerId, `rss limit exceeded (${rssMb}MB)`);
         }
       }
     }, this.options.heartbeatMonitorIntervalMs);
@@ -773,7 +812,7 @@ export class WorkerProcessRunner extends EventEmitter {
 
       return true;
     } catch (error) {
-      console.error(`[WorkerProcessRunner] Failed to kill worker ${workerId}:`, error);
+      coreLogger.error(`[WorkerProcessRunner] Failed to kill worker ${workerId}:`, error);
       return false;
     }
   }
@@ -797,7 +836,7 @@ export class WorkerProcessRunner extends EventEmitter {
       handle.process.send(message as unknown as Serializable);
       return true;
     } catch (error) {
-      console.error(`[WorkerProcessRunner] Failed to send message to worker ${workerId}:`, error);
+      coreLogger.error(`[WorkerProcessRunner] Failed to send message to worker ${workerId}:`, error);
       return false;
     }
   }

@@ -58,7 +58,7 @@ export function trimMessageWindow(messages: Message[]): Message[] {
 /** Max retained messages per agent (compacted on agent completion). */
 export const MAX_AGENT_MESSAGES_PER_AGENT = 200;
 /** Max retained agent conversations; running agents are never evicted. */
-export const MAX_AGENT_CONVERSATIONS = 30;
+export const MAX_AGENT_CONVERSATIONS = 15;
 /** Max retained agent metadata entries in s.agents (resets per-session on switch); running agents never evicted. */
 export const MAX_AGENTS = 100;
 export const TERMINAL_AGENT_STATUSES: ReadonlySet<string> = new Set(['completed', 'interrupted', 'failed']);

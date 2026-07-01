@@ -27,13 +27,14 @@ import { ensureModeWorktree } from '../core/ModeWorktreeService.js';
 import { attachTeamMailboxDatabase, getTeamMailbox } from '../core/TeamMailbox.js';
 import { TeamCommunicationService } from '../core/TeamCommunicationService.js';
 import type { ScheduledTaskManager } from '../core/ScheduledTaskManager.js';
+import type { TokenUsageView } from '../types/canonical.js';
 
 export interface SessionRuntimeComponents {
   workspaceObj: Workspace;
   board: TaskBoard;
   bus: MessageBus;
   tracker: TokenTracker & {
-    usageMap: Map<string, { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }>;
+    usageMap: Map<string, TokenUsageView>;
   };
   llm: ContentGenerator;
   toolRegistry: ToolRegistry;
@@ -70,20 +71,22 @@ export function createSessionTokenTracker(
   db: DatabaseManager,
   emitter: EventEmitter,
 ): TokenTracker & {
-  usageMap: Map<string, { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }>;
+  usageMap: Map<string, TokenUsageView>;
 } {
   const trackerImpl: TokenTracker & {
-    usageMap: Map<string, { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }>;
+    usageMap: Map<string, TokenUsageView>;
   } = {
-    usageMap: new Map<string, { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }>(),
-    addUsage: (agentId: string, usage: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }, modelName?: string) => {
-      const current = trackerImpl.usageMap.get(agentId) ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
+    usageMap: new Map<string, TokenUsageView>(),
+    addUsage: (agentId: string, usage: TokenUsageView, modelName?: string) => {
+      const current = trackerImpl.usageMap.get(agentId) ?? { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 };
       const next = {
         prompt: current.prompt + usage.prompt,
         completion: current.completion + usage.completion,
         total: current.total + usage.total,
         cache_read: (current.cache_read ?? 0) + (usage.cache_read ?? 0),
         cache_creation: (current.cache_creation ?? 0) + (usage.cache_creation ?? 0),
+        reasoning: (current.reasoning ?? 0) + (usage.reasoning ?? 0),
+        credit: (current.credit ?? 0) + (usage.credit ?? 0),
       };
       trackerImpl.usageMap.set(agentId, next);
       db.insertTokenUsage(sessionId, agentId, agentId, usage.prompt, usage.completion, usage.total, modelName, usage.cache_read, usage.cache_creation);
@@ -97,6 +100,8 @@ export function createSessionTokenTracker(
           total: usage.total,
           ...(usage.cache_read != null ? { cache_read: usage.cache_read } : {}),
           ...(usage.cache_creation != null ? { cache_creation: usage.cache_creation } : {}),
+          ...(usage.reasoning != null ? { reasoning: usage.reasoning } : {}),
+          ...(usage.credit != null ? { credit: usage.credit } : {}),
         },
       });
     },

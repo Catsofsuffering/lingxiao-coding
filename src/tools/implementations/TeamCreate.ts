@@ -7,6 +7,7 @@
 import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { getTeamMailbox, getTeamMemberRegistry } from '../../core/TeamMailbox.js';
+import { coreLogger } from '../../core/Log.js';
 
 export class TeamCreateTool extends Tool {
   readonly name = '__team_manage_create';
@@ -98,7 +99,7 @@ export class TeamCreateTool extends Tool {
         });
       } catch (err) {
         // 投影失败不应让 team 创建失败 — 用户视角 mailbox 已 OK，黑板侧仅是观测增强。
-        console.warn(`[TeamCreate] blackboard group projection failed: ${err instanceof Error ? err.message : String(err)}`);
+        coreLogger.warn(`[TeamCreate] blackboard group projection failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 

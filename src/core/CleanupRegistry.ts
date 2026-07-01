@@ -59,7 +59,7 @@ export class CleanupRegistry {
     for (const entry of sortedCleanups) {
       // 检查是否超时
       if (Date.now() - startTime > timeout) {
-        console.warn('[Cleanup] 超时，停止执行剩余清理函数');
+        coreLogger.warn('[Cleanup] 超时，停止执行剩余清理函数');
         break;
       }
 
@@ -74,7 +74,7 @@ export class CleanupRegistry {
         }
         successCount++;
       } catch (error) {
-        console.error(`[Cleanup] 清理函数执行失败:`, error);
+        coreLogger.error('[Cleanup] 清理函数执行失败:', error);
       }
     }
 

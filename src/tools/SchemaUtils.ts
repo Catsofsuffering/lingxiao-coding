@@ -17,9 +17,53 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): JsonSchema {
     toJSONSchema?: (schema: z.ZodTypeAny) => JsonSchema;
   };
   if (typeof zodWithJsonSchema.toJSONSchema === 'function') {
-    return zodWithJsonSchema.toJSONSchema(schema);
+    return stripDefaultedFromRequired(zodWithJsonSchema.toJSONSchema(schema));
   }
   return convert(schema);
+}
+
+/**
+ * zod v4 的原生 toJSONSchema 把带 .default() 的字段算进 required（input 端语义：
+ * default 只在缺省时补值，但字段仍被标 required）。这会污染暴露给 LLM 的 schema 和
+ * 任何基于该 JSON schema 的 ajv 校验：例如 structured_patch 的 search hunk 里
+ * replace_all = z.boolean().optional().default(false) 被列入 required，导致不带
+ * replace_all 的 hunk 无法匹配 anyOf 任一 variant，报 `hunks: Invalid input`。
+ *
+ * 修正：递归遍历整个 schema 树，凡 properties[k] 自身带 default 的，从同级 required
+ * 中剔除（default 字段天然可选）。覆盖 properties / items / oneOf / anyOf / allOf /
+ * $defs / definitions 等所有嵌套位置，是所有工具 schema 的单点修复。
+ */
+function stripDefaultedFromRequired(schema: JsonSchema): JsonSchema {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) {
+    return (schema as unknown[]).map((item) =>
+      stripDefaultedFromRequired(item as JsonSchema)) as unknown as JsonSchema;
+  }
+  const out: JsonSchema = {};
+  for (const [key, value] of Object.entries(schema)) {
+    out[key] = (value && typeof value === 'object')
+      ? stripDefaultedFromRequired(value as JsonSchema)
+      : value;
+  }
+  const props = out.properties;
+  if (props && typeof props === 'object' && !Array.isArray(props) && Array.isArray(out.required)) {
+    const defaulted = new Set<string>();
+    for (const [k, v] of Object.entries(props as Record<string, unknown>)) {
+      if (v && typeof v === 'object' && !Array.isArray(v) && 'default' in (v as Record<string, unknown>)) {
+        defaulted.add(k);
+      }
+    }
+    if (defaulted.size > 0) {
+      const nextRequired = (out.required as unknown[])
+        .filter((r): r is string => typeof r === 'string' && !defaulted.has(r));
+      if (nextRequired.length > 0) {
+        out.required = nextRequired;
+      } else {
+        delete out.required;
+      }
+    }
+  }
+  return out;
 }
 
 function convert(schema: unknown): JsonSchema {

@@ -17,6 +17,11 @@
 import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { createWorker } from 'tesseract.js';
+import {
+  LOCAL_TESSDATA_DIR,
+  isTessdataAvailable,
+  localWorkerOptions,
+} from '../../llm/tesseractResolver.js';
 import { fetchWithSafeRedirects } from './WebCommon.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -28,8 +33,6 @@ import {
   popSuppressedError,
 } from '../../core/RuntimeGuards.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LOCAL_TESSDATA_DIR = path.resolve(__dirname, '../../../tessdata');
 
 /** OCR 操作超时（ms） */
 const OCR_TIMEOUT_MS = 60_000;
@@ -168,6 +171,16 @@ export class OCRTool extends Tool {
     const languages = params.languages || ['eng', 'chi_sim'];
     const langStr = languages.join('+');
 
+    // 前置守卫：本地语言数据缺失时直接快速失败，而非让 createWorker 退回 CDN 下载空跑到超时。
+    if (!isTessdataAvailable()) {
+      return {
+        success: false,
+        data: null,
+        error: `OCR 不可用：未找到本地 tessdata 语言数据 (${LOCAL_TESSDATA_DIR})。\n` +
+          `请确认 tessdata/ 目录存在并含 eng.traineddata.gz，或设置环境变量 LINGXIAO_TESSDATA_DIR 指向该目录。`,
+      };
+    }
+
     try {
       const { buffer, mimeType } = await loadImageAsBuffer(params.image, params.from);
 
@@ -194,7 +207,7 @@ export class OCRTool extends Tool {
       try {
         const worker = await withTimeout(
           createWorker(langStr, 1, {
-            langPath: LOCAL_TESSDATA_DIR,
+            ...localWorkerOptions(),
             gzip: true,
             cacheMethod: 'none',
             logger: () => {}, // Suppress progress logging

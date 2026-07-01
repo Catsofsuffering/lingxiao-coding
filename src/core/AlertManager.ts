@@ -16,6 +16,7 @@
 import { writeFileSync, appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { CONFIG_DIR } from '../config.js';
+import { coreLogger } from './Log.js';
 
 // ─── types ───
 
@@ -139,7 +140,7 @@ export class AlertManager {
       void Promise.resolve()
         .then(() => channel.send(full))
         .catch((err) => {
-          console.warn(`[AlertManager] 通道 "${channel.name}" 告警投递失败:`, err instanceof Error ? err.message : String(err));
+          coreLogger.warn(`[AlertManager] 通道 "${channel.name}" 告警投递失败:`, err instanceof Error ? err.message : String(err));
         });
     }
   }
@@ -154,7 +155,7 @@ export class AlertManager {
     void Promise.resolve()
       .then(() => channel.send(full))
       .catch((err) => {
-        console.warn(`[AlertManager] 通道 "${channelName}" 告警投递失败:`, err instanceof Error ? err.message : String(err));
+        coreLogger.warn(`[AlertManager] 通道 "${channelName}" 告警投递失败:`, err instanceof Error ? err.message : String(err));
       });
   }
 }

@@ -11,6 +11,8 @@
 | [system-architecture.md](./system-architecture.md) | 系统分层架构图、层间依赖规则 | 全局 |
 | [core-engine.md](./core-engine.md) | 核心引擎层模块接口与契约 | `src/core/` |
 | [agent-orchestration.md](./agent-orchestration.md) | Agent 编排层模块接口与契约 | `src/agents/` |
+| [autonomy-governor.md](./autonomy-governor.md) | Autonomy Mode、Grant、RuntimeGate、LoopBreaker、PromptSegment 与 Web/TUI 同步契约 | Leader harness + Agent runtime + Web/TUI |
+| [autonomy-governor-views.md](./autonomy-governor-views.md) | Autonomy Governor 在 Web UI、TUI、Agent、Task、Permission、Cost、Trace 视图中的可视化契约 | Web/TUI + runtime events |
 | [web-server.md](./web-server.md) | Web 服务器层 API 端点与认证契约 | `src/web-server/` |
 | [sse-events.md](./sse-events.md) | SSE 事件名映射表与数据结构 | 跨层（后端→前端） |
 | [frontend.md](./frontend.md) | 前端状态管理与事件消费契约 | `web/src/` + `src/tui/` |

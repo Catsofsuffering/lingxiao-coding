@@ -7,6 +7,7 @@
 import { GitService, type Checkpoint, type FileDiff } from './GitService.js';
 import type { DatabaseRepositoryAdapter, AgentLog } from '../core/DatabaseRepositories.js';
 import { getConfigValue } from '../config.js';
+import { serverLogger } from '../core/Log.js';
 
 /** Parse [turn:N] [tool] / [turn:N] Turn labels to extract metadata */
 function parseCheckpointLabel(message: string): Pick<Checkpoint, 'turnNumber' | 'toolName' | 'type' | 'actorType' | 'agentName' | 'taskId'> {
@@ -211,7 +212,7 @@ export class FileChangesApi {
 
     const workspace = session.workspace;
     if (!workspace) {
-      console.error(`[FileChangesApi] Session ${sessionId} has no workspace — refusing to fall back to process.cwd()`);
+      serverLogger.error('[FileChangesApi] session has no workspace, refusing process.cwd() fallback', { sessionId });
       return null;
     }
     const gitService = new GitService(workspace);
@@ -219,7 +220,7 @@ export class FileChangesApi {
     try {
       await gitService.initialize();
     } catch (err) {
-      console.error(`[FileChangesApi] Failed to init GitService for session ${sessionId}:`, err);
+      serverLogger.error('[FileChangesApi] failed to init GitService', { sessionId, error: String(err) });
       return null;
     }
 
@@ -441,7 +442,7 @@ export class FileChangesApi {
         hash = await git.createFileSnapshot(message, sessionId);
       } catch (err) {
         // Git snapshot failure — still record the tool event below
-        console.warn(`[FileChangesApi] git snapshot failed: ${err instanceof Error ? err.message : err}`);
+        serverLogger.warn('[FileChangesApi] git snapshot failed', { error: String(err) });
       }
     }
 

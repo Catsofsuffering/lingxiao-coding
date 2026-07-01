@@ -201,6 +201,44 @@ body {
   color: var(--color-text-primary);
 }
 
+/*
+ * Electron reduced-effects mode.
+ * Windows packaged desktop builds enable this by default from src/desktop/main.ts.
+ * It keeps layout and business UI intact while removing high-cost paint/compositor effects
+ * that caused MSI-installed builds to feel sluggish on chat/log/terminal-heavy screens.
+ */
+:root[data-reduced-effects="true"] {
+  --motion-fast: 1ms;
+  --motion-base: 1ms;
+  --motion-slow: 1ms;
+  --breath-period: 1ms;
+  --glass-edge: none;
+  --shadow-flat: none;
+  --shadow-card: none;
+  --shadow-floating: none;
+  --glow-brand: none;
+  scroll-behavior: auto !important;
+}
+
+:root[data-reduced-effects="true"] *,
+:root[data-reduced-effects="true"] *::before,
+:root[data-reduced-effects="true"] *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+  will-change: auto !important;
+}
+
+:root[data-reduced-effects="true"] *,
+:root[data-reduced-effects="true"] *::before,
+:root[data-reduced-effects="true"] *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: none !important;
+  filter: none !important;
+  text-shadow: none !important;
+}
+
 #root {
   position: relative;
   min-height: 100vh;
@@ -935,22 +973,37 @@ a:hover {
 }
 
 .codex-topbar {
-  /* 顶栏：移除旧金色流云，保持克制玻璃层，让背景图作为主视觉。 */
-  background: color-mix(in srgb, #ffffff 84%, var(--color-bg-primary));
-  border-bottom-color: color-mix(in srgb, var(--color-border-default) 72%, transparent);
+  /* Light 顶栏：温润玉质感 + 淡金点缀 */
+  background: 
+    linear-gradient(180deg, 
+      color-mix(in srgb, var(--lingxiao-jade-soft) 68%, #ffffff),
+      color-mix(in srgb, var(--lingxiao-jade-soft) 42%, #ffffff)
+    ),
+    color-mix(in srgb, #ffffff 92%, var(--lingxiao-cloud));
+  border-bottom-color: color-mix(in srgb, var(--lingxiao-jade-deep) 18%, transparent);
   box-shadow:
-    inset 0 -1px 0 color-mix(in srgb, var(--lingxiao-glass-highlight) 54%, transparent),
-    0 10px 26px rgba(39, 60, 58, 0.055);
+    inset 0 -1px 0 color-mix(in srgb, var(--lingxiao-sword) 12%, transparent),
+    0 4px 16px rgba(138, 101, 31, 0.08),
+    0 1px 4px rgba(138, 101, 31, 0.06);
 }
 
 [data-theme="dark"] .codex-topbar {
+  /* Dark 顶栏：与主题底色同步，墨底青锋，深邃有神。
+     此前误用 --lingxiao-ink(暗色下为近白 #eff2f1)与不存在的 --lingxiao-jade,
+     导致顶栏偏灰、与主题脱节。现改用 --color-bg-secondary / --color-bg-primary
+     作为基底，叠加 --lingxiao-sword 暖金微光与 --lingxiao-jade-deep 青锋点缀，
+     使顶栏与侧栏/聊天底色保持同一色阶。 */
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-secondary) 52%, transparent), color-mix(in srgb, var(--color-bg-primary) 72%, transparent)),
-    color-mix(in srgb, var(--color-bg-primary) 58%, transparent);
-  border-bottom-color: color-mix(in srgb, var(--color-border-muted) 72%, transparent);
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--color-bg-secondary) 96%, var(--lingxiao-sword) 4%),
+      color-mix(in srgb, var(--color-bg-primary) 98%, var(--lingxiao-jade-deep) 2%)
+    ),
+    var(--color-bg-primary);
+  border-bottom-color: color-mix(in srgb, var(--lingxiao-jade-deep) 22%, var(--color-border-muted));
   box-shadow:
-    inset 0 -1px 0 color-mix(in srgb, var(--lingxiao-glass-highlight) 26%, transparent),
-    0 10px 26px rgba(0, 0, 0, 0.22);
+    inset 0 -1px 0 color-mix(in srgb, var(--lingxiao-jade-deep) 16%, transparent),
+    0 6px 20px rgba(0, 0, 0, 0.28),
+    0 2px 8px rgba(0, 0, 0, 0.34);
 }
 
 .chat-composer-area {
@@ -2633,6 +2686,212 @@ input[type="number"]::placeholder {
 .browser-viewport.is-inspecting {
   cursor: crosshair;
 }
+/* v1.0.5: 剑阁浏览器交互模式 */
+.browser-viewport.is-clickable {
+  cursor: pointer;
+}
+/* v1.0.5: iframe 实时模式 */
+.browser-iframe-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.browser-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: white;
+}
+.browser-screencast-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-bg-secondary);
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+}
+
+.browser-screencast-container canvas {
+  outline: none;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+
+.browser-inspect-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: transparent;
+}
+
+
+.browser-click-ripple {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  border-radius: 50%;
+  border: 2px solid var(--color-accent-brand);
+  background: color-mix(in srgb, var(--color-accent-brand) 20%, transparent);
+  animation: browser-ripple 0.6s ease-out forwards;
+  pointer-events: none;
+  z-index: 10;
+}
+
+@keyframes browser-ripple {
+  0% { transform: scale(0.5); opacity: 1; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+.browser-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border-muted);
+  background: var(--color-bg-tertiary);
+  flex-shrink: 0;
+  position: relative;
+}
+
+.browser-mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.browser-mode-btn:hover {
+  color: var(--color-text-secondary);
+  background: var(--color-bg-hover);
+}
+
+.browser-mode-btn.is-active {
+  color: var(--color-accent-brand);
+  background: color-mix(in srgb, var(--color-accent-brand) 12%, transparent);
+}
+
+.browser-js-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--color-border-muted);
+  border-radius: 3px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+.browser-js-input:focus {
+  border-color: color-mix(in srgb, var(--color-accent-brand) 50%, transparent);
+}
+.browser-input-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border-muted);
+  background: var(--color-bg-tertiary);
+  flex-shrink: 0;
+}
+
+.browser-text-input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--color-border-muted);
+  border-radius: 4px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: 11px;
+  outline: none;
+}
+
+.browser-text-input:focus {
+  border-color: color-mix(in srgb, var(--color-accent-brand) 50%, transparent);
+}
+
+.browser-text-input::placeholder {
+  color: var(--color-text-quaternary);
+  font-size: 10px;
+}
+
+
+.browser-eval-result {
+  position: absolute;
+  bottom: 100%;
+  right: 0;
+  z-index: 20;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border-muted);
+  border-radius: 4px;
+  padding: 4px;
+  max-width: 300px;
+}
+
+.browser-direct-patch-btn {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: none;
+  background: color-mix(in srgb, var(--color-accent-green) 15%, transparent);
+  color: var(--color-accent-green);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.browser-direct-patch-btn:hover {
+  background: color-mix(in srgb, var(--color-accent-green) 25%, transparent);
+}
+
+.browser-direct-patch-btn:disabled {
+  opacity: 0.5;
+}
+
+.browser-html-edit {
+  margin-top: 4px;
+  padding: 4px;
+  background: var(--color-bg-tertiary);
+  border-radius: 4px;
+}
+
+.browser-html-textarea {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--color-border-muted);
+  border-radius: 3px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  resize: vertical;
+  outline: none;
+}
+
+.browser-html-textarea:focus {
+  border-color: color-mix(in srgb, var(--color-accent-brand) 50%, transparent);
+}
+
 
 .browser-viewport img {
   display: block;
@@ -2839,7 +3098,7 @@ input[type="number"]::placeholder {
 }
 
 .workbench-panel.is-browser {
-  min-width: min(780px, calc(100vw - 420px));
+  min-width: min(480px, calc(100vw - 360px));
 }
 
 .workbench-collapsed-rail {
@@ -3910,10 +4169,22 @@ input[type="number"]::placeholder {
 
 .browser-dock-shell--expanded {
   height: 100%;
+  min-height: 0;
+  overflow-y: auto;
   border-radius: 8px;
   background:
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg-card) 86%, transparent), var(--color-bg-primary));
   padding: 10px;
+}
+
+/* 固定高度控制区不被 viewport 的 min-height 压缩/挤出可视区 */
+.browser-dock-shell--expanded > .browser-tab-strip,
+.browser-dock-shell--expanded > .browser-url-row,
+.browser-dock-shell--expanded > .browser-suggestion-row,
+.browser-dock-shell--expanded > .browser-mode-bar,
+.browser-dock-shell--expanded > .browser-input-bar,
+.browser-dock-shell--expanded > .browser-dock-header {
+  flex-shrink: 0;
 }
 
 .workbench-panel.is-browser .browser-dock-shell--expanded {
@@ -4032,6 +4303,7 @@ input[type="number"]::placeholder {
 }
 
 .browser-preview-column {
+  position: relative;
   display: flex;
   min-height: 0;
   flex: 1;
@@ -4040,13 +4312,13 @@ input[type="number"]::placeholder {
 }
 
 .browser-dock-shell--expanded .browser-viewport {
-  flex: 1;
-  min-height: clamp(440px, calc(100vh - 390px), 720px);
+  flex: 1 1 auto;
+  min-height: clamp(240px, calc(100vh - 390px), 720px);
   aspect-ratio: auto;
 }
 
 .workbench-panel.is-browser .browser-dock-shell--expanded .browser-viewport {
-  min-height: clamp(520px, calc(100vh - 340px), 820px);
+  min-height: clamp(280px, calc(100vh - 340px), 820px);
 }
 
 .workbench-panel.is-browser .browser-workspace.has-selection .browser-viewport {
@@ -4103,7 +4375,7 @@ input[type="number"]::placeholder {
 
 @media (max-width: 1399px) {
   .workbench-panel.is-browser {
-    min-width: min(680px, calc(100vw - 360px));
+    min-width: min(420px, calc(100vw - 320px));
   }
 
   .workbench-panel.is-browser .browser-workspace.has-selection {

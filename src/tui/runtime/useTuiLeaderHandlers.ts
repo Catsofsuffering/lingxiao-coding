@@ -36,6 +36,8 @@ interface UseTuiLeaderHandlersOptions {
   showThinkingContent: boolean;
   /** 工具执行状态 setter — 驱动 StreamingStatusLine tool_executing phase */
   setToolExecutingState: Dispatch<SetStateAction<{ toolName?: string; startedAt?: number; partialJson?: string }>>;
+  /** 重置 streaming token 计数 — Leader 输出完成后清除残留 */
+  resetStreamingTokens: () => void;
 }
 
 /**
@@ -68,6 +70,7 @@ export function useTuiLeaderHandlers({
   switchTab,
   showThinkingContent,
   setToolExecutingState,
+  resetStreamingTokens,
 }: UseTuiLeaderHandlersOptions) {
   // Refs so we can keep stable callbacks while dependent props may change.
   const showThinkingRef = useRef(showThinkingContent);
@@ -184,6 +187,8 @@ export function useTuiLeaderHandlers({
     setLeaderStatus(t('tui.leader.status.observing'));
     leaderStatusRef.current = t('tui.leader.status.observing');
     updateChannelStatus('main', t('tui.leader.status.observing'));
+    // Leader 输出完成：重置 streaming token 计数，防止状态栏残留「处理中」
+    resetStreamingTokens();
   }, [
     appendMessage,
     channelsRef,
@@ -191,6 +196,7 @@ export function useTuiLeaderHandlers({
     flushStreamBuffer,
     leaderStatusRef,
     markVisibleLeaderActivity,
+    resetStreamingTokens,
     setLeaderStatus,
     updateChannelNext,
     updateChannelStatus,

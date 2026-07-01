@@ -2,6 +2,9 @@ import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import en from './locales/en.json';
 import zh from './locales/zh.json';
+import { createLogger } from '../utils/logger';
+
+const log = createLogger('i18n');
 
 export type WebLanguage = 'zh' | 'en';
 
@@ -21,7 +24,7 @@ export function persistLanguage(language: WebLanguage): void {
   try {
     localStorage.setItem(LANGUAGE_STORAGE_KEY, JSON.stringify({ language }));
   } catch (err) {
-    console.warn('[i18n] Failed to persist language preference:', err);
+    log.warn('Failed to persist language preference:', err);
   }
 }
 
@@ -32,7 +35,7 @@ const savedLocale = (() => {
     const language = normalizeLanguage(parsed?.language);
     if (language) return language;
   } catch (err) {
-    console.warn('[i18n] Failed to load saved language preference:', err);
+    log.warn('Failed to load saved language preference:', err);
   }
   return 'zh';
 })();

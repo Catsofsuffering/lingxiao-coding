@@ -76,12 +76,13 @@ export function isCtrlCKey(key: KeyLike): boolean {
   return (key?.name === 'c' && key?.ctrl === true) || key?.sequence === '\x03';
 }
 
-export type TuiModeShortcutAction = 'collaboration' | 'route' | 'permission';
+export type TuiModeShortcutAction = 'collaboration' | 'route' | 'autonomy' | 'permission';
 
 export function resolveTuiModeShortcut(key: KeyLike, inputBuffer: string): TuiModeShortcutAction | null {
   if (!key?.meta || inputBuffer.length !== 0) return null;
   if (key.name === 'c') return 'collaboration';
   if (key.name === 'r') return 'route';
+  if (key.name === 'a') return 'autonomy';
   if (key.name === 'p') return 'permission';
   return null;
 }
@@ -140,6 +141,7 @@ interface UseTuiKeyControllerOptions {
   handleTabSwitchRef: MutableRefObject<(direction: 'next' | 'prev') => void>;
   onToggleCollaborationMode?: () => Promise<void> | void;
   onCycleExecutionRoute?: () => Promise<void> | void;
+  onCycleAutonomyMode?: () => Promise<void> | void;
   onCyclePermissionMode?: () => Promise<void> | void;
   leaderRuntimeQueueLength: number;
   onClearPendingMessages?: () => Promise<void>;
@@ -206,6 +208,7 @@ export function useTuiKeyController(opts: UseTuiKeyControllerOptions): (key: Key
     handleTabSwitchRef,
     onToggleCollaborationMode,
     onCycleExecutionRoute,
+    onCycleAutonomyMode,
     onCyclePermissionMode,
     leaderRuntimeQueueLength,
     onClearPendingMessages,
@@ -350,6 +353,10 @@ export function useTuiKeyController(opts: UseTuiKeyControllerOptions): (key: Key
       }
       if (modeShortcut === 'route' && onCycleExecutionRoute) {
         void onCycleExecutionRoute();
+        return;
+      }
+      if (modeShortcut === 'autonomy' && onCycleAutonomyMode) {
+        void onCycleAutonomyMode();
         return;
       }
       if (modeShortcut === 'permission' && onCyclePermissionMode) {
@@ -497,6 +504,7 @@ export function useTuiKeyController(opts: UseTuiKeyControllerOptions): (key: Key
     navigateInputHistory,
     onClearPendingMessages,
     onCycleExecutionRoute,
+    onCycleAutonomyMode,
     onCyclePermissionMode,
     onLanguageChanged,
     onOpenGit,

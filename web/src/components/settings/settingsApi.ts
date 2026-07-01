@@ -1,9 +1,12 @@
 import { getServerToken } from '../../api/headers';
+import { createLogger } from '../../utils/logger';
 import type {
   CreateModelProviderRequest,
   ModelProviderMutationResponse,
   UpdateModelProviderRequest,
 } from './types';
+
+const log = createLogger('settingsApi');
 
 export const SETTINGS_CHANGED_EVENT = 'lingxiao:settings-changed';
 
@@ -36,7 +39,7 @@ export async function settingsApiFetch<T>(path: string, opts?: RequestInit): Pro
       if (data?.message) message = String(data.message);
       else if (data?.error) message = String(data.error);
     } catch (err) {
-      console.warn('[settingsApi] Failed to parse error response:', err);
+      log.warn('Failed to parse error response:', err);
     }
     throw new Error(message);
   }

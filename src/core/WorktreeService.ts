@@ -38,6 +38,48 @@ export interface CreateWorktreeInput {
   taskId?: string;
 }
 
+export type WorktreeMergeReadinessLabel =
+  | 'auto_ff_ok'
+  | 'clean_no_delta'
+  | 'dirty_needs_commit_or_patch'
+  | 'dirty_with_commits_needs_commit_or_clean'
+  | 'clean_non_ff_needs_rebase_or_manual'
+  | 'missing'
+  | 'not_ready';
+
+export interface WorktreeMergeReadiness {
+  id: string;
+  name: string;
+  taskId?: string;
+  path: string;
+  branch: string;
+  baseBranch: string;
+  baseRef: string;
+  exists: boolean;
+  label: WorktreeMergeReadinessLabel;
+  canAutoMerge: boolean;
+  reasons: string[];
+  ahead: number;
+  behind: number;
+  baseIsAncestor: boolean;
+  conflictHint: boolean;
+  currentBranch?: string;
+  dirtyFiles: number;
+  modified: string[];
+  staged: string[];
+  untracked: string[];
+  conflicted: string[];
+}
+
+export interface WorktreeAuditResult {
+  repoRoot: string;
+  baseRef: string;
+  currentBranch: string;
+  mainClean: boolean;
+  worktrees: WorktreeMergeReadiness[];
+  summary: Record<WorktreeMergeReadinessLabel, number>;
+}
+
 const DEFAULT_WORKTREE_ROOT = join(CONFIG_DIR, 'worktrees');
 
 function getDefaultWorktreeRoot(): string {
@@ -92,6 +134,25 @@ async function runGit(args: string[], cwd: string): Promise<{ stdout: string; st
       }
     });
   });
+}
+
+async function tryGit(args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolveRun) => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => resolveRun({ code: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) }));
+    child.on('close', (code) => resolveRun({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
+  });
+}
+
+function parseCount(value: string): number {
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
 function parseStatus(text: string, branch: string): WorktreeLiveStatus {

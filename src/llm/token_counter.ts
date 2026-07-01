@@ -1,5 +1,6 @@
 import { contentToPlainText, thinkingBlocksToText, type MessageContent, type ThinkingBlock, type ToolCall } from './types.js';
 import { getCachedEncoder } from '../core/TiktokenCache.js';
+import { llmLogger } from '../core/Log.js';
 
 /** once-flag: 避免 tiktoken 不可用时每次调用都打印 warn */
 let _warnedTiktokenUnavailable = false;
@@ -25,14 +26,14 @@ export function countTokens(text: string): number {
       // tiktoken 编码失败时降级为启发式，仅首次打印 warn
       if (!_warnedTiktokenUnavailable) {
         _warnedTiktokenUnavailable = true;
-        console.warn('[token_counter] tiktoken encode failed, falling back to heuristic:', err);
+        llmLogger.warn('[token_counter] tiktoken encode failed, falling back to heuristic:', err);
       }
     }
   } else {
     // encoder 未能加载（tiktoken wasm 初始化失败），仅首次打印 warn
     if (!_warnedTiktokenUnavailable) {
       _warnedTiktokenUnavailable = true;
-      console.warn('[token_counter] tiktoken encoder unavailable, using heuristic estimate');
+      llmLogger.warn('[token_counter] tiktoken encoder unavailable, using heuristic estimate');
     }
   }
 

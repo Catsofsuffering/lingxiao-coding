@@ -231,69 +231,74 @@ export default function RunStatusStrip({
   const compactLabel = compactingProgress?.label || phaseLabel(t, phase, compactingProgress);
 
   return (
-    <div className="border-b border-border-muted bg-bg-secondary/62 px-3 py-1.5 backdrop-blur-2xl">
-      <div className="mx-auto flex h-8 max-w-[1240px] items-center gap-1.5 overflow-hidden text-[11px] text-text-secondary">
-        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-          {phaseVisible && (
-            <StatusPill tone={phaseTone(phase)} title={t('runStatus.phaseTitle', { phase })}>
-              {ACTIVE_PHASES.has(phase) ? <Loader2 size={12} className="animate-spin" /> : <Activity size={12} />}
-              <span className="font-medium">{t('runStatus.now')}</span>
-              <span>{phaseLabel(t, phase, compactingProgress)}</span>
-            </StatusPill>
-          )}
+    <div className="border-b border-border-muted bg-bg-secondary/62 px-2 py-1.5 backdrop-blur-2xl">
+      <div className="mx-auto grid max-w-[1240px] grid-cols-[minmax(0,1fr)_auto] items-center gap-2 text-[11px] text-text-secondary">
+        <div className="relative min-w-0">
+          <div className="min-w-0 overflow-x-auto overscroll-x-contain pr-1 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
+            <div className="flex w-max min-w-full items-center gap-1.5">
+              {phaseVisible && (
+                <StatusPill tone={phaseTone(phase)} title={t('runStatus.phaseTitle', { phase })}>
+                  {ACTIVE_PHASES.has(phase) ? <Loader2 size={12} className="animate-spin" /> : <Activity size={12} />}
+                  <span className="font-medium">{t('runStatus.now')}</span>
+                  <span>{phaseLabel(t, phase, compactingProgress)}</span>
+                </StatusPill>
+              )}
 
-          {showOrchestration && orchestrationStatus && (
-            <StatusPill tone={orchestrationTone(orchestrationStatus)} title={orchestrationStatus.reason || orchestrationStatus.bottleneck || orchestrationStatus.summary}>
-              <Network size={12} />
-              <span className="font-medium">{t('runStatus.tasks')}</span>
-              <span>{orchestrationLabel(t, orchestrationStatus)}</span>
-              {nodeProgress && <span className="text-text-tertiary">{nodeProgress}</span>}
-            </StatusPill>
-          )}
+              {showOrchestration && orchestrationStatus && (
+                <StatusPill tone={orchestrationTone(orchestrationStatus)} title={orchestrationStatus.reason || orchestrationStatus.bottleneck || orchestrationStatus.summary}>
+                  <Network size={12} />
+                  <span className="font-medium">{t('runStatus.tasks')}</span>
+                  <span>{orchestrationLabel(t, orchestrationStatus)}</span>
+                  {nodeProgress && <span className="text-text-tertiary">{nodeProgress}</span>}
+                </StatusPill>
+              )}
 
-          {agents.length > 0 && (
-            <StatusPill tone={agentTone} title={runningAgents.map((agent) => agent.agentName || agent.agentId).filter(Boolean).join(', ') || t('runStatus.agents')}>
-              <Bot size={12} />
-              <span className="font-medium">{t('runStatus.agents')}</span>
-              {runningAgents.length > 0 && <span>{t('runStatus.agentsRunning', { count: runningAgents.length })}</span>}
-              {completedAgents.length > 0 && <span>{t('runStatus.agentsDone', { count: completedAgents.length })}</span>}
-              {failedAgents.length > 0 && <span>{t('runStatus.agentsFailed', { count: failedAgents.length })}</span>}
-              <span className="text-text-tertiary">{t('runStatus.agentsOf', { count: agents.length })}</span>
-            </StatusPill>
-          )}
+              {agents.length > 0 && (
+                <StatusPill tone={agentTone} title={runningAgents.map((agent) => agent.agentName || agent.agentId).filter(Boolean).join(', ') || t('runStatus.agents')}>
+                  <Bot size={12} />
+                  <span className="font-medium">{t('runStatus.agents')}</span>
+                  {runningAgents.length > 0 && <span>{t('runStatus.agentsRunning', { count: runningAgents.length })}</span>}
+                  {completedAgents.length > 0 && <span>{t('runStatus.agentsDone', { count: completedAgents.length })}</span>}
+                  {failedAgents.length > 0 && <span>{t('runStatus.agentsFailed', { count: failedAgents.length })}</span>}
+                  <span className="text-text-tertiary">{t('runStatus.agentsOf', { count: agents.length })}</span>
+                </StatusPill>
+              )}
 
-          {showExplanation && runExplanation && (
-            <StatusPill
-              tone={explanationTone(runExplanation)}
-              title={[runExplanation.reason, runExplanation.nextAction].filter(Boolean).join(' | ')}
-              className="hidden min-w-0 flex-1 md:inline-flex"
-            >
-              <CircleAlert size={12} className="shrink-0" />
-              <span className="shrink-0 font-medium">{t(`runStatus.explanation.${runExplanation.state}`, { defaultValue: runExplanation.state })}</span>
-              <span className="min-w-0 flex-1 truncate text-text-secondary">{runExplanation.reason}</span>
-              {runExplanation.nextAction && <span className="hidden max-w-[200px] truncate text-accent-yellow/80 sm:inline">{t('runStatus.nextAction', { action: runExplanation.nextAction })}</span>}
-            </StatusPill>
-          )}
+              {showExplanation && runExplanation && (
+                <StatusPill
+                  tone={explanationTone(runExplanation)}
+                  title={[runExplanation.reason, runExplanation.nextAction].filter(Boolean).join(' | ')}
+                  className="hidden max-w-[420px] md:inline-flex"
+                >
+                  <CircleAlert size={12} className="shrink-0" />
+                  <span className="shrink-0 font-medium">{t(`runStatus.explanation.${runExplanation.state}`, { defaultValue: runExplanation.state })}</span>
+                  <span className="min-w-0 flex-1 truncate text-text-secondary">{runExplanation.reason}</span>
+                  {runExplanation.nextAction && <span className="hidden max-w-[180px] truncate text-accent-yellow/80 xl:inline">{t('runStatus.nextAction', { action: runExplanation.nextAction })}</span>}
+                </StatusPill>
+              )}
 
-          {showContext && contextRuntimeState && contextRuntimeState.maxTokens > 0 && (
-            <StatusPill tone={contextTone(contextRuntimeState)} title={`${ctxText} · ${contextRuntimeState.currentTokens}/${contextRuntimeState.maxTokens}`}>
-              <Activity size={12} />
-              <ContextBar context={contextRuntimeState} />
-              <span className="font-medium tabular-nums">{Math.round((contextRuntimeState.currentTokens / contextRuntimeState.maxTokens) * 100)}%</span>
-            </StatusPill>
-          )}
+              {showContext && contextRuntimeState && contextRuntimeState.maxTokens > 0 && (
+                <StatusPill tone={contextTone(contextRuntimeState)} title={`${ctxText} · ${contextRuntimeState.currentTokens}/${contextRuntimeState.maxTokens}`}>
+                  <Activity size={12} />
+                  <ContextBar context={contextRuntimeState} />
+                  <span className="font-medium tabular-nums">{Math.round((contextRuntimeState.currentTokens / contextRuntimeState.maxTokens) * 100)}%</span>
+                </StatusPill>
+              )}
 
-          {eternalView && (
-            <StatusPill tone={eternalView.tone} title={eternalView.title}>
-              {eternalView.spinning ? <Loader2 size={12} className="animate-spin" /> : <InfinityIcon size={12} />}
-              <span className="font-medium">{t('runStatus.eternal')}</span>
-              <span className="font-mono">{eternalView.statusLabel}</span>
-              {eternalView.detailLabel && <span className="font-mono text-text-tertiary">{eternalView.detailLabel}</span>}
-            </StatusPill>
-          )}
+              {eternalView && (
+                <StatusPill tone={eternalView.tone} title={eternalView.title}>
+                  {eternalView.spinning ? <Loader2 size={12} className="animate-spin" /> : <InfinityIcon size={12} />}
+                  <span className="font-medium">{t('runStatus.eternal')}</span>
+                  <span className="font-mono">{eternalView.statusLabel}</span>
+                  {eternalView.detailLabel && <span className="font-mono text-text-tertiary">{eternalView.detailLabel}</span>}
+                </StatusPill>
+              )}
+            </div>
+          </div>
+          <div className="pointer-events-none absolute right-0 top-0 h-full w-5 bg-gradient-to-l from-bg-secondary/90 to-transparent" aria-hidden="true" />
         </div>
 
-        <div className="ml-auto flex shrink-0 items-center justify-end gap-1">
+        <div className="flex shrink-0 items-center justify-end gap-1 rounded-lg border border-border-muted/70 bg-bg-primary/40 p-0.5">
           <StripButton icon={<Bot size={12} />} label={t('runStatus.agents')} onClick={onOpenAgents} disabled={agents.length === 0} />
           <StripButton icon={<ListTodo size={12} />} label={t('runStatus.tasks')} onClick={onOpenTasks} />
           <StripButton icon={<GitPullRequest size={12} />} label={t('runStatus.review')} onClick={onOpenEvidence} />

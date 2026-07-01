@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { getTeamMailbox, getTeamMemberRegistry } from '../../core/TeamMailbox.js';
+import { coreLogger } from '../../core/Log.js';
 
 export class TeamDeleteTool extends Tool {
   readonly name = '__team_manage_delete';
@@ -48,7 +49,7 @@ export class TeamDeleteTool extends Tool {
       try {
         context.blackboardGraph.releaseGroupTag(context.sessionId, params.team_name, 'team_manage(action="delete")');
       } catch (err) {
-        console.warn(`[TeamDelete] blackboard group release failed: ${err instanceof Error ? err.message : String(err)}`);
+        coreLogger.warn(`[TeamDelete] blackboard group release failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 

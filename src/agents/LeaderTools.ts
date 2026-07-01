@@ -53,6 +53,7 @@ import {
   confirmIntervention as agentConfirmIntervention,
   terminateAgent as agentTerminate,
   checkAgentProgress as agentCheckProgress,
+  listRuntimeAgents as agentListRuntimeAgents,
 } from './leader/tools/LeaderAgentControlTools.js';
 import {
   type TaskPlanningContext,
@@ -60,7 +61,11 @@ import {
   updateTask as planUpdateTask,
   deleteTask as planDeleteTask,
   defineAgentRole as planDefineAgentRole,
+  deleteAgentRole as planDeleteAgentRole,
   defineProjectBlueprint as planDefineProjectBlueprint,
+  addBlueprintSubsystem as planAddBlueprintSubsystem,
+  updateBlueprintSubsystem as planUpdateBlueprintSubsystem,
+  deleteBlueprintSubsystem as planDeleteBlueprintSubsystem,
   listAvailableRoles as planListAvailableRoles,
   updateTaskStatus as planUpdateTaskStatus,
 } from './leader/tools/LeaderTaskPlanningTools.js';
@@ -68,6 +73,7 @@ import {
   validateDispatchAgentName as gateValidateDispatchAgentName,
   formatRoster as gateFormatRoster,
   isLeaderExecutionTool as gateIsLeaderExecutionTool,
+  evaluateLeaderAutonomyToolGate,
 } from './leader/LeaderToolGates.js';
 import { LeaderToolFailure, fail, type DispatchItemStatus } from './leader/LeaderToolFailure.js';
 import { getTeamMailbox, getTeamMemberRegistry } from '../core/TeamMailbox.js';
@@ -75,7 +81,9 @@ import { MemoryManager, type MemoryScope, type MemoryType } from '../memory/Memo
 import { resolveModeRuntimeProjection, type ModeRuntimeProjection } from '../core/ModeRuntimeProjection.js';
 import { readPersistedEternalGoal } from '../core/EternalGoal.js';
 import { getPromptCatalog } from './prompts/i18n/catalog.js';
-import { collectPrimitiveLeaves } from '../tools/Registry.js';
+import { normalizeCapabilityIntentProfile } from './IntentClassifier.js';
+import type { LeaderAutonomyToolGateResult } from './leader/LeaderToolGates.js';
+import { collectPrimitiveLeaves } from '../tools/Registry.js';import { OFFICE_TOOL_NAMES, BUGHUNT_MODE_TOOL_NAMES } from '../contracts/constants/toolNames.js';
 
 /**
  * 把应进入 string[] 的值深度拍平为非空 string 数组。GLM 常把 string[] 误写成嵌套对象
@@ -375,6 +383,73 @@ export class LeaderToolsExecutor {
     };
   }
 
+  private readCurrentUserTurnId(): number {
+    const raw = this.leader.db.getSessionState(this.leader.sessionId, SESSION_KEYS.CURRENT_USER_TURN_ID);
+    const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 0;
+  }
+
+  private readRecordedCapabilityIntentTurnId(): number | null {
+    const raw = this.leader.db.getSessionState(this.leader.sessionId, SESSION_KEYS.CAPABILITY_INTENT_TURN_ID);
+    const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : null;
+  }
+
+  private recordCapabilityIntent(args: Record<string, unknown>): string {
+    // 意图识别工具豁免工具抑制检查：record_capability_intent 是理解用户需求的前提，
+    // 即使用户说"不要调用工具"，也需要先识别意图才能理解用户到底想做什么。
+    // 元认知工具 > 执行工具，意图识别属于元认知层，不应被执行层的抑制逻辑拦截。
+    // if (this.leader.isUserInterruptPending() || this.leader.isToolUseSuppressedForCurrentTurn()) {
+    //   return 'ERROR: record_capability_intent 已被跳过：检测到更新的用户输入/本轮用户明确要求不要调用工具。请立即停止工具调用，直接回复最新用户消息。';
+    // }
+    const currentTurnId = this.readCurrentUserTurnId();
+    const recordedTurnId = this.readRecordedCapabilityIntentTurnId();
+    if (currentTurnId > 0 && recordedTurnId === currentTurnId) {
+      const existing = this.leader.db.getSessionState(this.leader.sessionId, SESSION_KEYS.CAPABILITY_INTENT_PROFILE);
+      return `本轮 capability intent profile 已记录为 ${compactOneLine(existing, 120)}；不要再次调用 record_capability_intent，请直接继续执行用户请求。`;
+    }
+
+    const now = Date.now();
+    const profile = normalizeCapabilityIntentProfile(args, {
+      turnId: currentTurnId || null,
+      now,
+      source: 'record_capability_intent',
+    });
+    if (!profile) {
+      return 'ERROR: record_capability_intent 参数无效：必须提供合法 primaryIntent/scope/phase/grants/denies/requiredGates/constraints/confidence/reason。';
+    }
+    this.leader.db.setSessionState(this.leader.sessionId, SESSION_KEYS.CAPABILITY_INTENT_PROFILE, JSON.stringify(profile));
+    if (currentTurnId > 0) {
+      this.leader.db.setSessionState(this.leader.sessionId, SESSION_KEYS.CAPABILITY_INTENT_TURN_ID, currentTurnId);
+    }
+    this.leader.emitter.emit('leader:capability_intent', {
+      sessionId: this.leader.sessionId,
+      profile,
+    });
+    return `已记录 capability intent profile：${profile.primaryIntent}/${profile.phase}/${profile.scope.kind} (confidence=${profile.confidence.toFixed(2)}) — ${profile.reason}\n现在继续执行用户请求；本轮不要再次调用 record_capability_intent。`;
+  }
+
+  private recordAutonomyDecision(toolName: string, gate: LeaderAutonomyToolGateResult): void {
+    const gateResult = gate.ok
+      ? 'allow'
+      : gate.gateKind === 'confirmation_required'
+        ? 'confirmation_required'
+        : 'blocked';
+    const trace = {
+      toolName,
+      decision: gate.decision,
+      gateResult,
+      gateKind: gate.ok ? null : gate.gateKind,
+      recordedAt: Date.now(),
+      source: 'leader_tool_gate',
+    };
+    this.leader.db.setSessionState(this.leader.sessionId, SESSION_KEYS.AUTONOMY_DECISION_TRACE, JSON.stringify(trace));
+    this.leader.emitter.emit('leader:autonomy_decision', {
+      sessionId: this.leader.sessionId,
+      ...trace,
+    });
+  }
+
   /**
    * 执行元工具
    *
@@ -386,6 +461,27 @@ export class LeaderToolsExecutor {
    *   - bughunt ledger 元工具（直接读写 BughuntLedger 内存表）
    */
   async execute(name: string, args: Record<string, unknown>): Promise<string> {
+    if (name === 'record_capability_intent') {
+      return this.recordCapabilityIntent(args);
+    }
+
+    const autonomyGate = evaluateLeaderAutonomyToolGate({
+      toolName: name,
+      args,
+      modes: resolveModeRuntimeProjection({
+        sessionId: this.leader.sessionId,
+        db: this.leader.db,
+        blackboardAvailable: this.leader.isBlackboardEnabled(),
+        permissionContext: this.leader.getPermissionContext(),
+        permissionSummary: this.leader.getInteractionSnapshot().permissionSummary,
+      }),
+      permissionContext: this.leader.getPermissionContext(),
+    });
+    this.recordAutonomyDecision(name, autonomyGate);
+    if (!autonomyGate.ok) {
+      return `ERROR: ${autonomyGate.message}`;
+    }
+
     const ctx = this.getAgentControlContext();
     const planCtx = this.getTaskPlanningContext();
     switch (name) {
@@ -397,14 +493,24 @@ export class LeaderToolsExecutor {
         return await planDeleteTask(planCtx, args);
       case 'define_agent_role':
         return await planDefineAgentRole(planCtx, args);
+      case 'delete_agent_role':
+        return planDeleteAgentRole(planCtx, args);
       case 'define_project_blueprint':
         return await planDefineProjectBlueprint(planCtx, args);
+      case 'add_subsystem':
+        return planAddBlueprintSubsystem(planCtx, args);
+      case 'update_subsystem':
+        return planUpdateBlueprintSubsystem(planCtx, args);
+      case 'delete_subsystem':
+        return planDeleteBlueprintSubsystem(planCtx, args);
       case 'list_available_roles':
         return planListAvailableRoles(planCtx);
       case 'dispatch_agent':
         return await this.dispatchAgent(args);
       case 'dispatch_batch':
         return await this.dispatchBatch(args);
+      case 'spawn_worker':
+        return await this.spawnWorker(args);
       case 'explore':
         return await this.exploreCodebase(args);
       case 'send_message_to_agent':
@@ -447,8 +553,12 @@ export class LeaderToolsExecutor {
         return await this.finishSession(args);
       case 'complete_eternal_goal':
         return await this.completeEternalGoal(args);
+      case 'list_runtime_agents':
+        return await agentListRuntimeAgents(ctx, args);
       case 'check_agent_progress':
         return await agentCheckProgress(ctx, args);
+      case 'write_contract':
+        return this.writeContract(args);
       case 'learn_soul':
         return await this.learnSoul(args);
       case 'request_permission_update':
@@ -469,6 +579,8 @@ export class LeaderToolsExecutor {
         return this.getReadyDagNodesTool(args);
       case 'verify_finding':
         return await this.verifyFindingTool(args);
+      case 'set_mode':
+        return this.setMode(args);
       default:
         throw new Error(`Unknown leader tool: ${name}`);
     }
@@ -523,27 +635,16 @@ export class LeaderToolsExecutor {
     if (!task) {
       throw fail(`任务 ${taskId} 不存在`);
     }
-    // 项目蓝图覆盖 gate:会话定义了蓝图时,任何 implement 子系统若无任务覆盖,拦截派发。
-    // 防止"定义了完整蓝图却只建部分任务就开工"导致规划坍缩成 MVP。确定性:机械比对蓝图
-    // status=implement 子系统的 taskIds。解除方式见反馈。
+    // v1.0.4: 蓝图覆盖 gate 降级为警告——不再硬阻塞派发
+    // Leader 现在有 write_contract 可以随时解锁，不需要先建全部任务
     {
       const blueprint = parseBlueprint(this.leader.db.getSessionState(this.leader.sessionId, SESSION_KEYS.PROJECT_BLUEPRINT));
       if (blueprint) {
         const coverage = computeBlueprintCoverage(blueprint);
-        // contract 节点(架构师产契约)豁免覆盖检查:契约是实现的前置,应能在所有 implement 子系统
-        // 都建好实现任务之前先派发(define_project_blueprint 已自动为每子系统建 contract 任务)。
-        // 仅豁免 node_kind=contract;evaluate/repair 等事后节点不豁免。
-        if (coverage.uncovered.length > 0 && task.orchestration?.nodeKind !== 'contract') {
+        if (coverage.uncovered.length > 0 && task.orchestration?.nodeKind !== 'contract' && task.orchestration?.nodeKind !== 'plan') {
           const gapList = coverage.uncovered.map((s) => `${s.id}(${s.name})`).join(', ');
-          throw fail([
-            `项目蓝图覆盖不完整:${coverage.uncovered.length} 个 implement 子系统尚无任务,不能派发。`,
-            `  缺口: ${gapList}`,
-            `补救(任选其一):`,
-            `  1. 为每个缺口 create_task(subsystem=<id>) 建任务;`,
-            `  2. 若确实不做,define_project_blueprint 把对应子系统 status=defer/not_applicable 并附 rationale;`,
-            `  3. 若这是与当前蓝图无关的新项目,重新 define_project_blueprint 覆盖旧蓝图。`,
-            `合法 subsystem id 见每轮注入的「项目蓝图」概览。`,
-          ].join('\n'), 'skipped');
+          leaderLogger.info(`[dispatch] 蓝图覆盖不完整(警告,不阻塞): 缺 ${gapList}`);
+          // 不再 throw——继续派发，信任 Leader 的判断
         }
       }
     }
@@ -687,7 +788,22 @@ export class LeaderToolsExecutor {
           },
     });
     if (!dispatched) {
-      const reason = this.leader.board.getBlockedReason(task) ?? '并发预算已满、任务状态变化或依赖/契约未就绪';
+      // 优先使用 scheduler 的精确拒绝原因
+      const schedulerReason = scheduler.getLastRejectReason?.();
+      if (schedulerReason) {
+        throw fail(`调度器拒绝派发任务 ${taskId}：${schedulerReason}`, 'skipped');
+      }
+      // 兜底：区分"槽位已满"与"任务状态变化/依赖未就绪"
+      const cap = scheduler.getCapacityInfo();
+      const blockedReason = this.leader.board.getBlockedReason(task);
+      if (cap.available === 0) {
+        throw fail(
+          `并发槽位已满（${cap.running}/${cap.max}），任务 ${taskId} 暂时无法派发。` +
+          `请等待正在运行的 Agent 完成后再重试，或减少同批 dispatch_batch 的并行数量。`,
+          'skipped',
+        );
+      }
+      const reason = blockedReason ?? '任务状态变化或依赖/契约未就绪';
       throw fail(`调度器拒绝派发任务 ${taskId}（${reason}）`, 'skipped');
     }
     // Record real usage so distill's C gate can later refine proven agents (N5-A).
@@ -701,6 +817,19 @@ export class LeaderToolsExecutor {
       });
     } catch { /* usage tracking is best-effort, never blocks dispatch */ }
     this.leader.setDelegateMode(`已委派任务 ${taskId} 给 @${agentName}，Leader 切换为委派主控模式。`);
+
+    // 0→1: ContractHotSync 注册 consumer——让 running worker 能收到契约变更通知
+    try {
+      const hotSync = this.leader.getContractHotSync();
+      if (hotSync) {
+        const contractSurface = task.orchestration?.contractBinding?.surface;
+        hotSync.registerFromTask(
+          agentName,
+          `${this.leader.sessionId}:${agentName}`,
+          contractSurface || '*',
+        );
+      }
+    } catch { /* non-critical */ }
 
     return `已启动 Agent ${agentName}${capabilityDetails ? ` (baseline=${capabilityDetails.baselineRole}${capabilityDetails.skillNames.length > 0 ? ` · skills=${capabilityDetails.skillNames.join(', ')}` : ''}${capabilityDetails.droppedTools.length > 0 ? ` · dropped=${capabilityDetails.droppedTools.join(', ')}` : ''})` : ''}`;
   }
@@ -753,6 +882,46 @@ export class LeaderToolsExecutor {
     const dispatchResult = await this.dispatchAgentWithOptions({ task_id: taskId, agent_name: agentName });
     // 在返回结果前缀 task_id，供 Leader 追踪异步探索任务
     return `[task_id=${taskId}] ${dispatchResult}`;
+  }
+
+  /**
+   * spawn_worker: 一步到位派发临时 worker——create_task + dispatch + 异步回流。
+   * v1.0.4 新增，替代 create_task + dispatch_agent 两步操作。
+   */
+  protected async spawnWorker(args: Record<string, unknown>): Promise<string> {
+    const goal = typeof args.goal === 'string' ? args.goal.trim() : '';
+    if (!goal) {
+      throw fail('spawn_worker 的 goal 不能为空');
+    }
+    const scope = typeof args.scope === 'string' ? args.scope.trim() : '';
+    const role = typeof args.role === 'string' ? args.role.trim() : 'fullstack';
+    const context = typeof args.context === 'string' ? args.context.trim() : '';
+
+    const subject = goal.length > 60 ? `${goal.slice(0, 60)}…` : goal;
+    const contextParts: string[] = [`【任务目标】\n${goal}`];
+    if (scope) contextParts.push(`【工作范围】${scope}`);
+    if (context) contextParts.push(`【背景知识】\n${context}`);
+    contextParts.push('【要求】完成后用 attempt_completion 回流结果和证据。');
+    const fullContext = contextParts.join('\n\n');
+
+    const agentName = memoryNameFromContent(role, goal);
+    const writeScope = scope ? [scope] : [];
+
+    const taskId = this.leader.board.nextTaskId();
+    this.leader.board.createTask(
+      taskId,
+      subject,
+      goal,
+      role,
+      [],           // blocked_by
+      writeScope,
+      undefined,    // working_directory
+      fullContext,
+      { taskType: 'generic', preferred_agent_name: agentName },
+    );
+
+    const dispatchResult = await this.dispatchAgentWithOptions({ task_id: taskId, agent_name: agentName });
+    return `[task_id=${taskId}] 已启动 ${role} worker "${agentName}"。完成后结果将自动回流。\n${dispatchResult}`;
   }
 
   protected async dispatchBatch(args: Record<string, unknown>): Promise<string> {
@@ -1298,7 +1467,50 @@ export class LeaderToolsExecutor {
 
   /**
    * 兼容旧 learn_soul 入口，实际写入统一长期记忆系统。
+   */  /**
+   * write_contract: Leader 直接写入契约到 SharedLedger。
+   * 解除蓝图 dispatch 拦截、满足 contract readiness gate。
    */
+  protected async writeContract(args: Record<string, unknown>): Promise<string> {
+    const surface = typeof args.surface === 'string' ? args.surface.trim() : '';
+    const title = typeof args.title === 'string' ? args.title.trim() : surface;
+    const content = typeof args.content === 'string' ? args.content.trim() : '';
+    if (!surface) throw fail('surface 不能为空');
+    if (!content) throw fail('content 不能为空');
+    const evidence = Array.isArray(args.evidence)
+      ? (args.evidence as unknown[]).filter((v): v is string => typeof v === 'string')
+      : undefined;
+
+    const ledger = this.leader.getSharedLedger();
+    const entryId = ledger.update(surface, 'contract', {
+      author: 'leader',
+      content: `# ${title}\n\n${content}`,
+      evidence,
+    });
+
+    // 同时持久化到项目级 contracts 目录——让前端 API 和跨会话访问能看到
+    try {
+      const { persistContractToProjectDir } = await import('../core/ProjectContracts.js');
+      await persistContractToProjectDir(this.leader.workspace, {
+        surface,
+        title,
+        content,
+        version: 1,
+        createdBy: 'leader',
+        createdAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      // non-critical: SharedLedger 已写入，项目级持久化失败不影响当前会话
+      leaderLogger.warn(`[writeContract] 项目级持久化失败: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // 刷新 TaskBoard readiness——可能解除等待此 surface 的任务阻塞
+    this.leader.board.refreshReadiness();
+
+    return `契约已写入 SharedLedger [${entryId}]: surface="${surface}"\n对应 contract_surface 的任务将自动解除阻塞。`;
+  }
+
+
   protected async learnSoul(args: Record<string, unknown>): Promise<string> {
     const content = typeof args.content === 'string' ? args.content.trim() : '';
     const scope: MemoryScope = args.scope === 'user' ? 'user' : 'project';
@@ -1619,6 +1831,44 @@ export class LeaderToolsExecutor {
     }
     lines.push(`  已回写 compile_artifacts(+${compile.artifacts.length})${blackbox ? `、blackbox_artifacts(+${blackbox.artifacts.length})` : ''}；verified 门现认真实执行产物。`);
     return lines.join('\n');
+  }
+  /**
+   * set_mode — Leader 自主开关会话级模式（仅 office / bughunt，排除 workflow）。
+   *
+   * 复用既有激活链：写 session_state + emit('plugin:toggled')，
+   * 由 LeaderAgent 的 plugin:toggled 订阅回调调用 setOfficeMode/setBugHuntMode，
+   * 与 TUI /office、/bughunt 命令走同一条路径，保证状态/工具面/prompt 注入一致。
+   * workflow 是 beta 功能，只允许手动开启，故此处显式拒绝。
+   */
+  protected setMode(args: Record<string, unknown>): string {
+    const mode = typeof args.mode === 'string' ? args.mode.trim().toLowerCase() : '';
+    if (mode !== 'office' && mode !== 'bughunt') {
+      throw fail(`set_mode 仅支持 office / bughunt（workflow 为 beta，只能手动开启）；收到: ${mode || '(空)'}`);
+    }
+    const enabled = args.enabled === undefined ? true : args.enabled === true;
+    const sessionId = this.leader.sessionId;
+    const sessionKey = mode === 'office' ? SESSION_KEYS.OFFICE_MODE_ACTIVE : SESSION_KEYS.BUGHUNT_MODE_ACTIVE;
+    const current = this.leader.db.getSessionState(sessionId, sessionKey) === 'true';
+    if (current === enabled) {
+      return `${mode} 模式已经是${enabled ? '开启' : '关闭'}状态，无需变更。`;
+    }
+    const toolNames = mode === 'office' ? OFFICE_TOOL_NAMES : BUGHUNT_MODE_TOOL_NAMES;
+    this.leader.db.setSessionState(sessionId, sessionKey, String(enabled));
+    this.leader.emitter.emit('plugin:toggled', {
+      pluginId: mode,
+      enabled,
+      sessionId,
+      toolNames,
+      toolCount: toolNames.length,
+    });
+    if (mode === 'office') {
+      return enabled
+        ? 'Office 模式已开启 — 办公审美协议已注入。⚠ 动手前先做意图澄清：若用户需求模糊（如"做个PPT"未说清产物类型/场景/受众/风格/内容来源），必须先 ask_user 一次性澄清这些维度，再选风格、写脚本，禁止拿模糊输入直接埋头生成。PPTX/DOCX/XLSX/PDF 用 shell 跑 Node 脚本直调库（pptxgenjs/docx/exceljs/pdfkit）生成。再次调用 set_mode(mode="office", enabled=false) 关闭。'
+        : 'Office 模式已关闭 — 回到纯 Coding 模式，办公协议已从上下文卸载。';
+    }
+    return enabled
+      ? `BugHunt 模式已开启 — ${toolNames.length} 个调查/验证元工具已注入。再次调用 set_mode(mode="bughunt", enabled=false) 关闭。`
+      : 'BugHunt 模式已关闭 — 调查元工具已卸载。';
   }
 
   protected upsertBughuntFindingTool(args: Record<string, unknown>): string {

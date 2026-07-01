@@ -26,6 +26,7 @@ export class LeaderMetaTool extends MetaTool {
   }
 
   async execute(args: unknown, context?: ToolContext): Promise<ToolResult> {
+    try {
     const executor = context?.leaderToolsExecutor;
     if (!executor) {
       return {
@@ -66,6 +67,7 @@ export class LeaderMetaTool extends MetaTool {
       return { success: false, data: null, error: e.message };
     }
     throw e; // 意料外异常照抛，绝不静默吞掉
+    }
   }
 }
 

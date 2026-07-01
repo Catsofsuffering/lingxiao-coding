@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(scriptsDir, '..');
+const require = createRequire(import.meta.url);
 const forbiddenSourceEntrypoints = [
   ['src', 'next'].join('-'),
   ['NEXT', 'GEN', 'ENABLED'].join('_'),
@@ -111,4 +114,58 @@ test('web i18n locale files (zh.json / en.json) have identical top-level key set
   const onlyEn = [...enKeys].filter((k) => !zhKeys.has(k));
   assert.deepEqual(onlyZh, [], `keys present only in zh.json: ${onlyZh.slice(0, 30).join(', ')}`);
   assert.deepEqual(onlyEn, [], `keys present only in en.json: ${onlyEn.slice(0, 30).join(', ')}`);
+});
+
+test('electron afterPack pruning removes only Windows-unneeded unpacked artifacts', () => {
+  const { pruneUnpackedNodeModules } = require('./prune-electron-unpacked.cjs');
+  const dir = join(tmpdir(), `lx-prune-electron-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  const nodeModulesDir = join(dir, 'resources', 'app.asar.unpacked', 'node_modules');
+
+  const write = (relativePath, content = 'x') => {
+    const target = join(nodeModulesDir, ...relativePath.split('/'));
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  };
+
+  try {
+    write('@ast-grep/lang-typescript/src/parser.c');
+    write('@ast-grep/lang-typescript/src/parser.h');
+    write('@ast-grep/lang-typescript/prebuild-linux-x64/tree-sitter-typescript.node');
+    write('@ast-grep/lang-typescript/prebuild-darwin-arm64/tree-sitter-typescript.node');
+    write('@ast-grep/lang-typescript/prebuild-win32-x64/tree-sitter-typescript.node');
+    write('tree-sitter-grammar/prebuilds/linux-x64/parser.node');
+    write('tree-sitter-grammar/prebuilds/darwin-arm64/parser.node');
+    write('tree-sitter-grammar/prebuilds/win32-x64/parser.node');
+    write('native-addon/build/Release/addon.node');
+    write('native-addon/bin/helper.exe');
+    write('native-addon/bin/runtime.dll');
+    write('native-addon/package.json', '{"name":"native-addon"}');
+    write('native-addon/README.md');
+    write('native-addon/index.js.map');
+    write('native-addon/include/addon.h');
+    write('native-addon/src/addon.c');
+
+    const result = pruneUnpackedNodeModules(nodeModulesDir);
+    assert.ok(result.removed.length >= 6);
+
+    assert.equal(existsSync(join(nodeModulesDir, '@ast-grep/lang-typescript/src/parser.c')), false);
+    assert.equal(existsSync(join(nodeModulesDir, '@ast-grep/lang-typescript/prebuild-linux-x64/tree-sitter-typescript.node')), false);
+    assert.equal(existsSync(join(nodeModulesDir, '@ast-grep/lang-typescript/prebuild-darwin-arm64/tree-sitter-typescript.node')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'tree-sitter-grammar/prebuilds/linux-x64/parser.node')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'tree-sitter-grammar/prebuilds/darwin-arm64/parser.node')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/README.md')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/index.js.map')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/include/addon.h')), false);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/src/addon.c')), false);
+
+    assert.equal(existsSync(join(nodeModulesDir, '@ast-grep/lang-typescript/prebuild-win32-x64/tree-sitter-typescript.node')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'tree-sitter-grammar/prebuilds')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'tree-sitter-grammar/prebuilds/win32-x64/parser.node')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/build/Release/addon.node')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/bin/helper.exe')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/bin/runtime.dll')), true);
+    assert.equal(existsSync(join(nodeModulesDir, 'native-addon/package.json')), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

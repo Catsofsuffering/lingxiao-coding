@@ -22,6 +22,7 @@ import {
 } from './WebCommon.js';
 import { buildStealthUserAgent } from '../../core/BrowserStealth.js';
 import { sleep } from '../../utils/sleep.js';
+import { coreLogger } from '../../core/Log.js';
 
 const WebFetchSchema = z.object({
   url: z.string().url().describe('要抓取的网页 URL'),
@@ -217,7 +218,7 @@ export class WebFetchTool extends Tool {
         const msg = formatNetworkError(err, FETCH_TIMEOUT_SECONDS);
         // 写日志而非中断
         if (process.env.LINGXIAO_DEBUG_WEB_FETCH) {
-          console.error(`[web_fetch] fast-path fetch failed for ${params.url}: ${msg}`);
+          coreLogger.debug(`[web_fetch] fast-path fetch failed for ${params.url}: ${msg}`);
         }
       }
     }

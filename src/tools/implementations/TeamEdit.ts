@@ -13,6 +13,7 @@
 import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { getTeamMailbox, getTeamMemberRegistry } from '../../core/TeamMailbox.js';
+import { coreLogger } from '../../core/Log.js';
 
 export class TeamEditTool extends Tool {
   readonly name = '__team_manage_edit';
@@ -261,7 +262,7 @@ export class TeamEditTool extends Tool {
           description,
         });
       } catch (err) {
-        console.warn(`[TeamEdit] blackboard group projection failed: ${err instanceof Error ? err.message : String(err)}`);
+        coreLogger.warn(`[TeamEdit] blackboard group projection failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }

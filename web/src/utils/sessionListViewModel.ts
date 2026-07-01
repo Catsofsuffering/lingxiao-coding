@@ -5,6 +5,11 @@ import {
   runtimeImpliesBusy,
 } from '../stores/sessionStoreHelpers.ts';
 import type { SessionInfo, SessionRuntimeSnapshot } from '../stores/sessionStoreTypes.ts';
+import { createLogger } from './logger';
+
+const log = createLogger('sessionListViewModel');
+
+const LAST_SELECTED_SESSION_KEY = 'lingxiao-last-selected-session-id';
 
 export type SessionBadgeTone = 'active' | 'warn' | 'danger' | 'ok' | 'neutral';
 
@@ -17,6 +22,30 @@ export interface SessionBadgeViewModel {
 export interface SessionBadgeInput {
   currentSessionId?: string | null;
   runtimeSnapshot?: SessionRuntimeSnapshot | null;
+}
+
+export function loadLastSelectedSessionId(): string | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const stored = localStorage.getItem(LAST_SELECTED_SESSION_KEY);
+    return stored && stored.trim() ? stored : null;
+  } catch (err) {
+    log.warn('Failed to load last selected session:', err);
+    return null;
+  }
+}
+
+export function saveLastSelectedSessionId(sessionId: string | null): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    if (sessionId && sessionId.trim()) {
+      localStorage.setItem(LAST_SELECTED_SESSION_KEY, sessionId);
+    } else {
+      localStorage.removeItem(LAST_SELECTED_SESSION_KEY);
+    }
+  } catch (err) {
+    log.warn('Failed to save last selected session:', err);
+  }
 }
 
 function isMatchingRuntimeSnapshot(sessionId: string, snapshot?: SessionRuntimeSnapshot | null): snapshot is SessionRuntimeSnapshot {
@@ -96,6 +125,7 @@ function latestSession(sessions: SessionInfo[]): SessionInfo | undefined {
 export function pickBootstrapSessionId(
   sessions: SessionInfo[],
   activeSessionId?: string | null,
+  lastSelectedSessionId?: string | null,
 ): string | null {
   const selectable = sessions.filter((session) => !isDeletedSession(session));
   const runningWorkerSession = latestSession(selectable.filter(sessionRuntimeHasWorkers));
@@ -104,8 +134,15 @@ export function pickBootstrapSessionId(
   const busyRuntimeSession = latestSession(selectable.filter(sessionRuntimeBusy));
   if (busyRuntimeSession) return busyRuntimeSession.id;
 
+  // 后端 active session 优先于 localStorage 旧会话：
+  // 启动时后端刚 createSession 新会话并设为 active，应优先载入它，
+  // 而不是回退到上次使用的旧会话（避免每次启动都载入旧会话而非新会话）。
   if (activeSessionId && selectable.some((session) => session.id === activeSessionId)) {
     return activeSessionId;
+  }
+
+  if (lastSelectedSessionId && selectable.some((session) => session.id === lastSelectedSessionId)) {
+    return lastSelectedSessionId;
   }
 
   const memoryActive = latestSession(selectable.filter((session) => session.isActive));

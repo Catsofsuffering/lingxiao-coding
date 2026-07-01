@@ -97,6 +97,48 @@ export interface PermissionResponsePayload {
   decision: 'approved' | 'rejected';
 }
 
+/**
+ * T-13: ToolFailureLoopGuard 熔断后 worker → leader 升级消息。
+ * Leader PermissionManager.handleToolFailureLoopEscalation 据此自动放行/拒绝。
+ */
+export interface ToolFailureLoopEscalationControlPayload {
+  kind: 'tool_failure_loop_escalation';
+  requestId: string;
+  workerName: string;
+  toolName: string;
+  argsHash: string;
+  errorKind: string;
+  errorCode: string;
+  count: number;
+  requiresEscalation: boolean;
+  lastErrorMessage: string;
+}
+
+export function createToolFailureLoopEscalationPayload(input: {
+  requestId: string;
+  workerName: string;
+  toolName: string;
+  argsHash: string;
+  errorKind: string;
+  errorCode: string;
+  count: number;
+  requiresEscalation: boolean;
+  lastErrorMessage: string;
+}): ToolFailureLoopEscalationControlPayload {
+  return {
+    kind: 'tool_failure_loop_escalation',
+    requestId: input.requestId,
+    workerName: input.workerName,
+    toolName: input.toolName,
+    argsHash: input.argsHash,
+    errorKind: input.errorKind,
+    errorCode: input.errorCode,
+    count: input.count,
+    requiresEscalation: input.requiresEscalation,
+    lastErrorMessage: input.lastErrorMessage,
+  };
+}
+
 export interface AgentHealthCriticalPayload {
   kind: 'agent_health_critical';
   taskId: string;
@@ -144,7 +186,8 @@ export type AgentControlPayload =
   | PermissionRequestControlPayload
   | PermissionResponsePayload
   | AgentHealthCriticalPayload
-  | WorkerRecoveryPayload;
+  | WorkerRecoveryPayload
+  | ToolFailureLoopEscalationControlPayload;
 
 export function createTaskCompletePayload(
   taskId: string,
@@ -287,6 +330,17 @@ function isAgentHealthCriticalPayload(value: unknown): value is AgentHealthCriti
     typeof (value as AgentHealthCriticalPayload).reason === 'string';
 }
 
+function isToolFailureLoopEscalationControlPayload(
+  value: unknown,
+): value is ToolFailureLoopEscalationControlPayload {
+  return !!value
+    && typeof value === 'object'
+    && (value as ToolFailureLoopEscalationControlPayload).kind === 'tool_failure_loop_escalation'
+    && typeof (value as ToolFailureLoopEscalationControlPayload).requestId === 'string'
+    && typeof (value as ToolFailureLoopEscalationControlPayload).toolName === 'string'
+    && typeof (value as ToolFailureLoopEscalationControlPayload).workerName === 'string';
+}
+
 function isWorkerRecoveryPayload(value: unknown): value is WorkerRecoveryPayload {
   return !!value &&
     typeof value === 'object' &&
@@ -326,6 +380,9 @@ export function readAgentControlMessage(
     return message.payload;
   }
   if (message.type === 'worker_recovery' && isWorkerRecoveryPayload(message.payload)) {
+    return message.payload;
+  }
+  if (message.type === 'tool_failure_loop_escalation' && isToolFailureLoopEscalationControlPayload(message.payload)) {
     return message.payload;
   }
 

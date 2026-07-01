@@ -32,6 +32,15 @@ export interface BrowserElementSelection {
   screenshotUrl?: string;
 }
 
+export interface DomTreeNode {
+  tag: string;
+  attrs: Record<string, string>;
+  text?: string;
+  rect: { x: number; y: number; w: number; h: number };
+  childCount: number;
+  children?: DomTreeNode[];
+}
+
 interface BrowserSession extends BrowserSessionSummary {
   context: BrowserContext;
   page: Page;
@@ -45,7 +54,9 @@ interface CreateBrowserSessionOptions {
 const DEFAULT_VIEWPORT: BrowserViewport = {
   width: 1280,
   height: 820,
-  deviceScaleFactor: 1,
+  // 高分屏下用 2x 设备像素采样，screencast 位图按物理像素渲染，
+  // canvas 以 CSS 尺寸显示时由浏览器降采样，画面清晰不糊。
+  deviceScaleFactor: 2,
 };
 
 const MAX_SESSIONS = 3;
@@ -65,7 +76,7 @@ function normalizeUrl(raw: string): string {
 function toViewport(input?: Partial<BrowserViewport>): BrowserViewport {
   const width = Math.min(1920, Math.max(360, Math.round(input?.width ?? DEFAULT_VIEWPORT.width)));
   const height = Math.min(1400, Math.max(320, Math.round(input?.height ?? DEFAULT_VIEWPORT.height)));
-  const deviceScaleFactor = Math.min(2, Math.max(1, Number(input?.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor)));
+  const deviceScaleFactor = Math.min(3, Math.max(1, Number(input?.deviceScaleFactor ?? DEFAULT_VIEWPORT.deviceScaleFactor)));
   return { width, height, deviceScaleFactor };
 }
 
@@ -155,6 +166,24 @@ export class BrowserRuntime {
     session.url = session.page.url();
     session.title = await session.page.title().catch(() => '');
     return this.summary(session);
+  }
+
+  /**
+   * 调整 session 视口尺寸，使其匹配前端预览区的实际宽高比，
+   * 避免 object-fit: contain 产生大面积留边（画面显示太小）。
+   * 入参经 toViewport 夹紧到 [360..1920] x [320..1400]。
+   */
+  async resizeViewport(id: string, input: Partial<BrowserViewport>): Promise<BrowserViewport> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const next = toViewport({ ...session.viewport, ...input });
+    // 尺寸无变化时跳过，避免无谓重排
+    if (next.width === session.viewport.width && next.height === session.viewport.height) {
+      return session.viewport;
+    }
+    await session.page.setViewportSize({ width: next.width, height: next.height });
+    session.viewport = next;
+    return next;
   }
 
   async screenshot(id: string): Promise<Buffer> {
@@ -304,6 +333,175 @@ export class BrowserRuntime {
       },
     };
   }
+  // ============================================================
+  // v1.0.5 剑阁大改：真实交互能力
+  // ============================================================
+  /** 获取页面信息 */  /** 获取 session 的 page 对象（供 screencast 等内部模块使用） */
+  getPage(id: string): Page | undefined {
+    return this.sessions.get(id)?.page;
+  }
+
+
+  async getPageInfo(id: string): Promise<{ url: string; title: string }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    return { url: session.page.url(), title: await session.page.title().catch(() => '') };
+  }
+
+  /** 坐标点击：模拟真实用户点击 */
+  async click(id: string, point: { x: number; y: number }): Promise<{ ok: true; url: string; title: string }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const x = Math.max(0, Math.round(point.x));
+    const y = Math.max(0, Math.round(point.y));
+    await session.page.mouse.click(x, y);
+    await session.page.waitForLoadState('domcontentloaded', { timeout: 3_000 }).catch(() => {});
+    session.url = session.page.url();
+    session.title = await session.page.title().catch(() => '');
+    return { ok: true, url: session.url, title: session.title };
+  }
+
+  /** 选择器点击 */
+  async clickSelector(id: string, selector: string): Promise<{ ok: true; url: string; title: string }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.click(selector, { timeout: 5_000 });
+    await session.page.waitForLoadState('domcontentloaded', { timeout: 3_000 }).catch(() => {});
+    session.url = session.page.url();
+    session.title = await session.page.title().catch(() => '');
+    return { ok: true, url: session.url, title: session.title };
+  }
+
+  /** 填充输入框 */
+  async fill(id: string, selector: string, value: string): Promise<{ ok: true }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.fill(selector, value, { timeout: 5_000 });
+    return { ok: true };
+  }
+  /** 在当前焦点元素输入文字 */
+  async type(id: string, text: string): Promise<{ ok: true }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.keyboard.type(text, { delay: 10 });
+    return { ok: true };
+  }
+
+  /** 按键 */
+  async press(id: string, key: string): Promise<{ ok: true }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.keyboard.press(key);
+    return { ok: true };
+  }
+
+  /** 在指定坐标的元素上输入文字 */
+  async typeAt(id: string, x: number, y: number, text: string): Promise<{ ok: true }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.mouse.click(Math.max(0, Math.round(x)), Math.max(0, Math.round(y)));
+    await session.page.keyboard.type(text, { delay: 10 });
+    return { ok: true };
+  }
+
+  /** 聚焦并清空输入框 */
+  async focusAndClear(id: string, selector: string): Promise<{ ok: true }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.focus(selector, { timeout: 5_000 });
+    await session.page.keyboard.press('Control+a');
+    await session.page.keyboard.press('Delete');
+    return { ok: true };
+  }
+
+
+
+  /** 滚动页面 */
+  async scroll(id: string, delta: { x?: number; y?: number }): Promise<{ ok: true; scrollX: number; scrollY: number }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const dx = Math.round(delta.x ?? 0);
+    const dy = Math.round(delta.y ?? 0);
+    await session.page.mouse.wheel(dx, dy);
+    const pos = await session.page.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+    return { ok: true, scrollX: pos.x, scrollY: pos.y };
+  }
+
+  /** 执行 JavaScript */
+  async evalJs<T = unknown>(id: string, script: string): Promise<{ ok: true; result: T }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const result = await session.page.evaluate(script) as T;
+    session.url = session.page.url();
+    session.title = await session.page.title().catch(() => '');
+    return { ok: true, result };
+  }
+
+  /** 获取页面 HTML */
+  async getHtml(id: string): Promise<{ html: string; url: string; title: string }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const html = await session.page.content();
+    return { html, url: session.page.url(), title: await session.page.title().catch(() => '') };
+  }
+
+  /** 设置页面 HTML（直接修改页面内容） */
+  async setHtml(id: string, html: string): Promise<{ ok: true; url: string; title: string }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    await session.page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 10_000 });
+    session.url = session.page.url();
+    session.title = await session.page.title().catch(() => '');
+    return { ok: true, url: session.url, title: session.title };
+  }
+
+  /** 获取简化 DOM 树（用于文件画布联动） */
+  async getDomTree(id: string, maxDepth = 5): Promise<DomTreeNode> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const tree = await session.page.evaluate((depth: number) => {
+      function buildNode(el: Element, currentDepth: number, maxDepth: number): any {
+        const tag = el.tagName.toLowerCase();
+        const rect = el.getBoundingClientRect();
+        const attrs: Record<string, string> = {};
+        for (const attr of Array.from(el.attributes)) {
+          attrs[attr.name] = attr.value.slice(0, 200);
+        }
+        const text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+        const node: any = {
+          tag,
+          attrs,
+          text: text || undefined,
+          rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+          childCount: el.children.length,
+        };
+        if (currentDepth < maxDepth && el.children.length > 0 && el.children.length <= 50) {
+          node.children = Array.from(el.children).slice(0, 30).map(c => buildNode(c, currentDepth + 1, maxDepth)).filter(Boolean);
+        }
+        return node;
+      }
+      return buildNode(document.documentElement, 0, depth);
+    }, maxDepth);
+    return tree as DomTreeNode;
+  }
+
+  /** 按选择器修改元素 HTML（评论直接改 HTML 的底层实现） */
+  async patchElement(id: string, selector: string, patch: { html?: string; text?: string; style?: string; attr?: Record<string, string>; remove?: boolean }): Promise<{ ok: true; applied: boolean }> {
+    const session = this.getSession(id);
+    session.lastUsedAt = Date.now();
+    const applied = await session.page.evaluate(({ sel, p }) => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+      if (p.remove) { el.remove(); return true; }
+      if (p.html !== undefined) el.innerHTML = p.html;
+      if (p.text !== undefined) el.textContent = p.text;
+      if (p.style !== undefined) el.setAttribute('style', p.style);
+      if (p.attr) { for (const [k, v] of Object.entries(p.attr)) el.setAttribute(k, v); }
+      return true;
+    }, { sel: selector, p: patch });
+    return { ok: true, applied };
+  }
+
 
   async closeSession(id: string): Promise<boolean> {
     const session = this.sessions.get(id);

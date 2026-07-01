@@ -176,9 +176,11 @@ export type I18nKey =
   | 'tui.mode.feedback.error'
   | 'tui.mode.collaboration'
   | 'tui.mode.route'
+  | 'tui.mode.autonomy'
   | 'tui.mode.permission'
   | 'tui.mode.compact.collaboration'
   | 'tui.mode.compact.route'
+  | 'tui.mode.compact.autonomy'
   | 'tui.mode.compact.permission'
   | 'tui.mode.collaboration.solo'
   | 'tui.mode.collaboration.team'
@@ -190,15 +192,20 @@ export type I18nKey =
   | 'tui.mode.route.autoHint'
   | 'tui.mode.route.directHint'
   | 'tui.mode.route.delegateHint'
+  | 'tui.mode.autonomy.review_first'
+  | 'tui.mode.autonomy.balanced'
+  | 'tui.mode.autonomy.autonomous'
   | 'tui.mode.permission.yolo'
   | 'tui.mode.permission.networked'
   | 'tui.mode.permission.dev'
   | 'tui.mode.permission.strict'
   | 'tui.mode.switched.collaboration'
   | 'tui.mode.switched.route'
+  | 'tui.mode.switched.autonomy'
   | 'tui.mode.switched.permission'
   | 'tui.mode.error.collaboration'
   | 'tui.mode.error.route'
+  | 'tui.mode.error.autonomy'
   | 'tui.mode.error.permission'
   | 'tui.selection.copied'
   | 'tui.paste.unresolved'
@@ -252,6 +259,7 @@ export type I18nKey =
   | 'tui.leader.heartbeat.working'
   | 'tui.leader.heartbeat.cancel_hint'
   | 'tui.leader.heartbeat.long_stall'
+  | 'tui.leader.heartbeat.critical_stall'
   | 'tui.leader.heartbeat.tool_executing'
   | 'tui.meta.age.seconds'
   | 'tui.meta.age.minutes_seconds'
@@ -271,6 +279,7 @@ export type I18nKey =
   | 'tui.meta.permission'
   | 'tui.meta.route'
   | 'tui.meta.collaboration'
+  | 'tui.meta.autonomy'
   | 'tui.meta.unconfigured'
   | 'tui.meta.control'
   | 'tui.meta.control_eternal'
@@ -374,6 +383,7 @@ export type I18nKey =
   | 'tui.event.control_manual'
   | 'tui.event.collaboration_mode_changed'
   | 'tui.event.route_changed'
+  | 'tui.event.autonomy_mode_changed'
   | 'tui.event.permission_mode_changed'
   | 'tui.event.blackboard_disabled'
   | 'tui.event.llm_retry'
@@ -828,9 +838,11 @@ export interface I18nStrings {
   'tui.mode.feedback.error': (message: string) => string;
   'tui.mode.collaboration': (current: string, next: string) => string;
   'tui.mode.route': (current: string, next: string) => string;
+  'tui.mode.autonomy': (current: string, next: string) => string;
   'tui.mode.permission': (current: string, next: string) => string;
   'tui.mode.compact.collaboration': (current: string) => string;
   'tui.mode.compact.route': (current: string) => string;
+  'tui.mode.compact.autonomy': (current: string) => string;
   'tui.mode.compact.permission': (current: string) => string;
   'tui.mode.collaboration.solo': string;
   'tui.mode.collaboration.team': string;
@@ -842,15 +854,20 @@ export interface I18nStrings {
   'tui.mode.route.autoHint': string;
   'tui.mode.route.directHint': string;
   'tui.mode.route.delegateHint': string;
+  'tui.mode.autonomy.review_first': string;
+  'tui.mode.autonomy.balanced': string;
+  'tui.mode.autonomy.autonomous': string;
   'tui.mode.permission.yolo': string;
   'tui.mode.permission.networked': string;
   'tui.mode.permission.dev': string;
   'tui.mode.permission.strict': string;
   'tui.mode.switched.collaboration': (mode: string) => string;
   'tui.mode.switched.route': (mode: string) => string;
+  'tui.mode.switched.autonomy': (mode: string) => string;
   'tui.mode.switched.permission': (mode: string) => string;
   'tui.mode.error.collaboration': (mode: string, message: string) => string;
   'tui.mode.error.route': (mode: string, message: string) => string;
+  'tui.mode.error.autonomy': (mode: string, message: string) => string;
   'tui.mode.error.permission': (mode: string, message: string) => string;
   'tui.selection.copied': string;
   'tui.paste.unresolved': string;
@@ -911,6 +928,7 @@ export interface I18nStrings {
   'tui.leader.heartbeat.working': string;
   'tui.leader.heartbeat.cancel_hint': string;
   'tui.leader.heartbeat.long_stall': (status: string, seconds: number) => string;
+  'tui.leader.heartbeat.critical_stall': (status: string, seconds: number) => string;
   'tui.leader.heartbeat.tool_executing': (tool: string, seconds: number) => string;
   'tui.meta.age.seconds': (seconds: number) => string;
   'tui.meta.age.minutes_seconds': (minutes: number, seconds: number) => string;
@@ -930,6 +948,7 @@ export interface I18nStrings {
   'tui.meta.permission': (summary: string) => string;
   'tui.meta.route': (mode: string, preference: string) => string;
   'tui.meta.collaboration': (mode: string, activeTeamName: string) => string;
+  'tui.meta.autonomy': (mode: string, lifecyclePhase: string, modeGeneration: number) => string;
   'tui.meta.unconfigured': string;
   'tui.meta.control': (mode: string) => string;
   'tui.meta.control_eternal': string;
@@ -1033,6 +1052,7 @@ export interface I18nStrings {
   'tui.event.control_manual': string;
   'tui.event.collaboration_mode_changed': (mode: string) => string;
   'tui.event.route_changed': (mode: string) => string;
+  'tui.event.autonomy_mode_changed': (mode: string) => string;
   'tui.event.permission_mode_changed': (mode: string) => string;
   'tui.event.blackboard_disabled': (reason: string) => string;
   'tui.event.llm_retry': (attempt: string, kind: string, message: string) => string;
@@ -1682,18 +1702,20 @@ const zhStrings: I18nStrings = {
   'tui.input.continue': '输入继续...',
   'tui.input.processing': '处理中...',
   'tui.input.cancel_hint': 'esc 取消',
-  'tui.shortcut.compact': 'Esc 清空/中断 · Enter 发送 · Ctrl+X 任务图 · Alt+C/R/P 切模式',
-  'tui.shortcut.medium': 'Esc 清空/中断 · Enter 发送 · Ctrl+X 任务图 · Tab 切频道 · Alt+C 协作 · Alt+R 路由 · Alt+P 权限',
-  'tui.shortcut.full': 'Esc 清空/中断 · Enter 发送 · Shift+Enter 换行 · Tab 切频道 · Ctrl+X 任务图 · Ctrl+E 折叠卡片 · Ctrl+Y 复制代码 · Ctrl+T 原生选中 · Alt+C/R/P 切模式 · PgUp/PgDn 滚动',
+  'tui.shortcut.compact': 'Esc 清空/中断 · Enter 发送 · Ctrl+X 任务图 · Alt+C/R/A/P 切模式',
+  'tui.shortcut.medium': 'Esc 清空/中断 · Enter 发送 · Ctrl+X 任务图 · Tab 切频道 · Alt+C 协作 · Alt+R 路由 · Alt+A 自治 · Alt+P 权限',
+  'tui.shortcut.full': 'Esc 清空/中断 · Enter 发送 · Shift+Enter 换行 · Tab 切频道 · Ctrl+X 任务图 · Ctrl+E 折叠卡片 · Ctrl+Y 复制代码 · Ctrl+T 原生选中 · Alt+C/R/A/P 切模式 · PgUp/PgDn 滚动',
   'tui.mode.header': '当前模式',
   'tui.mode.feedback': (message: string) => `[OK] ${message}`,
   'tui.mode.feedback.success': (message: string) => `[OK] ${message}`,
   'tui.mode.feedback.error': (message: string) => `[ERR] ${message}`,
   'tui.mode.collaboration': (current: string, _next: string) => `协作：${current}（Alt+C 切换）`,
   'tui.mode.route': (current: string, _next: string) => `路由：${current}（Alt+R 切换）`,
+  'tui.mode.autonomy': (current: string, _next: string) => `自治：${current}（Alt+A 切换）`,
   'tui.mode.permission': (current: string, _next: string) => `权限：${current}（Alt+P 切换）`,
   'tui.mode.compact.collaboration': (current: string) => `协作:${current}`,
   'tui.mode.compact.route': (current: string) => `路由:${current}`,
+  'tui.mode.compact.autonomy': (current: string) => `自治:${current}`,
   'tui.mode.compact.permission': (current: string) => `权限:${current}`,
   'tui.mode.collaboration.solo': '单人',
   'tui.mode.collaboration.team': '团队',
@@ -1705,15 +1727,20 @@ const zhStrings: I18nStrings = {
   'tui.mode.route.autoHint': '按任务复杂度自动决定：简单活自己干，重活派助手',
   'tui.mode.route.directHint': 'Leader 直接动手，不派助手，最快最省',
   'tui.mode.route.delegateHint': '尽量外包给 worker agent，适合大范围或重实现',
+  'tui.mode.autonomy.review_first': '先审后做',
+  'tui.mode.autonomy.balanced': '平衡',
+  'tui.mode.autonomy.autonomous': '全自动',
   'tui.mode.permission.yolo': 'YOLO',
   'tui.mode.permission.networked': '联网',
   'tui.mode.permission.dev': '开发',
   'tui.mode.permission.strict': '严格',
   'tui.mode.switched.collaboration': (mode: string) => `协作已切到 ${mode}`,
   'tui.mode.switched.route': (mode: string) => `路由已切到 ${mode}`,
+  'tui.mode.switched.autonomy': (mode: string) => `自治已切到 ${mode}`,
   'tui.mode.switched.permission': (mode: string) => `权限已切到 ${mode}`,
   'tui.mode.error.collaboration': (mode: string, message: string) => `协作切换到 ${mode} 失败：${message}`,
   'tui.mode.error.route': (mode: string, message: string) => `路由切换到 ${mode} 失败：${message}`,
+  'tui.mode.error.autonomy': (mode: string, message: string) => `自治切换到 ${mode} 失败：${message}`,
   'tui.mode.error.permission': (mode: string, message: string) => `权限切换到 ${mode} 失败：${message}`,
   'tui.selection.copied': '选中文本已复制',
   'tui.paste.unresolved': '检测到未展开的粘贴折叠标记，已阻止发送。请重新粘贴后再试。',
@@ -1776,6 +1803,7 @@ const zhStrings: I18nStrings = {
   'tui.leader.heartbeat.cancel_hint': ' · Esc 可中断',
   'tui.leader.heartbeat.tool_executing': (tool: string, seconds: number) => `仍在执行 ${tool}（${seconds}s）`,
   'tui.leader.heartbeat.long_stall': (status: string, seconds: number) => `${status} (${seconds}s) · 如果长时间无响应可尝试 Ctrl+C 中断`,
+  'tui.leader.heartbeat.critical_stall': (status: string, seconds: number) => `${status} (${seconds}s) · 已超时 5 分钟，建议 Ctrl+C 中断后重试`,
   'tui.meta.age.seconds': (seconds: number) => `${seconds}s前`,
   'tui.meta.age.minutes_seconds': (minutes: number, seconds: number) => `${minutes}m${seconds}s前`,
   'tui.meta.age.minutes': (minutes: number) => `${minutes}m前`,
@@ -1795,6 +1823,7 @@ const zhStrings: I18nStrings = {
   'tui.meta.permission': (summary: string) => `权限:${summary}`,
   'tui.meta.route': (mode: string, preference: string) => `执行:${mode}${preference ? ` · 偏好:${preference}` : ''}`,
   'tui.meta.collaboration': (mode: string, activeTeamName: string) => `协作:${mode}${activeTeamName ? ` · 团队:${activeTeamName}` : ''}`,
+  'tui.meta.autonomy': (mode: string, lifecyclePhase: string, modeGeneration: number) => `自治:${mode} · 阶段:${lifecyclePhase} · gen:${modeGeneration}`,
   'tui.meta.unconfigured': '(未配置)',
   'tui.meta.control': (mode: string) => `控制 ${mode}`,
   'tui.meta.control_eternal': 'Eternal(自治)',
@@ -1901,6 +1930,7 @@ const zhStrings: I18nStrings = {
   'tui.event.control_manual': '切换至 Manual Mode（用户主导）',
   'tui.event.collaboration_mode_changed': (mode: string) => `协作模式已切换为 ${mode}`,
   'tui.event.route_changed': (mode: string) => `执行路由偏好已切换为 ${mode}`,
+  'tui.event.autonomy_mode_changed': (mode: string) => `自治模式已切换为 ${mode}`,
   'tui.event.permission_mode_changed': (mode: string) => `权限模式已切换为 ${mode}`,
   'tui.event.blackboard_disabled': (reason: string) => `· 黑板未启用: ${reason}`,
   'tui.event.llm_retry': (attempt: string, kind: string, message: string) => `⏳ LLM ${attempt}${kind}: ${message}`,
@@ -2572,18 +2602,20 @@ const enStrings: I18nStrings = {
   'tui.input.continue': 'Continue typing...',
   'tui.input.processing': 'Processing...',
   'tui.input.cancel_hint': 'esc cancel',
-  'tui.shortcut.compact': 'Esc clear/interrupt · Enter send · Ctrl+X task graph · Alt+C/R/P modes',
-  'tui.shortcut.medium': 'Esc clear/interrupt · Enter send · Ctrl+X task graph · Tab switch channel · Alt+C collab · Alt+R route · Alt+P permission',
-  'tui.shortcut.full': 'Esc clear/interrupt · Enter send · Shift+Enter newline · Tab switch channel · Ctrl+X task graph · Ctrl+E collapse card · Ctrl+Y copy code · Ctrl+T native select · Alt+C/R/P modes · PgUp/PgDn scroll',
+  'tui.shortcut.compact': 'Esc clear/interrupt · Enter send · Ctrl+X task graph · Alt+C/R/A/P modes',
+  'tui.shortcut.medium': 'Esc clear/interrupt · Enter send · Ctrl+X task graph · Tab switch channel · Alt+C collab · Alt+R route · Alt+A autonomy · Alt+P permission',
+  'tui.shortcut.full': 'Esc clear/interrupt · Enter send · Shift+Enter newline · Tab switch channel · Ctrl+X task graph · Ctrl+E collapse card · Ctrl+Y copy code · Ctrl+T native select · Alt+C/R/A/P modes · PgUp/PgDn scroll',
   'tui.mode.header': 'Current modes',
   'tui.mode.feedback': (message: string) => `[OK] ${message}`,
   'tui.mode.feedback.success': (message: string) => `[OK] ${message}`,
   'tui.mode.feedback.error': (message: string) => `[ERR] ${message}`,
   'tui.mode.collaboration': (current: string, _next: string) => `Collab: ${current} (Alt+C to switch)`,
   'tui.mode.route': (current: string, _next: string) => `Route: ${current} (Alt+R to switch)`,
+  'tui.mode.autonomy': (current: string, _next: string) => `Autonomy: ${current} (Alt+A to switch)`,
   'tui.mode.permission': (current: string, _next: string) => `Permission: ${current} (Alt+P to switch)`,
   'tui.mode.compact.collaboration': (current: string) => `Collab:${current}`,
   'tui.mode.compact.route': (current: string) => `Route:${current}`,
+  'tui.mode.compact.autonomy': (current: string) => `Auto:${current}`,
   'tui.mode.compact.permission': (current: string) => `Perm:${current}`,
   'tui.mode.collaboration.solo': 'solo',
   'tui.mode.collaboration.team': 'team',
@@ -2595,15 +2627,20 @@ const enStrings: I18nStrings = {
   'tui.mode.route.autoHint': 'Auto-decide by complexity: simple work direct, heavy work delegated',
   'tui.mode.route.directHint': 'Leader executes directly, no helper; fastest, lowest cost',
   'tui.mode.route.delegateHint': 'Prefer delegating to worker agents; for large or heavy work',
+  'tui.mode.autonomy.review_first': 'review first',
+  'tui.mode.autonomy.balanced': 'balanced',
+  'tui.mode.autonomy.autonomous': 'autonomous',
   'tui.mode.permission.yolo': 'yolo',
   'tui.mode.permission.networked': 'networked',
   'tui.mode.permission.dev': 'dev',
   'tui.mode.permission.strict': 'strict',
   'tui.mode.switched.collaboration': (mode: string) => `collab switched to ${mode}`,
   'tui.mode.switched.route': (mode: string) => `route switched to ${mode}`,
+  'tui.mode.switched.autonomy': (mode: string) => `autonomy switched to ${mode}`,
   'tui.mode.switched.permission': (mode: string) => `permission switched to ${mode}`,
   'tui.mode.error.collaboration': (mode: string, message: string) => `Failed to switch collaboration to ${mode}: ${message}`,
   'tui.mode.error.route': (mode: string, message: string) => `Failed to switch route to ${mode}: ${message}`,
+  'tui.mode.error.autonomy': (mode: string, message: string) => `Failed to switch autonomy to ${mode}: ${message}`,
   'tui.mode.error.permission': (mode: string, message: string) => `Failed to switch permission to ${mode}: ${message}`,
   'tui.selection.copied': 'Selected text copied',
   'tui.paste.unresolved': 'Unexpanded paste placeholders were detected, so the message was not sent. Paste again and retry.',
@@ -2666,6 +2703,7 @@ const enStrings: I18nStrings = {
   'tui.leader.heartbeat.cancel_hint': ' · Esc to interrupt',
   'tui.leader.heartbeat.tool_executing': (tool: string, seconds: number) => `still executing ${tool} (${seconds}s)`,
   'tui.leader.heartbeat.long_stall': (status: string, seconds: number) => `${status} (${seconds}s) · try Ctrl+C to interrupt if it keeps hanging`,
+  'tui.leader.heartbeat.critical_stall': (status: string, seconds: number) => `${status} (${seconds}s) · stalled 5+ min, press Ctrl+C to interrupt and retry`,
   'tui.meta.age.seconds': (seconds: number) => `${seconds}s ago`,
   'tui.meta.age.minutes_seconds': (minutes: number, seconds: number) => `${minutes}m${seconds}s ago`,
   'tui.meta.age.minutes': (minutes: number) => `${minutes}m ago`,
@@ -2685,6 +2723,7 @@ const enStrings: I18nStrings = {
   'tui.meta.permission': (summary: string) => `permission:${summary}`,
   'tui.meta.route': (mode: string, preference: string) => `execution:${mode}${preference ? ` · preference:${preference}` : ''}`,
   'tui.meta.collaboration': (mode: string, activeTeamName: string) => `collab:${mode}${activeTeamName ? ` · team:${activeTeamName}` : ''}`,
+  'tui.meta.autonomy': (mode: string, lifecyclePhase: string, modeGeneration: number) => `autonomy:${mode} · phase:${lifecyclePhase} · gen:${modeGeneration}`,
   'tui.meta.unconfigured': '(unconfigured)',
   'tui.meta.control': (mode: string) => `control ${mode}`,
   'tui.meta.control_eternal': 'Eternal(auto)',
@@ -2791,6 +2830,7 @@ const enStrings: I18nStrings = {
   'tui.event.control_manual': 'Switched to Manual Mode (user-led)',
   'tui.event.collaboration_mode_changed': (mode: string) => `Collaboration mode switched to ${mode}`,
   'tui.event.route_changed': (mode: string) => `Execution route preference switched to ${mode}`,
+  'tui.event.autonomy_mode_changed': (mode: string) => `Autonomy mode switched to ${mode}`,
   'tui.event.permission_mode_changed': (mode: string) => `Permission mode switched to ${mode}`,
   'tui.event.blackboard_disabled': (reason: string) => `· Blackboard disabled: ${reason}`,
   'tui.event.llm_retry': (attempt: string, kind: string, message: string) => `⏳ LLM ${attempt}${kind}: ${message}`,

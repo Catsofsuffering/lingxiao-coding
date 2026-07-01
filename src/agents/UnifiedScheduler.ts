@@ -12,7 +12,7 @@
 import type { TaskBoard, Task } from '../core/TaskBoard.js';
 import type { AgentPool } from './AgentPoolRuntime.js';
 import type { EventEmitter } from '../core/EventEmitter.js';
-import { config as runtimeConfig } from '../config.js';
+import { config as runtimeConfig, onConfigReload } from '../config.js';
 import { coreLogger } from '../core/Log.js';
 import { isCoreTaskTerminalStatus } from '../core/StateSemantics.js';
 
@@ -65,7 +65,7 @@ export interface DispatchOptions {
  * 不持有 setInterval，不自驱选 task。所有派发都由 LLM 显式触发 requestDispatch。
  */
 export class UnifiedScheduler {
-  private readonly config: SchedulerConfig;
+  private config: SchedulerConfig;
   private readonly deps: UnifiedSchedulerDeps;
   /** sessionId -> Set<taskId>，反映"已派发尚未释放槽位"的 worker */
   private readonly runningWorkers = new Map<string, Set<string>>();
@@ -77,6 +77,8 @@ export class UnifiedScheduler {
   };
   private disposed = false;
   private readonly unsubscribers: Array<() => void> = [];
+  /** 最近一次 requestDispatch 拒绝原因（供 LeaderTools 读取给 LLM 精确反馈） */
+  private lastRejectReason: string | null = null;
 
   constructor(deps: UnifiedSchedulerDeps) {
     this.deps = deps;
@@ -86,6 +88,24 @@ export class UnifiedScheduler {
       maxProjectWorkers: deps.config?.maxProjectWorkers ?? defaultMaxWorkers,
     };
     this.subscribeToTaskBoardEvents();
+
+    // 注册配置热加载：agents.max_concurrent 变化时动态更新槽位上限，
+    // 避免需要重启 session 才能让新并发上限生效。
+    const unsub = onConfigReload((cfg) => {
+      try {
+        const newMax = cfg.agents.max_concurrent;
+        if (newMax > 0 && newMax !== this.config.maxProjectWorkers) {
+          this.config = {
+            maxWorkers: newMax,
+            maxProjectWorkers: newMax,
+          };
+          coreLogger.info(`[UnifiedScheduler] 热加载并发上限 → ${newMax}`);
+        }
+      } catch (e) {
+        coreLogger.warn(`[UnifiedScheduler] onConfigReload 回调异常: ${e}`);
+      }
+    });
+    this.unsubscribers.push(unsub);
   }
 
   /** 订阅 TaskBoard 生命周期事件，自动维护槽位计数 */
@@ -156,14 +176,22 @@ export class UnifiedScheduler {
    * @returns 是否成功启动 worker。budget 不足、任务非 dispatchable、hook 拒绝都会返回 false。
    */
   async requestDispatch(task: Task, opts: DispatchOptions = {}): Promise<boolean> {
-    if (this.disposed) return false;
+    if (this.disposed) { this.lastRejectReason = '调度器已销毁'; return false; }
     // A7: 派发前先对账,回收因漏事件泄漏的槽位(否则 currentRunning 虚高挤占可用并发)。
     this.reconcile();
-    if (task.status !== 'dispatchable') return false;
-    if (!this.deps.board.isTaskReady(task.id)) return false;
+    if (task.status !== 'dispatchable') { this.lastRejectReason = `任务状态为 ${task.status}（非 dispatchable）`; return false; }
+    if (!this.deps.board.isTaskReady(task.id)) {
+      const blockedReason = this.deps.board.getBlockedReason(task);
+      this.lastRejectReason = blockedReason ? `依赖/契约未就绪：${blockedReason}` : '依赖或契约未就绪';
+      return false;
+    }
     const bucket = this.runningWorkers.get(this.deps.sessionId);
-    if (bucket?.has(task.id)) return false;
-    if (!this.canDispatchMore()) return false;
+    if (bucket?.has(task.id)) { this.lastRejectReason = `任务 ${task.id} 已在派发中（bucket 冲突）`; return false; }
+    if (!this.canDispatchMore()) {
+      const cap = this.getCapacityInfo();
+      this.lastRejectReason = `并发槽位已满（${cap.running}/${cap.max}），请等待运行中的 Agent 完成`;
+      return false;
+    }
 
     this.claimSlot(task.id);
     let ok = false;
@@ -185,8 +213,10 @@ export class UnifiedScheduler {
         this.stats.currentRunning = Math.max(0, this.stats.currentRunning - 1);
         this.stats.totalDispatched = Math.max(0, this.stats.totalDispatched - 1);
       }
+      this.lastRejectReason = `dispatchTask hook 返回 false（worker 启动失败，可能原因：agent 名称冲突/角色注册失败/进程启动异常）`;
       return false;
     }
+    this.lastRejectReason = null;
     return true;
   }
 
@@ -230,8 +260,21 @@ export class UnifiedScheduler {
     return { ...this.stats };
   }
 
+  /** 返回最近一次 requestDispatch 的拒绝原因（null 表示上次成功或未调用过） */
+  getLastRejectReason(): string | null {
+    return this.lastRejectReason;
+  }
+
   getRunningTaskIds(): string[] {
     return Array.from(this.runningWorkers.get(this.deps.sessionId) ?? []);
+  }
+
+  /** 返回当前并发槽位使用情况，供 Leader 给出精确的"槽位已满"错误信息 */
+  getCapacityInfo(): { running: number; max: number; available: number } {
+    this.reconcile();
+    const running = this.stats.currentRunning;
+    const max = this.config.maxProjectWorkers;
+    return { running, max, available: Math.max(0, max - running) };
   }
 
   dispose(): void {

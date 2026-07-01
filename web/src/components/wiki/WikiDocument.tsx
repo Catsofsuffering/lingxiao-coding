@@ -5,7 +5,7 @@ import { useViewStore } from '../../stores/viewStore';
 import { useMemo, useEffect, useRef, useCallback, useState } from 'react';
 import DOMPurify from 'dompurify';
 import SafeMarkdown, { type SafeMarkdownComponents } from '../ui/SafeMarkdown';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { PrismAsync as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { useThemeStore } from '../../stores/themeStore';

@@ -79,10 +79,14 @@ export const AGENT = {
   MAX_RUNTIME_MINUTES: 480,
   /** 权限请求超时 (ms) */
   PERMISSION_TIMEOUT_MS: 300_000,
-  /** 对话最大消息数 */
-  MAX_CONVERSATION_MESSAGES: 800,
-  /** 单 Agent 最大消息数 */
-  MAX_AGENT_MESSAGES: 500,
+  /** 对话最大消息数 — 长任务默认保留更多轮次，避免恢复态/运行态被过早挤出热上下文 */
+  MAX_CONVERSATION_MESSAGES: 2_000,
+  /** Leader 内存对话历史字节预算（UTF-8），超限后按 tool-call 配对安全裁剪旧消息 */
+  MAX_CONVERSATION_BYTES: 96 * 1024 * 1024,
+  /** 单 Agent 最大消息数 — 多工具链 worker 默认保留更长尾部 */
+  MAX_AGENT_MESSAGES: 1_200,
+  /** Worker/Agent 内存 messages 字节预算（UTF-8），超限后按 tool-call 配对安全裁剪旧消息 */
+  MAX_AGENT_MESSAGES_BYTES: 80 * 1024 * 1024,
   /** 工具结果默认截断长度 */
   TOOL_RESULT_MAX_CHARS: 4_000,
   /** 最大续接深度 */
@@ -103,10 +107,17 @@ export const TOOLS = {
 // ═══════════════════════════════════════════════════════════════
 
 export const LEADER = {
-  /** Leader 最大工具轮次 */
-  MAX_TOOL_ROUNDS: 200,
+  /** Leader 最大工具轮次 — 长任务/恢复窗口默认给足，不因预算刷新误停 */
+  MAX_TOOL_ROUNDS: 500,
   /** Leader 最大运行时间 (分钟) — 24×7 模式持续运行 */
   MAX_RUNTIME_MINUTES: 480,
+  /**
+   * Leader 单轮 wall-clock 超时 (ms) — 安全网，兜底 LlmGuard 内部 hang watchdog
+   * (240s) 失效或内层重试循环 (3×180s=540s+backoff) 运行过久。
+   * 600s 高于 LlmGuard 最坏情况 (~723s)，仅在极端场景触发；
+   * 触发后 abort 当前 LLM 调用，按可重试错误走外层 retry 计数器。
+   */
+  ROUND_TIMEOUT_MS: 600_000,
   /** Leader 探测沉默阈值 (秒) — Agent 启动后首次静默多久开始探测 */
   PROBE_SILENCE_SECONDS: 300,
   /** Leader 探测最大间隔 (秒) */
@@ -438,6 +449,8 @@ export const MESSAGE_BUS = {
   WARNING_THRESHOLD: 500,
   /** 消息队列危险阈值 */
   CRITICAL_THRESHOLD: 1_000,
+  /** messageHistory 字节硬上限（UTF-8 估算），长会话默认保留更多 runtime 事件和恢复证据 */
+  MAX_HISTORY_BYTES: 64 * 1024 * 1024,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════
@@ -484,6 +497,9 @@ export const RESOURCE_BUDGET = {
   SQLITE_WAL_CHECKPOINT_MB: 50,
   /** scratchpad 最大磁盘 (MB) */
   SCRATCHPAD_MAX_MB: 50,
+  /** 单个 Worker 子进程 RSS 内存上限 (MB)：超过则按温控 kill 并走可恢复重派。
+   *  0 表示禁用内存温控。默认 2GB——正常 worker 远低于此，触顶通常意味着失控/泄漏。 */
+  WORKER_MAX_RSS_MB: 2048,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════
@@ -518,6 +534,8 @@ export const BLACKBOARD = {
   MAX_GRAPH_NODES: 1000,
   /** 图边上限 */
   MAX_GRAPH_EDGES: 5000,
+  /** 单个黑板节点正文最大字符数，防止巨型 fact/contract/design_doc 常驻 DB 与内存 */
+  MAX_NODE_CONTENT_CHARS: 32_000,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════
@@ -526,15 +544,15 @@ export const BLACKBOARD = {
 
 export const BUDGET = {
   /** 总 token 预算硬上限（system prompt + tools + soul + blackboard + messages） */
-  MAX_CONTEXT_BUDGET: 100_000,
+  MAX_CONTEXT_BUDGET: 300_000,
   /** 总 token 预算下限（防止小模型预算过低） */
-  MIN_CONTEXT_BUDGET: 50_000,
+  MIN_CONTEXT_BUDGET: 120_000,
   /** Soul.md 默认 token 预算 */
-  SOUL_DEFAULT_BUDGET: 12_000,
+  SOUL_DEFAULT_BUDGET: 20_000,
   /** 黑板图快照默认 token 预算 */
-  BLACKBOARD_DEFAULT_BUDGET: 5_000,
+  BLACKBOARD_DEFAULT_BUDGET: 18_000,
   /** 工具定义默认 token 预算 */
-  TOOLS_DEFAULT_BUDGET: 8_000,
+  TOOLS_DEFAULT_BUDGET: 24_000,
   /** 注入内容（skills/intuition/memory）默认 token 预算 */
-  INJECTIONS_DEFAULT_BUDGET: 5_000,
+  INJECTIONS_DEFAULT_BUDGET: 18_000,
 } as const;

@@ -60,6 +60,24 @@ export interface AgentHealthRecord {
   lastEscalationAtMs: number;
   /** Agent 是否已被标记为终止 */
   terminated: boolean;
+  /**
+   * Distinct progress 维度（新增，与 T-13 ToolFailureLoopGuard 配套）。
+   * 含义：本次运行中实际产生「新增产物或状态变化」的工具调用去重数量。
+   * 读文件 / 读会话产物等「只读」调用不计——只要读不算 progress。
+   * 写文件 / 补丁 / shell / python / 状态变更等「产生新事实」的工具调用计 1。
+   * 该字段有「不刷新 lastActivityAtMs」语义——避免「重复读同一个文件」伪装 progress。
+   */
+  distinctProgressCount: number;
+  /**
+   * 当前运行中连续被熔断（ToolFailureLoopGuard 触发）的工具调用次数。
+   * 当该值 >= 1 时，assessAgentHealth 会直接报 stuck+redirect（状态类错误场景）。
+   */
+  toolFailureLoopTrips: number;
+  /**
+   * 最近一次 ToolFailureLoopGuard 熔断的时间。
+   * 用来给 stuck/runaway 检测提供一个「业务零进展 + tool failure loop」双信号。
+   */
+  lastToolFailureLoopAtMs: number;
 }
 
 export interface AgentHealthMonitorConfig {
@@ -113,6 +131,23 @@ export function assessAgentHealth(
 ): HealthDecision {
   const inactiveMs = nowMs - record.lastActivityAtMs;
   const inactiveSeconds = Math.round(inactiveMs / 1000);
+
+  // 0. T-13 ToolFailureLoopGuard 优先：状态类错误熔断后必须升级为 stuck+redirect。
+  // 要求在 5 分钟内有熔断发生（避免历史记录误伤新 session），且 toolFailureLoopTrips >= 1。
+  if (record.toolFailureLoopTrips > 0
+      && record.lastToolFailureLoopAtMs > 0
+      && nowMs - record.lastToolFailureLoopAtMs < 5 * 60_000) {
+    const escalationReady = nowMs - record.lastEscalationAtMs >= config.nudgeCooldownMs;
+    const trips = record.toolFailureLoopTrips;
+    return {
+      agentId: record.agentId,
+      name: record.name,
+      status: 'stuck',
+      reason: `ToolFailureLoopGuard 触发熔断 ${trips} 次，状态类错误连续重试不会改变结果`,
+      action: escalationReady ? 'redirect' : 'none',
+      stallSeconds: Math.round((nowMs - record.lastToolFailureLoopAtMs) / 1000),
+    };
+  }
 
   // 1. 检查 runaway（长时间无进展）
   if (inactiveMs >= config.runawayThresholdMs) {
@@ -236,16 +271,44 @@ export class AgentHealthMonitor {
     // 导致旧 interval 永跑且无法清理。
     if (this.pollTimer) return;
     this.subscribeEvents();
-    this.pollTimer = setInterval(() => {
+    this.schedulePoll();
+  }
+
+  /**
+   * 资源降级：idle 时拉长轮询周期，减少空转 CPU
+   */
+  private static readonly IDLE_POLL_MULTIPLIER = 3;
+  private idleMode = false;
+
+  setIdleMode(idle: boolean): void {
+    if (this.idleMode === idle) return;
+    this.idleMode = idle;
+    // 重新调度下一次 poll以新周期
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+      this.schedulePoll();
+    }
+  }
+
+  private getEffectivePollInterval(): number {
+    return this.idleMode
+      ? this.config.pollIntervalMs * AgentHealthMonitor.IDLE_POLL_MULTIPLIER
+      : this.config.pollIntervalMs;
+  }
+
+  private schedulePoll(): void {
+    this.pollTimer = setTimeout(() => {
       this.triggerEvaluation('poll');
-    }, this.config.pollIntervalMs);
-    // unref:不阻塞事件循环自然退出(Leader 停止时 stop() 会 clearInterval,#40)
+      this.schedulePoll(); // 继续下一轮
+    }, this.getEffectivePollInterval());
+    // unref：不阻塞事件循环自然退出(Leader 停止时 stop() 会 clearTimeout)
     this.pollTimer.unref?.();
   }
 
   stop(): void {
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
     if (this.eventDebounceTimer) {
@@ -289,6 +352,9 @@ export class AgentHealthMonitor {
       nudgeCount: 0,
       lastEscalationAtMs: 0,
       terminated: false,
+      distinctProgressCount: 0,
+      toolFailureLoopTrips: 0,
+      lastToolFailureLoopAtMs: 0,
     });
   }
 
@@ -408,6 +474,20 @@ export class AgentHealthMonitor {
     this.emitter.on('agent:completed', onTerminated);
     this.emitter.on('agent:failed', onTerminated);
 
+    // ToolFailureLoopGuard 熔断：累计 toolFailureLoopTrips + lastToolFailureLoopAtMs，
+    // **不**刷新 lastActivityAtMs（熔断是失败信号不是 progress）。触发评估让 Leader 介入。
+    // 状态类错误（requiresEscalation=true）会立即被 assessAgentHealth 报 stuck+redirect。
+    const onToolFailureLoop = (data: Record<string, unknown>) => {
+      const agentId = String(data.agentId || '');
+      const record = this.records.get(agentId);
+      if (record && !record.terminated) {
+        record.toolFailureLoopTrips += 1;
+        record.lastToolFailureLoopAtMs = Date.now();
+        this.scheduleEventEvaluation();
+      }
+    };
+    this.emitter.on('agent:tool_failure_loop', onToolFailureLoop);
+
     // 保存取消订阅函数
     this.unsubscribers.push(
       () => this.emitter.off('agent:text_chunk', onActivity),
@@ -423,6 +503,7 @@ export class AgentHealthMonitor {
       () => this.emitter.off('token:usage', onActivity),
       () => this.emitter.off('agent:completed', onTerminated),
       () => this.emitter.off('agent:failed', onTerminated),
+      () => this.emitter.off('agent:tool_failure_loop', onToolFailureLoop),
     );
   }
 

@@ -6,6 +6,7 @@ import { config as runtimeConfig, saveSettings, ConfigSchema, setConfigValue } f
 import { getTerminalSessionManager } from '../tools/implementations/TerminalSessionManager.js';
 import { isTerminalSessionActiveStatus } from '../core/StateSemantics.js';
 import { eventPayloadToSessionUpdateMessage } from '../contracts/adapters/EventAdapter.js';
+import { SESSION_KEYS } from '../core/SessionStateKeys.js';
 import { getModelManager } from '../config/ModelManager.js';
 import { t } from '../i18n.js';
 import { VERSION } from '../version.js';
@@ -91,10 +92,57 @@ function isPermissionResolutionDecision(value: unknown): value is PermissionReso
   return value === 'approved' || value === 'rejected' || value === 'allowAll';
 }
 
-function parsePermissionResolutionRequest(params?: Record<string, unknown>): PermissionResolutionRequest {
-  const requestId = nonEmptyString(params?.requestId);
-  const decision = params?.decision;
-  if (!requestId || !isPermissionResolutionDecision(decision)) {
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function normalizePermissionResolutionDecision(value: unknown): PermissionResolutionDecision | undefined {
+  if (isPermissionResolutionDecision(value)) return value;
+  if (typeof value !== 'string') return undefined;
+  switch (value.trim().toLowerCase()) {
+    case 'approve':
+    case 'allow':
+    case 'accept':
+    case 'yes':
+      return 'approved';
+    case 'deny':
+    case 'reject':
+    case 'no':
+      return 'rejected';
+    case 'allow_all':
+    case 'allow-all':
+    case 'allowall':
+    case 'all':
+      return 'allowAll';
+    default:
+      return undefined;
+  }
+}
+
+function permissionResolutionParams(params?: Record<string, unknown>): Record<string, unknown> | undefined {
+  return asRecord(params?.permissionResolution)
+    ?? asRecord(params?.resolution)
+    ?? params;
+}
+
+function parsePermissionResolutionRequest(
+  params?: Record<string, unknown>,
+  fallbackRequestId?: string,
+): PermissionResolutionRequest {
+  const source = permissionResolutionParams(params);
+  // 兼容历史/跨端字段：toolCallId、request_id、id；旧 Web 卡片可能缺 requestId，
+  // 这种情况下回退到当前 session 的 pending permission requestId。
+  const requestId = nonEmptyString(source?.requestId)
+    ?? nonEmptyString(source?.request_id)
+    ?? nonEmptyString(source?.toolCallId)
+    ?? nonEmptyString(source?.id)
+    ?? fallbackRequestId;
+  const decision = normalizePermissionResolutionDecision(
+    source?.decision ?? source?.action ?? source?.status,
+  );
+  if (!requestId || !decision) {
     throw new Error('requestId and decision are required');
   }
   return {
@@ -232,6 +280,10 @@ export class AcpHandler {
           result = await this.handleSetExecutionRoute(params, sessionId);
           break;
 
+        case 'session/set_autonomy_mode':
+          result = await this.handleSetAutonomyMode(params, sessionId);
+          break;
+
         case 'session/set_eternal_goal':
           result = await this.handleSetEternalGoal(params, sessionId);
           break;
@@ -291,6 +343,10 @@ export class AcpHandler {
 
         case 'memory/run':
           result = await this.handleMemoryRun(params, sessionId);
+          break;
+
+        case 'memory/toggle':
+          result = await this.handleMemoryToggle(params, sessionId);
           break;
 
         default:
@@ -697,6 +753,40 @@ export class AcpHandler {
     };
   }
 
+  private async handleSetAutonomyMode(params?: Record<string, unknown>, sessionId?: string) {
+    if (!sessionId) throw new Error('sessionId is required');
+    const mode = params?.mode as string;
+    if (!mode || typeof mode !== 'string') {
+      throw new Error('mode is required');
+    }
+    // Accept canonical values (review_first / balanced / autonomous) and UI alias (full_auto).
+    const validModes = ['review_first', 'balanced', 'autonomous', 'full_auto'];
+    if (!validModes.includes(mode)) {
+      throw new Error(`invalid autonomy mode: ${String(mode)}`);
+    }
+
+    const lifecyclePhase = params?.lifecycle_phase as string | undefined;
+    const updatedBy = (params?.updated_by as string | undefined) === 'tui' ? 'tui'
+      : (params?.updated_by as string | undefined) === 'web' ? 'web'
+      : (params?.updated_by as string | undefined) === 'runtime_policy' ? 'runtime_policy'
+      : 'leader';
+    const reason = params?.reason as string | undefined;
+
+    const result = this.sessionManager.setAutonomyMode(sessionId, mode, {
+      lifecyclePhase,
+      updatedBy,
+      reason,
+    });
+    if (!result.ok) throw new Error(result.message);
+    const runtime = this.readRuntimeSnapshot(sessionId, 'acp_set_autonomy_mode');
+    return {
+      success: true,
+      mode: runtime?.runtimeState.modes.autonomy ?? mode,
+      message: result.message,
+      runtime,
+    };
+  }
+
   private async handleSetEternalGoal(params?: Record<string, unknown>, sessionId?: string) {
     if (!sessionId) throw new Error('sessionId is required');
     const unsupported = Object.keys(params || {}).find((key) => !ETERNAL_GOAL_FIELDS.has(key));
@@ -789,7 +879,12 @@ export class AcpHandler {
   private async handleResolvePermission(params?: Record<string, unknown>, sessionId?: string) {
     if (!sessionId) throw new Error('sessionId is required');
 
-    const resolution = parsePermissionResolutionRequest(params);
+    const pendingPermission = asRecord(this.db.getSessionState(sessionId, SESSION_KEYS.PENDING_PERMISSION_REQUEST));
+    const fallbackRequestId = nonEmptyString(pendingPermission?.requestId)
+      ?? nonEmptyString(pendingPermission?.request_id)
+      ?? nonEmptyString(pendingPermission?.toolCallId)
+      ?? nonEmptyString(pendingPermission?.id);
+    const resolution = parsePermissionResolutionRequest(params, fallbackRequestId);
 
     const session = this.sessionManager.getSession(sessionId);
     if (!session) {
@@ -931,5 +1026,29 @@ export class AcpHandler {
       sessionId: targetSessionId,
       allowOverwrite: Boolean(params?.allowOverwrite),
     });
+  }
+
+  private async handleMemoryToggle(params?: Record<string, unknown>, sessionId?: string) {
+    const kind = params?.kind;
+    if (kind !== 'dream' && kind !== 'distill') {
+      throw new Error('kind must be dream or distill');
+    }
+    const enabled = Boolean(params?.enabled);
+
+    // 动态更新 runtimeConfig
+    const { config: runtimeConfig, updateConfig } = await import('../config.js');
+    const configKey = kind === 'dream' ? 'dream' : 'distill';
+
+    await updateConfig({
+      memory: {
+        ...runtimeConfig.memory,
+        [configKey]: {
+          ...runtimeConfig.memory[configKey],
+          enabled,
+        },
+      },
+    });
+
+    return { success: true, kind, enabled };
   }
 }

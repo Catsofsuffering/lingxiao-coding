@@ -120,6 +120,7 @@ import {
   buildTuiLayoutBudget,
   buildTuiMetaLine,
   buildTuiStatusView,
+  formatTuiAutonomyMode,
   formatTuiCollaborationMode,
   formatTuiPermissionMode,
   formatTuiRoutePreference,
@@ -174,10 +175,12 @@ type TuiSessionSnapshotChannelSeed = InitialChannelSeed & {
 
 type TuiPermissionMode = 'yolo' | 'networked' | 'dev' | 'strict';
 type TuiRoutePreference = 'auto' | 'direct' | 'delegate';
+type TuiAutonomyMode = 'review_first' | 'balanced' | 'autonomous';
 type TuiCollaborationMode = 'solo' | 'team';
 
 const TUI_PERMISSION_MODES: readonly TuiPermissionMode[] = ['yolo', 'networked', 'dev', 'strict'];
 const TUI_ROUTE_PREFERENCES: readonly TuiRoutePreference[] = ['auto', 'direct', 'delegate'];
+const TUI_AUTONOMY_MODES: readonly TuiAutonomyMode[] = ['review_first', 'balanced', 'autonomous'];
 
 function commandResultContent(result: CommandResult | string | void, fallback: string): string {
   if (typeof result === 'string') return result;
@@ -193,6 +196,10 @@ function readTuiPermissionMode(value: unknown): TuiPermissionMode | null {
 
 function readTuiRoutePreference(value: unknown): TuiRoutePreference | null {
   return TUI_ROUTE_PREFERENCES.includes(value as TuiRoutePreference) ? value as TuiRoutePreference : null;
+}
+
+function readTuiAutonomyMode(value: unknown): TuiAutonomyMode | null {
+  return TUI_AUTONOMY_MODES.includes(value as TuiAutonomyMode) ? value as TuiAutonomyMode : null;
 }
 type TuiSessionSnapshotDto = {
   sessionStatus: SessionStatusData;
@@ -298,10 +305,9 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     if (processExitRequestedRef.current) return;
     processExitRequestedRef.current = true;
     emitter.emit('shutdown', { reason });
+    // 只调用 Ink 的 exit()，让 cli.ts 的 waitUntilExit 自然完成
+    // 清理和 process.exit 统一在 cli.ts 的 finally 块中执行
     exit();
-    setTimeout(() => {
-      process.exit(0);
-    }, 250).unref?.();
   }, [emitter, exit]);
   const initialLeaderDisplayStatus = normalizeLocalizedAwaitingInputStatus(initialLeaderStatus);
   const [sessionStatus, setSessionStatus] = useState(initialStatus);
@@ -443,6 +449,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [leaderRuntimeActive, setLeaderRuntimeActive] = useState(false);
   const [leaderRuntimeQueueLength, setLeaderRuntimeQueueLength] = useState(0);
+  const [leaderRuntimeModel, setLeaderRuntimeModel] = useState<string | undefined>(undefined);
   const [mainQueuedCount, setMainQueuedCount] = useState(0);
   const leaderRuntimeActiveRef = useRef(false);
   const leaderRuntimeQueueLengthRef = useRef(0);
@@ -513,6 +520,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     leaderRuntimeActiveRef.current = false;
     setLeaderRuntimeQueueLength(0);
     leaderRuntimeQueueLengthRef.current = 0;
+    setLeaderRuntimeModel(undefined);
   }, []);
 
   // 主 tab 只显示真实上下文 token（context:runtime_updated / context:compressed）。
@@ -584,7 +592,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     maxWidth: Math.max(24, termSize.cols - 4),
     now,
   }), [sessionStatus, currentTab, tabOrder, channels, mainQueuedCount, taskSummaryText, currentAgentDiagnostic, currentAgentInteractiveState, termSize.cols, now, languageVersion]);
-  const modelName = config.llm.leader_model || config.llm.agent_model || 'default-model';
+  const modelName = leaderRuntimeModel || config.llm.leader_model || config.llm.agent_model || 'default-model';
   const statusView = useMemo(() => buildTuiStatusView({
     modelName,
     currentTab,
@@ -818,6 +826,16 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
       return resolveModeForTabSwitch(name, prev);
     });
   }, []);
+  const tokenUsageHandlers = useTuiTokenBuffer({
+    setTokenUsage,
+    setAgentTokens,
+    agentIdMapRef,
+    setCurrentContextTokenTotal,
+    setCurrentContextLimit,
+    setCurrentContextPct,
+    appendMessage,
+    contextLimit,
+  });
 
   const leaderHandlers = useTuiLeaderHandlers({
     appendMessage,
@@ -842,6 +860,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     switchTab,
     showThinkingContent: config.llm.show_thinking_content === true,
     setToolExecutingState,
+    resetStreamingTokens: tokenUsageHandlers.resetStreamingTokens,
   });
 
   const permissionSync = useMemo(() => createPermissionSync({
@@ -852,16 +871,6 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     buildPreviewHint: buildPermissionPreviewHint,
   }), [appendMessage, pendingPermissionRequest]);
 
-  const tokenUsageHandlers = useTuiTokenBuffer({
-    setTokenUsage,
-    setAgentTokens,
-    agentIdMapRef,
-    setCurrentContextTokenTotal,
-    setCurrentContextLimit,
-    setCurrentContextPct,
-    appendMessage,
-    contextLimit,
-  });
 
   const _handleSessionInterrupted = leaderHandlers.handleSessionInterrupted;
   const handleSessionInterrupted = useCallback<TuiEventHandler<'session:interrupted'>>((event) => {
@@ -986,7 +995,12 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
 
   const handleTokenUsage = tokenUsageHandlers.handleTokenUsage;
   const handleContextRuntimeUpdated = tokenUsageHandlers.handleContextRuntimeUpdated;
-  const handleContextCompressed = tokenUsageHandlers.handleContextCompressed;
+  const handleContextCompressed = useCallback<TuiEventHandler<'context:compressed'>>((event) => {
+    // 兜底清除 compactingState：context:compacting 的 phase='end' 事件可能丢失
+    // 或未发，但 context:compressed 是压缩完成的确定性信号，必须在此清除。
+    setCompactingState(null);
+    tokenUsageHandlers.handleContextCompressed(event);
+  }, [tokenUsageHandlers]);
 
   const handleContextCompacting = useCallback<TuiEventHandler<'context:compacting'>>((event) => {
     const payload = eventRecord(event);
@@ -1007,6 +1021,16 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
       }));
     }
   }, []);
+
+  // Safety timeout: 如果 compactingState 超过 10 分钟仍未收到 end 事件，自动清除
+  // 防止 end 事件丢失或上游异常导致压缩条幅永久残留
+  useEffect(() => {
+    if (!compactingState) return;
+    const timer = setTimeout(() => {
+      setCompactingState(null);
+    }, 10 * 60 * 1000);
+    return () => clearTimeout(timer);
+  }, [compactingState]);
 
   const handlePlanSubmitted = useCallback<TuiEventHandler<'plan:submitted'>>((event) => {
     const payload = eventRecord(event);
@@ -1350,6 +1374,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
       hasRunningWorkers,
       nextSessionStatus,
       nextLeaderStatus,
+      leaderModel: projectedLeaderModel,
     } = projection;
     const wasRuntimeActive = leaderRuntimeActiveRef.current;
     sessionStatusRef.current = nextSessionStatus;
@@ -1369,11 +1394,20 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     leaderRuntimeActiveRef.current = runtimeActive;
     setLeaderRuntimeQueueLength(queueLength);
     leaderRuntimeQueueLengthRef.current = queueLength;
+    if (projectedLeaderModel) {
+      setLeaderRuntimeModel(projectedLeaderModel);
+    }
     if (runtimeActive && !wasRuntimeActive) {
       tokenUsageHandlers.resetStreamingTokens();
     }
     if (!runtimeActive) {
       leaderPhaseRef.current = undefined;
+      // Leader 不再活跃时，清除残留的 streaming token 和工具执行状态。
+      // 否则 startedAt/outputTokens 残留会让 streamingStatus 持续返回 active: true，
+      // 状态栏永远显示「处理中」——尤其发生在 Leader 输出完成但 worker 仍在运行时
+      // （runtimeImpliesBusy 因 worker 返回 true，导致 runtimeActive 不变）。
+      tokenUsageHandlers.resetStreamingTokens();
+      setToolExecutingState({});
     }
 
     if (nextLeaderStatus && nextLeaderStatus !== leaderStatusRef.current) {
@@ -2328,6 +2362,33 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     }
   }, [appendMessage, patchSessionStatus, showModeActionFlash]);
 
+  const cycleAutonomyMode = useCallback(async () => {
+    const current = readTuiAutonomyMode(sessionStatusRef.current?.modes?.autonomy) || 'balanced';
+    const next = TUI_AUTONOMY_MODES[(TUI_AUTONOMY_MODES.indexOf(current) + 1) % TUI_AUTONOMY_MODES.length];
+    try {
+      const result = await onCommandRef.current(`/autonomy ${next}`);
+      const display = formatTuiAutonomyMode(next);
+      appendMessage('main', {
+        type: 'system',
+        content: commandResultContent(result, t('tui.event.autonomy_mode_changed', display)),
+      });
+      showModeActionFlash(t('tui.mode.switched.autonomy', display));
+      patchSessionStatus((prev) => ({
+        ...prev,
+        modes: prev.modes ? {
+          ...prev.modes,
+          autonomy: next,
+          modeGeneration: Math.max(1, (prev.modes.modeGeneration || 1) + 1),
+        } : prev.modes,
+      }));
+    } catch (error) {
+      const display = formatTuiAutonomyMode(next);
+      const message = t('tui.mode.error.autonomy', display, error instanceof Error ? error.message : String(error));
+      appendMessage('main', { type: 'error', content: message });
+      showModeActionFlash(message, 'error');
+    }
+  }, [appendMessage, patchSessionStatus, showModeActionFlash]);
+
   const cyclePermissionMode = useCallback(async () => {
     const current = readTuiPermissionMode(sessionStatusRef.current?.modes?.permission.mode)
       || readTuiPermissionMode(sessionStatusRef.current?.permissionMode)
@@ -2406,6 +2467,7 @@ export const LingXiaoTUI: React.FC<LingXiaoTUIProps> = ({
     handleTabSwitchRef,
     onToggleCollaborationMode: toggleCollaborationMode,
     onCycleExecutionRoute: cycleExecutionRoute,
+    onCycleAutonomyMode: cycleAutonomyMode,
     onCyclePermissionMode: cyclePermissionMode,
     leaderRuntimeQueueLength,
     onClearPendingMessages,

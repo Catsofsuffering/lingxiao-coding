@@ -30,6 +30,14 @@ export interface ModelPricing {
 
 export type ModelPricingResolution = ModelPricing & {
   estimated: false;
+  /**
+   * cache 子价（cacheReadPerMToken / cacheCreationPerMToken）缺失，被静默回退为
+   * inputPerMToken 计价。会让 cache_read 段费用看起来 ≈ input 段，丢失真实节省幅度。
+   * UI 应当把这种"部分定价"显式标记为 estimated / partial,避免伪精确。
+   * 仅在 resolvePricing() 解析路径上设置,coerceModelPricing 内部旧实现保持行为不变以
+   * 不破坏其他调用方。
+   */
+  pricingPartial?: boolean;
 };
 
 export interface CostBreakdown {
@@ -45,7 +53,13 @@ export interface CostBreakdown {
   cacheReadCost: number;
   cacheCreationCost: number;
   totalCost: number;
+  /** 完整定价缺失（无 input/output 价格）— 费用全为 0 */
   pricingMissing?: boolean;
+  /**
+   * 仅 cache 子价（read/creation）被回退为 inputPerMToken。input/output 价格精确,
+   * 但 cache 段费用是兜底估算 — 应在 UI 标记为"partial estimated"。
+   */
+  pricingPartial?: boolean;
 }
 
 export interface SessionCostSummary {
@@ -57,24 +71,44 @@ export interface SessionCostSummary {
   totalCost: number;
   cacheHitRate: number;
   cacheSavings: number;
+  /** 任一模型 cache 子价被回退为 input 价 — UI 应展示 partial 标签 */
+  pricingPartial?: boolean;
+  /** 任一模型完整定价缺失 — UI 应展示 unavailable 标签 */
+  pricingMissing?: boolean;
 }
 
 const warnedPricingMisses = new Set<string>();
+const warnedPricingPartial = new Set<string>();
 
-function coerceModelPricing(value: unknown): ModelPricing | null {
-  if (!value || typeof value !== 'object') return null;
+interface CoercedPricing {
+  pricing: ModelPricing | null;
+  /** input/output 价格齐全，但 cache 子价（read/creation）缺失并被回退为 input */
+  pricingPartial: boolean;
+}
+
+function coerceModelPricingWithDetails(value: unknown): CoercedPricing {
+  if (!value || typeof value !== 'object') return { pricing: null, pricingPartial: false };
   const raw = value as Partial<Record<keyof ModelPricing, unknown>>;
   const input = raw.inputPerMToken;
   const output = raw.outputPerMToken;
   if (typeof input !== 'number' || input <= 0 || typeof output !== 'number' || output <= 0) {
-    return null;
+    return { pricing: null, pricingPartial: false };
   }
+  const hasRead = typeof raw.cacheReadPerMToken === 'number';
+  const hasCreation = typeof raw.cacheCreationPerMToken === 'number';
   return {
-    inputPerMToken: input,
-    outputPerMToken: output,
-    cacheReadPerMToken: typeof raw.cacheReadPerMToken === 'number' ? raw.cacheReadPerMToken : input,
-    cacheCreationPerMToken: typeof raw.cacheCreationPerMToken === 'number' ? raw.cacheCreationPerMToken : input,
+    pricing: {
+      inputPerMToken: input,
+      outputPerMToken: output,
+      cacheReadPerMToken: hasRead ? (raw.cacheReadPerMToken as number) : input,
+      cacheCreationPerMToken: hasCreation ? (raw.cacheCreationPerMToken as number) : input,
+    },
+    pricingPartial: !(hasRead && hasCreation),
   };
+}
+
+function coerceModelPricing(value: unknown): ModelPricing | null {
+  return coerceModelPricingWithDetails(value).pricing;
 }
 
 function warnPricingMiss(modelId: string): void {
@@ -83,49 +117,68 @@ function warnPricingMiss(modelId: string): void {
   coreLogger.warn('no-pricing-for-model', { modelId });
 }
 
-function getPricingFromRuntimeConfig(modelId: string): ModelPricing | null {
+function warnPricingPartial(modelId: string): void {
+  if (!modelId || warnedPricingPartial.has(modelId)) return;
+  warnedPricingPartial.add(modelId);
+  coreLogger.warn('partial-pricing-for-model', {
+    modelId,
+    reason: 'cache_read/cache_creation sub-price missing; falling back to inputPerMToken — cache segment cost is estimated',
+  });
+}
+
+function getPricingFromRuntimeConfigDetailed(modelId: string): CoercedPricing {
   for (const models of Object.values(runtimeConfig.llm.model_providers || {})) {
     for (const model of models) {
       if (model.id !== modelId) continue;
-      const configuredPricing = coerceModelPricing(model.pricing);
-      if (configuredPricing) return configuredPricing;
+      const configured = coerceModelPricingWithDetails(model.pricing);
+      if (configured.pricing) return configured;
 
       const providerModelId = model.model;
       if (providerModelId && providerModelId !== modelId) {
-        const providerPricing = coerceModelPricing(getModelDevInfoExact(providerModelId)?.pricing);
-        if (providerPricing) return providerPricing;
+        const provider = coerceModelPricingWithDetails(getModelDevInfoExact(providerModelId)?.pricing);
+        if (provider.pricing) return provider;
       }
-      return null;
+      return { pricing: null, pricingPartial: false };
     }
   }
-  return null;
+  return { pricing: null, pricingPartial: false };
 }
 
 /**
  * 从结构化注册表精确查找模型定价。
+ *
+ * 保持向后兼容:只返回价格或 null。partial 状态通过
+ * {@link getPricingFromRegistryDetailed} 暴露。
  */
 export function getPricingFromRegistry(modelId: string): ModelPricing | null {
-  const id = modelId.trim();
-  if (!id) return null;
+  return getPricingFromRegistryDetailed(modelId).pricing;
+}
 
-  const runtimeConfigured = getPricingFromRuntimeConfig(id);
-  if (runtimeConfigured) return runtimeConfigured;
+/**
+ * 同 getPricingFromRegistry,但额外返回 cache 子价是否被回退为 input 价。
+ */
+export function getPricingFromRegistryDetailed(modelId: string): CoercedPricing {
+  const id = modelId.trim();
+  if (!id) return { pricing: null, pricingPartial: false };
+
+  const runtimeConfigured = getPricingFromRuntimeConfigDetailed(id);
+  if (runtimeConfigured.pricing) return runtimeConfigured;
 
   try {
     const configured = getModelManager().getModelById(id) as { pricing?: unknown; model?: string } | undefined;
-    const configuredPricing = coerceModelPricing(configured?.pricing);
-    if (configuredPricing) return configuredPricing;
+    const configuredPricing = coerceModelPricingWithDetails(configured?.pricing);
+    if (configuredPricing.pricing) return configuredPricing;
 
     const providerModelId = configured?.model;
     if (providerModelId && providerModelId !== id) {
-      const providerPricing = coerceModelPricing(getModelDevInfoExact(providerModelId)?.pricing);
-      if (providerPricing) return providerPricing;
+      const providerPricing = coerceModelPricingWithDetails(getModelDevInfoExact(providerModelId)?.pricing);
+      if (providerPricing.pricing) return providerPricing;
     }
   } catch {
     // ModelManager can throw while resolving incomplete local credentials; pricing lookup must stay non-fatal.
   }
 
-  return coerceModelPricing(getModelDevInfoExact(id)?.pricing);
+  return coerceModelPricingWithDetails(getModelDevInfoExact(id)?.pricing);
 }
 
 /**
@@ -141,8 +194,11 @@ export function resolvePricing(modelName: string): ModelPricingResolution | null
     return null;
   }
 
-  const registry = getPricingFromRegistry(modelId);
-  if (registry) return { ...registry, estimated: false };
+  const registry = getPricingFromRegistryDetailed(modelId);
+  if (registry.pricing) {
+    if (registry.pricingPartial) warnPricingPartial(modelId);
+    return { ...registry.pricing, estimated: false, ...(registry.pricingPartial ? { pricingPartial: true } : {}) };
+  }
 
   warnPricingMiss(modelId);
   return null;
@@ -200,6 +256,7 @@ export function calculateModelCost(
     cacheReadCost,
     cacheCreationCost,
     totalCost,
+    ...(pricing.pricingPartial ? { pricingPartial: true } : {}),
   };
 }
 
@@ -240,10 +297,16 @@ export function calculateSessionCost(
 
   const cacheHitRate = totalInput > 0 ? (totalCacheRead / totalInput) * 100 : 0;
 
+  // 汇总 partial / missing:任一模型 partial/missing,整体即标 partial/missing,
+  // UI 用作"整体估算"标签。
+  const pricingPartial = models.some((m) => m.pricingPartial);
+  const pricingMissing = models.some((m) => m.pricingMissing);
+
   // 节省金额 = 无缓存时的输入侧费用 − 有缓存时的实际输入侧费用。
   //   inputTokens 已是毛输入（含 cache_read + cache_creation），无缓存时全部
   //   按 inputPerMToken 计价；实际费用 = 净输入 + 缓存读 + 缓存写三段单价之和。
   //   两边都只算输入侧（output 费用一致，不参与节省比较）。
+  //   注意:遇到 pricingPartial 的模型,节省额本身也是估算（按 input 价算），公式仍成立。
   const cacheSavings = models.reduce((sum, m) => {
     const pricing = resolvePricing(m.model);
     if (!pricing) return sum;
@@ -261,6 +324,8 @@ export function calculateSessionCost(
     totalCost,
     cacheHitRate,
     cacheSavings,
+    ...(pricingPartial ? { pricingPartial: true } : {}),
+    ...(pricingMissing ? { pricingMissing: true } : {}),
   };
 }
 
@@ -294,7 +359,9 @@ export function formatCostReport(summary: SessionCostSummary): string {
     lines.push(`  ${formatTokens(m.inputTokens)} input, ${formatTokens(m.outputTokens)} output, ${formatTokens(m.cacheReadTokens)} cache read, ${formatTokens(m.cacheCreationTokens)} cache write`);
     lines.push(`  ${formatCost(m.inputCost)} + ${formatCost(m.outputCost)} + ${formatCost(m.cacheReadCost)} + ${formatCost(m.cacheCreationCost)} = ${formatCost(m.totalCost)}`);
     if (m.pricingMissing) {
-      lines.push('  pricing unavailable');
+      lines.push('  pricing unavailable — set model_providers.<provider>.pricing to enable cost tracking');
+    } else if (m.pricingPartial) {
+      lines.push('  pricing partial — cache read/write sub-price missing, cache segment cost is estimated using input rate');
     }
   }
 
@@ -306,6 +373,11 @@ export function formatCostReport(summary: SessionCostSummary): string {
 
   lines.push('');
   lines.push(`Total cost: ${formatCost(summary.totalCost)}`);
+  if (summary.pricingMissing) {
+    lines.push('(pricing unavailable for some models — totals are incomplete)');
+  } else if (summary.pricingPartial) {
+    lines.push('(pricing partial — cache sub-prices missing, cache segment is estimated)');
+  }
 
   if (summary.totalCacheReadTokens > 0) {
     lines.push(`Cache hit rate: ${summary.cacheHitRate.toFixed(1)}%`);

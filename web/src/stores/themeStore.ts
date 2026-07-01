@@ -1,4 +1,7 @@
 import { create } from 'zustand';
+import { createLogger } from '../utils/logger';
+
+const log = createLogger('themeStore');
 
 type ThemeMode = 'light' | 'dark' | 'system';
 type ResolvedTheme = 'light' | 'dark';
@@ -31,7 +34,7 @@ function loadStoredMode(): ThemeMode {
       if (parsed.mode) return parsed.mode;
     }
   } catch (err) {
-    console.warn('[themeStore] Failed to load stored theme:', err);
+    log.warn('Failed to load stored theme:', err);
   }
   return 'light';
 }

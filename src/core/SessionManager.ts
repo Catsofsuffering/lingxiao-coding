@@ -1,7 +1,6 @@
 export {
   SessionManager,
   default,
-  looksLikeIdentityProbeCandidate,
   shouldProcessInitialUserRequest,
 } from './SessionManagerRuntime.js';
 export type {

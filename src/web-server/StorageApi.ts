@@ -2,7 +2,7 @@ import os from 'os';
 import fs from 'fs';
 import type { SessionStateRepository } from '../core/DatabaseRepositories.js';
 import { VERSION } from '../version.js';
-
+import { serverLogger } from '../core/Log.js';
 /**
  * Storage KV API — UI 状态持久化
  */
@@ -16,7 +16,7 @@ export class StorageApi {
     } catch (err) {
       // 声称「DB 可能未就绪」，但实际 catch 覆盖了查询/序列化/锁竞争等所有错误；
       // 持久化的 DB 故障不应静默退化成「无保存状态」，记 warn 以便定位。
-      console.warn(`[StorageApi] getValue(${key}) 失败，返回 null:`, err instanceof Error ? err.message : String(err));
+      serverLogger.warn('[StorageApi] getValue failed, returning null', { key, error: String(err) });
       return null;
     }
   }
@@ -32,7 +32,7 @@ export class StorageApi {
       }
       return result;
     } catch (err) {
-      console.warn(`[StorageApi] getNamespace(${namespace}) 失败，返回空对象:`, err instanceof Error ? err.message : String(err));
+      serverLogger.warn('[StorageApi] getNamespace failed, returning empty', { namespace, error: String(err) });
       return {};
     }
   }

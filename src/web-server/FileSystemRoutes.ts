@@ -11,6 +11,7 @@ import os from 'os';
 import { FILE_PARSER } from '../config/defaults.js';
 import { Workspace } from '../core/Workspace.js';
 import type { AuthFn } from './types.js';
+import { serverLogger } from '../core/Log.js';
 
 export function isPathInside(parent: string, target: string): boolean {
   const rel = path.relative(path.resolve(parent), path.resolve(target));
@@ -76,7 +77,7 @@ export function registerFileSystemRoutes(
         });
       return { entries };
     } catch (err) {
-      console.error('[fs/list] error:', err);
+      serverLogger.error('[fs/list] error', { error: err instanceof Error ? err.message : String(err) });
       return { entries: [], error: err instanceof Error ? err.message : 'Unknown error' };
     }
   });

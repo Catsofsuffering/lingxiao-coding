@@ -49,6 +49,8 @@ export const SESSION_KEYS = {
   LEADER_CONTEXT_SUMMARY: 'leader_context_summary',
   /** Current model ID for this session (written by LeaderAgent.setModel) */
   CURRENT_MODEL: 'current_model',
+  /** Current default Agent model ID for this session (written by SessionManagerRuntime.setAgentModel) */
+  CURRENT_AGENT_MODEL: 'current_agent_model',
   /** Active team name (set by Leader when calling team_manage(action="create")) */
   LEADER_ACTIVE_TEAM: 'leader_active_team',
   /** Bughunt mode flag ('true' | 'false') */
@@ -99,6 +101,37 @@ export const SESSION_KEYS = {
   FORK_PARENT_SESSION_ID: 'fork:parent_session',
   /** Active project blueprint (project_type + standard subsystems + coverage taskIds) — serialized ProjectBlueprint JSON */
   PROJECT_BLUEPRINT: 'project_blueprint',
+  /** Current user turn capability intent profile; serialized CapabilityIntentProfile JSON. */
+  CAPABILITY_INTENT_PROFILE: 'capability_intent_profile',
+  /** Turn id for which CAPABILITY_INTENT_PROFILE was recorded; prevents repeat record loops. */
+  CAPABILITY_INTENT_TURN_ID: 'capability_intent_turn_id',
+  /** Current user turn id, incremented when Leader accepts a user message. */
+  CURRENT_USER_TURN_ID: 'current_user_turn_id',
+  /** Pending flag set by runtime when the just-arrived user input explicitly forbids tool calls. */
+  TOOL_USE_SUPPRESSION_PENDING: 'tool_use_suppression_pending',
+  /** Current user turn id for which all Leader tool calls must be hidden/skipped. */
+  TOOL_USE_SUPPRESSION_TURN_ID: 'tool_use_suppression_turn_id',
+  /** Latest structured autonomy gate decision trace for Web/TUI audit. */
+  AUTONOMY_DECISION_TRACE: 'autonomy_decision_trace',
+  /**
+   * AutonomyMode for the current session — serialized JSON of one of
+   * 'review_first' | 'balanced' | 'autonomous'. Default value is 'balanced'
+   * (see `DEFAULT_AUTONOMY_MODE` in `contracts/types/Autonomy.ts`). Orthogonal
+   * to PermissionMode; high autonomy does NOT bypass dangerous/scope/loop gates.
+   */
+  AUTONOMY_MODE: 'autonomy_mode',
+  /** Autonomy Governor lifecycle phase: bootstrap | active | recovery | stable. */
+  AUTONOMY_LIFECYCLE_PHASE: 'autonomy_lifecycle_phase',
+  /** Monotonic generation incremented whenever autonomy policy changes. */
+  AUTONOMY_MODE_GENERATION: 'autonomy_mode_generation',
+  /** Effective autonomy policy id used by prompt/runtime/UI audit. */
+  AUTONOMY_POLICY_ID: 'autonomy_policy_id',
+  /** Stable hash of the effective autonomy policy card/summary. */
+  AUTONOMY_POLICY_HASH: 'autonomy_policy_hash',
+  /** Last autonomy update actor: web | tui | leader | runtime_policy. */
+  AUTONOMY_UPDATED_BY: 'autonomy_updated_by',
+  /** Optional human-readable reason for the last autonomy update. */
+  AUTONOMY_UPDATE_REASON: 'autonomy_update_reason',
 } as const;
 
 /** All known session_state key prefixes for namespace validation */
@@ -118,6 +151,8 @@ export const SESSION_KEY_PREFIXES = [
   'eternal_',          // written by EternalLoop
   'orchestration_runtime:', // written by OrchestrationRuntime
   'current_model',     // written by LeaderAgent.setModel()
+  'current_user_turn_id', // written by LeaderAgent when accepting a user turn
+  'current_agent_model', // written by SessionManagerRuntime.setAgentModel()
   'control_mode',      // written by LeaderAgent.setControlMode()
   'side_thread:',      // written by SessionRoutes side-thread creation
   'global:',           // global pseudo-session state
@@ -128,4 +163,6 @@ export const SESSION_KEY_PREFIXES = [
   'running',           // approval/runtime marker
   'fork:',             // fork metadata
   'project_blueprint', // written by define_project_blueprint
+  'capability_intent_', // written by record_capability_intent
+  'autonomy_',         // written by Autonomy Governor state/gate/policy manager
 ] as const;

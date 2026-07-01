@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { registerToastSink } from './toastBridge';
 
 export interface ToastAction {
   label: string;
@@ -29,10 +30,20 @@ export function useToast() {
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastTimeoutsRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+
+  const clearToastTimeout = useCallback((id: string) => {
+    const timeout = toastTimeoutsRef.current.get(id);
+    if (timeout) {
+      clearTimeout(timeout);
+      toastTimeoutsRef.current.delete(id);
+    }
+  }, []);
 
   const removeToast = useCallback((id: string) => {
+    clearToastTimeout(id);
     setToasts((prev) => prev.filter((t) => t.id !== id));
-  }, []);
+  }, [clearToastTimeout]);
 
   const addToast = useCallback(
     (toast: Omit<Toast, 'id'>) => {
@@ -40,11 +51,28 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const duration = toast.duration ?? 3000;
       setToasts((prev) => [...prev, { ...toast, id }]);
       if (duration > 0) {
-        setTimeout(() => removeToast(id), duration);
+        const timeout = setTimeout(() => removeToast(id), duration);
+        toastTimeoutsRef.current.set(id, timeout);
       }
     },
     [removeToast],
   );
+
+  // 注册到全局桥，让非组件上下文也能弹 toast
+  useEffect(() => {
+    registerToastSink(addToast);
+    return () => registerToastSink(null);
+  }, [addToast]);
+
+  // 组件卸载时清理仍在等待自动消失的 toast timer，避免卸载后 setState。
+  useEffect(() => {
+    return () => {
+      for (const timeout of toastTimeoutsRef.current.values()) {
+        clearTimeout(timeout);
+      }
+      toastTimeoutsRef.current.clear();
+    };
+  }, []);
 
   return (
     <ToastContext.Provider value={{ toasts, addToast, removeToast }}>
@@ -94,8 +122,9 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
           <button
             onClick={() => onDismiss(toast.id)}
             className="shrink-0 opacity-60 hover:opacity-100 transition-opacity"
+            aria-label="Dismiss"
           >
-            \u2715
+            {'\u2715'}
           </button>
         </div>
       ))}

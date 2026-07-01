@@ -349,7 +349,7 @@ export function ArtifactsView() {
                   className={`
                     px-2 py-1 text-xs rounded transition-all duration-200
                     ${roleFilter === role
-                      ? 'bg-accent-brand text-white'
+                      ? 'bg-accent-brand text-[color:var(--primary-button-fg)]'
                       : 'bg-bg-tertiary text-text-tertiary hover:bg-bg-hover'
                     }
                   `}

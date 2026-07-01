@@ -1,5 +1,6 @@
 import { EventEmitter as NodeEventEmitter } from 'events';
 import type { Task } from './TaskBoard.js';
+import { coreLogger } from './Log.js';
 import type { OrchestrationTaskMetadata, OrchestrationVerdict } from './OrchestrationTypes.js';
 import type { EdgeDefinition, ExecutionLog, NodeDefinition, WorkflowDefinition } from './workflow/types.js';
 import type { BusMessage, MessagePriority } from './MessageBus.js';
@@ -10,9 +11,11 @@ import type { BlackboardEvent, BlackboardDelta } from './blackboard/types.js';
 import type { LlmInputManifest } from './LlmInputManifest.js';
 import type { SessionRuntimeState } from './SessionRuntimeState.js';
 import type { InteractionTurnState } from './TurnCoordinator.js';
+import type { CapabilityIntentProfile } from '../contracts/types/Autonomy.js';
+import type { AutonomyDecision } from '../contracts/types/AutonomyDecision.js';
 import type { TransportEnvelope } from './transport/Transport.js';
 import type { WorkerRecoveryPayload } from './AgentProtocol.js';
-import { coreLogger } from './Log.js';
+import type { TokenUsageView } from '../types/canonical.js';
 
 export type LeaderStatusKind = 'active' | 'idle' | 'waiting' | 'interrupted' | 'completed';
 
@@ -38,6 +41,19 @@ export interface EventMap {
       sessionTotalTokens: number;
     } | null;
   };
+  'leader:capability_intent': {
+    sessionId: string;
+    profile: CapabilityIntentProfile;
+  };
+  'leader:autonomy_decision': {
+    sessionId: string;
+    toolName: string;
+    decision: AutonomyDecision;
+    gateResult: 'allow' | 'blocked' | 'confirmation_required';
+    gateKind?: 'forbidden' | 'confirmation_required' | null;
+    recordedAt: number;
+    source?: string;
+  };
   'permission:mode_changed': {
     sessionId: string;
     mode: 'strict' | 'dev' | 'networked' | 'yolo';
@@ -56,6 +72,17 @@ export interface EventMap {
   'session:collaboration_mode_changed': {
     sessionId: string;
     mode: 'solo' | 'team';
+  };
+  'session:autonomy_mode_changed': {
+    sessionId: string;
+    previousMode: string;
+    nextMode: string;
+    previousGeneration: number;
+    nextGeneration: number;
+    lifecyclePhase: string;
+    updatedBy: 'web' | 'tui' | 'leader' | 'runtime_policy';
+    reason?: string;
+    effectivePolicyHash: string | null;
   };
   'session:execution_route_changed': {
     sessionId: string;
@@ -137,6 +164,18 @@ export interface EventMap {
     owner: 'leader' | 'agent';
     ownerName?: string;
     state: unknown;
+  };
+  'context:mutation': {
+    sessionId: string;
+    source: string;
+    operation: 'append' | 'replace' | 'collapse' | 'noop' | 'compact' | 'cache_breakpoint';
+    slot?: string;
+    oldHash?: string | null;
+    newHash?: string | null;
+    oldLength?: number;
+    newLength?: number;
+    changed: boolean;
+    reason?: string;
   };
   'llm:input_manifest': {
     sessionId?: string;
@@ -246,6 +285,23 @@ export interface EventMap {
     tool?: string;
     partialJson: string;
   };
+  'agent:tool_failure_loop': {
+    sessionId: string;
+    agentId: string;
+    agentName: string;
+    taskId?: string;
+    signature: {
+      toolName: string;
+      argsHash: string;
+      errorKind: string;
+      errorCode: string;
+    };
+    count: number;
+    threshold: number;
+    requiresEscalation: boolean;
+    lastErrorMessage: string;
+    timestamp: number;
+  };
   'agent:tool_result': {
     agentId: string;
     agentName?: string;
@@ -304,6 +360,23 @@ export interface EventMap {
     tool: string;
     pid?: number;
     status: 'started' | 'completed' | 'failed' | 'killed';
+  };
+  'agent:activity': {
+    sessionId: string;
+    agentId: string;
+    agentName: string;
+    taskId?: string;
+    toolName: string;
+    toolCategory?: string;
+    toolTier?: string;
+    action?: string;
+    success: boolean;
+    timestamp: number;
+    summary?: string;
+    target?: string;
+    files?: string[];
+    command?: string;
+    error?: string;
   };
   'terminal:output': {
     terminalId: string;
@@ -487,8 +560,8 @@ export interface EventMap {
   'plan:submitted': { sessionId: string; plan: unknown };
   'plan:updated': { sessionId: string; plan: unknown; reason?: string };
   'plan:finalized': { sessionId: string; planId: string; finalStatus: string; summary?: string };
-  'token:usage': { sessionId: string; agentId: string; ts: number; usage: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; persisted?: boolean; persistError?: string };
-  'token:usage:persist_failed': { sessionId: string; agentId: string; ts: number; usage: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; persisted: false; persistError?: string };
+  'token:usage': { sessionId: string; agentId: string; ts: number; usage: TokenUsageView; persisted?: boolean; persistError?: string };
+  'token:usage:persist_failed': { sessionId: string; agentId: string; ts: number; usage: TokenUsageView; persisted: false; persistError?: string };
   'agent:llm_call': { agentId: string; agentName: string; iteration: number };
   'context:compressed': {
     sessionId: string;
@@ -740,6 +813,14 @@ export interface EventMap {
     /** Error message on failure */
     error?: string;
   };
+  'canvas:version_pushed': {
+    sessionId: string;
+    artifactId: string;
+    version: number;
+    activeVersion: number;
+    intent?: string;
+    timestamp: number;
+  };
 }
 
 export type EventName = keyof EventMap;
@@ -818,7 +899,7 @@ export class EventEmitter {
       return this.emitter.emit(event as string, data);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error('[EventEmitter] handler threw on "' + String(event) + '": ' + msg);
+      coreLogger.error('[EventEmitter] handler threw on "' + String(event) + '": ' + msg);
       return false;
     }
   }

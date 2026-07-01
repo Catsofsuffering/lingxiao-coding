@@ -36,6 +36,7 @@ import { toErrorMessage } from './core/errors.js';
 import { playInitIntro, renderInitNotice } from './cli_init_banner.js';
 import { runUpgrade } from './cli_upgrade.js';
 import { runOnboarding } from './tui/OnboardingTui.js';
+import { cleanupLingxiaoDisk, formatBytes } from './commands/cleanupDisk.js';
 
 const emitter = createEventEmitter();
 const messageBus = createMessageBus(1000, emitter);
@@ -72,25 +73,28 @@ installProcessRuntimeGuards();
 // 主进程信号处理
 //
 // daemon 模式：本就该响应 SIGTERM/SIGHUP 优雅退出（由 DaemonManager / supervisor 管理生命周期）。
-// 交互模式：长跑优先。终端关闭/分离会向进程组发 SIGHUP，某些终端（含 WSL 关窗）发 SIGTERM。
-//   这些信号在信号层无法与"用户真想停"区分，若直接 runAllCleanups 会把会话连同 worker agent
-//   一起拆掉（用户看到的"自杀"）。因此交互模式下不连坐拆 swarm，仅分离：进程存活、Web 端口
-//   仍可访问重连。显式停止途径：TUI 内 Ctrl+Q、`lingxiao stop`、或 SIGKILL。
+// 交互模式：终端断开后进入"有限存活"模式（默认 5 分钟），给 Web UI 重连留窗口。
+//   超时后 ProcessIdleGuard 自动 gracefulShutdown。
+//   全 idle（无活跃会话/Agent）超过 10 分钟也自动退出，杜绝僵尸累积。
+//   显式停止途径：TUI 内 Ctrl+Q、`lingxiao stop`、或 SIGKILL。
+import { getProcessIdleGuard } from './core/ProcessIdleGuard.js';
 const isDaemonProcess = () => !!process.env.LINGXIAO_DAEMON_MODE;
 
 process.on('SIGTERM', async () => {
   if (isDaemonProcess()) {
     console.log('[CLI] Received SIGTERM, shutting down gracefully...');
     await gracefulShutdown(0, 10000);
+    return;
   }
-  // 交互模式：分离而非拆除
-  console.log('\n[CLI] 收到 SIGTERM（终端可能已断开）。会话与 agent 继续后台运行，Web UI 仍可访问。');
-  console.log('[CLI] 如需停止：TUI 内按 Ctrl+Q，或运行 `lingxiao stop`。');
+  // 交互模式：标记 detached，ProcessIdleGuard 会在 TTL 到期后自动退出
+  console.log('\n[CLI] 收到 SIGTERM（终端可能已断开）。进入有限存活模式，Web UI 仍可重连。');
+  getProcessIdleGuard().markDetached('SIGTERM');
 });
 process.on('SIGINT', async () => {
   if (isDaemonProcess()) {
     console.log('[CLI] Received SIGINT, shutting down gracefully...');
     await gracefulShutdown(0, 10000);
+    return;
   }
   // 交互模式：SIGINT(Ctrl+C) 交给 TUI/ink 处理，不在此拆 swarm
 });
@@ -98,9 +102,11 @@ process.on('SIGHUP', async () => {
   if (isDaemonProcess()) {
     console.log('[CLI] Received SIGHUP, shutting down gracefully...');
     await gracefulShutdown(0, 10000);
+    return;
   }
-  // 交互模式：终端挂断 → 分离，进程存活
-  console.log('\n[CLI] 收到 SIGHUP（终端已断开）。会话与 agent 继续后台运行，Web UI 仍可访问。');
+  // 交互模式：终端挂断 → 有限存活
+  console.log('\n[CLI] 收到 SIGHUP（终端已断开）。进入有限存活模式，Web UI 仍可重连。');
+  getProcessIdleGuard().markDetached('SIGHUP');
 });
 
 program
@@ -156,9 +162,23 @@ function _listAvailableSkills(baseWorkspace: string): string {
 /**
  * 启动 TUI
  */
-async function startTUI(sessionId?: string): Promise<void> {
+async function startTUI(sessionId?: string, opts?: { tuiOnly?: boolean }): Promise<void> {
+  // Phase 0: 清理同目录旧实例（防止僵尸累积导致 CPU/swap 爆炸）
+  const { cleanOrphanInstances } = await import('./core/ProcessOrphanCleaner.js');
+  const orphanResult = await cleanOrphanInstances(process.pid, process.cwd());
+  if (orphanResult.cleaned.length > 0) {
+    console.log(`[StartTUI] 已清理 ${orphanResult.cleaned.length} 个同目录旧实例`);
+  }
+
+  // Phase 0.5: 启动进程级 Idle 守卫（daemon 模式由 supervisor 管理，不启动 idle guard）
+  const isDaemonModeEarly = !!process.env.LINGXIAO_DAEMON_MODE;
+  const idleGuard = getProcessIdleGuard();
+  if (!isDaemonModeEarly) {
+    idleGuard.start();
+  }
+
   // 清理上一次崩溃/非正常退出遗留的孤儿 Worker 进程（按进程全量扫描 /proc/*/environ）。
-  // 必须在任何新 Worker 被创建之前执行，否则同名孤儿会引发“Worker 已存在”/工作区与端口竞态。
+  // 必须在任何新 Worker 被创建之前执行，否则同名孤儿会引发"Worker 已存在"/工作区与端口竞态。
   // 不传 sessionId：当前 daemon 自身的 Worker 尚未生成，故清理全部 lingxiao 残留进程。
   await WorkerProcessRunner.killOrphanWorkers();
 
@@ -191,6 +211,12 @@ async function startTUI(sessionId?: string): Promise<void> {
   // 这些子进程会沦为孤儿继续持有 DB 句柄/端口/工作区锁。
   registerCleanup(async () => { await WorkerProcessRunner.killOrphanWorkers(); }, 9.5);
 
+  // 退出兜底：gracefulShutdown 的 runAllCleanups 有 10s 超时，若超时强退则 db.close 可能未执行；
+  // process('exit') 是同步退出的最后机会，幂等调用 db.close()（已关则 no-op）确保 WAL 锁释放。
+  process.on('exit', () => {
+    try { db.close(); } catch { /* tolerate — already closed or closing */ }
+  });
+
   // 初始化会话管理器
   const sessionManager = new SessionManager(db, emitter);
   const activeSessionCoordinator = new ActiveSessionCoordinator(undefined, isDaemonMode ? 'daemon' : 'startup');
@@ -198,6 +224,13 @@ async function startTUI(sessionId?: string): Promise<void> {
   const setCurrentSessionId = (nextSessionId: string | undefined, source: ActiveSessionSource = 'tui') => {
     activeSessionCoordinator.setActiveSessionId(nextSessionId, source);
   };
+
+  // 注册 Idle Guard 活跃探针：任何会话有 running leader/agent 就算活跃
+  idleGuard.registerProbe(() => sessionManager.hasActiveWork());
+  // 用户操作事件刷新 idle timer
+  emitter.subscribe('user:message', () => idleGuard.touch());
+  emitter.subscribe('session:created', () => idleGuard.touch());
+  emitter.subscribe('round_complete', () => idleGuard.touch());
 
   // Daemon 模式：只启动 Web Server + QQ Bot，跳过 TUI/LLM 预热等
   if (isDaemonMode) {
@@ -232,13 +265,15 @@ async function startTUI(sessionId?: string): Promise<void> {
       }
       setCurrentSessionId(daemonSessionId, 'daemon');
 
-      const { fastify: webServer, token: serverToken } = await createServerWithDeps(db, sessionManager, {
+      const daemonServerResult = await createServerWithDeps(db, sessionManager, {
         logger: false,
         activeSessionCoordinator,
         isDaemon: true,
         emitter,
         messageBus,
       });
+      const webServer = daemonServerResult.fastify;
+      const serverToken = daemonServerResult.token;
 
       const useRandomPort = getConfigValue('server.random_port') === true;
       const requestedPort = useRandomPort ? 0 : webPort;
@@ -324,10 +359,13 @@ async function startTUI(sessionId?: string): Promise<void> {
   }
   setCurrentSessionId(currentSessionId, 'tui');
 
+  // ── --tui-only 模式：跳过 Web Server，仅启动 TUI ──
+  const tuiOnly = opts?.tuiOnly || process.env.LINGXIAO_TUI_ONLY === '1';
+
   // 启动 Web UI 服务器（复用当前 db/sessionManager，传入 TUI 当前会话 ID）
   // ★ 在 Web 服务器启动的同时，后台预热 LLM TCP+TLS 连接，减少首次响应延迟
   //    未初始化时跳过——leader_model 尚未配置
-  if (checkInitialized()) {
+  if (!tuiOnly && checkInitialized()) {
     try {
       const { createLLMClient } = await import('./llm/Client.js');
       const { config: _cfg } = await import('./config.js');
@@ -365,6 +403,10 @@ async function startTUI(sessionId?: string): Promise<void> {
 
   let webUrl: string | undefined;
   let scheduledTaskManager: import('./core/ScheduledTaskManager.js').ScheduledTaskManager | undefined;
+  if (tuiOnly) {
+    // --tui-only 模式：跳过 Web Server，只打印 TUI 模式提示
+    console.log(chalk.dim('  TUI-only 模式：Web UI 服务未启动'));
+  } else {
   try {
     const { createServerWithDeps, findAvailablePort, writePortFile, readPortFile, removePortFile, warnIfInsecureHostBinding } = await import('./server.js');
     const { isHardenedMode } = await import('./core/HardeningPolicy.js');
@@ -387,6 +429,8 @@ async function startTUI(sessionId?: string): Promise<void> {
     const webServer = serverResult.fastify;
     const serverToken = serverResult.token;
     scheduledTaskManager = serverResult.scheduledTaskManager;
+    // Web UI 保持连接时也视为进程活跃，避免交互终端被误判 idle 后自杀。
+    idleGuard.registerProbe(() => serverResult.connectionManager.getStats().totalConnections > 0);
 
     warnIfInsecureHostBinding(webHost, isHardenedMode());
 
@@ -478,9 +522,11 @@ async function startTUI(sessionId?: string): Promise<void> {
         console.log(chalk.dim(`  Browser open skipped: ${openResult.plan.diagnostics.join('; ')}`));
       }
     }
-  } catch (err: unknown) {
+  }
+  catch (err: unknown) {
     // Web 服务器启动失败不阻塞 TUI
     console.warn(chalk.yellow(`⚠ Web UI 启动失败: ${toErrorMessage(err)}`));
+  }
   }
 
   // ── 首次初始化引导（Web 服务器已启动，TUI + Web UI 同步可用）──
@@ -592,8 +638,11 @@ async function startTUI(sessionId?: string): Promise<void> {
   // 关掉 Log.ts 的 ConsoleSink：它直写 process.stderr，绕过 muteConsole（只屏蔽 console.*）。
   // TUI 下任何 WARN/ERROR 日志直写终端会打乱 Ink log-update 的光标行数计算，
   // 使状态行无法原地刷新而反复重印（刷屏根因）。日志改为只落文件。
-  const { configureLogging } = await import('./core/Log.js');
-  configureLogging({ console: false, file: process.env.LINGXIAO_LOG_PATH || true });
+  // 统一日志配置口径：CLI 仍 console:false 防 TUI 污染，level/file/清理策略与 Web 共用一套默认。
+  const { configureCliLogging, ensureLogMaintenance } = await import('./runtime/LoggingRuntime.js');
+  configureCliLogging({ sessionId: currentSessionId });
+  // 启动定期日志清理（cleanupRegistry priority=50 + unref，进程内幂等），控制磁盘日志增长。
+  ensureLogMaintenance();
 
   // 清屏并隐藏光标（标准TUI行为）
   process.stdout.write('\x1b[2J\x1b[H');  // 清屏 + 光标归位
@@ -745,17 +794,9 @@ async function startTUI(sessionId?: string): Promise<void> {
   };
 
   // Listen for shutdown signal from TUI to ensure clean process exit
+  // 不在 shutdown 事件中直接 process.exit，让 waitUntilExit 自然完成
   const unsubShutdown = emitter.subscribe('shutdown', () => {
-    void (async () => {
-      try {
-        await runAllCleanups(5000);
-      } catch {
-        // ignore cleanup failures on forced shutdown
-      }
-      restoreConsole();
-      printFarewell();
-      setTimeout(() => process.exit(0), 25);
-    })();
+    // shutdown 事件只是通知，清理逻辑统一在 finally 块中执行
   });
 
   try {
@@ -764,6 +805,16 @@ async function startTUI(sessionId?: string): Promise<void> {
     restoreConsole();
     unsubShutdown();
     printFarewell();
+
+    // 统一执行清理，使用更短的超时避免卡死
+    try {
+      await runAllCleanups(2000);
+    } catch {
+      // 清理失败不阻塞退出
+    }
+
+    // 确保进程退出
+    process.exit(0);
   }
 }
 
@@ -1052,8 +1103,9 @@ program
   .option('--worktree [name]', '在隔离的 git worktree 中运行')
   .option('--worktree-branch <branch>', '指定 worktree 创建的分支名')
   .option('--tmux', '使用 tmux 窗格分割（实验性）')
+  .option('--tui-only', '仅启动 TUI，不启动 Web UI 服务')
   .option('-s, --session <id>', '指定要恢复的会话 ID')
-  .action(async (opts: { bg?: boolean; name?: string; daemonMode?: boolean; worktree?: string | boolean; worktreeBranch?: string; tmux?: boolean; outputFormat?: string; session?: string }) => {
+  .action(async (opts: { bg?: boolean; name?: string; daemonMode?: boolean; worktree?: string | boolean; worktreeBranch?: string; tmux?: boolean; tuiOnly?: boolean; outputFormat?: string; session?: string }) => {
     if (process.env.LINGXIAO_NO_AUTO_START === '1') {
       return;
     }
@@ -1113,7 +1165,7 @@ program
 
         // Start TUI in worktree directory
         process.chdir(info.path);
-        await startTUI(opts.session);
+        await startTUI(opts.session, { tuiOnly: opts.tuiOnly });
       } catch (err: unknown) {
         console.error(chalk.red(`✗ Worktree 创建失败: ${toErrorMessage(err)}`));
         process.exit(1);
@@ -1157,7 +1209,7 @@ program
       console.log(chalk.dim(`  日志: ${logPath}`));
       console.log(chalk.dim(`  使用 lingxiao attach ${name} 查看 Web UI 地址`));
     } else {
-      await startTUI(opts.session);
+      await startTUI(opts.session, { tuiOnly: opts.tuiOnly });
     }
   });
 
@@ -1167,6 +1219,14 @@ program
   .argument('<session_id>', 'session_id')
   .action(async (sessionId: string) => {
     await startTUI(sessionId);
+  });
+
+program
+  .command('tui')
+  .description('仅启动 TUI 终端界面（不启动 Web UI 服务）')
+  .option('-s, --session <id>', '指定要恢复的会话 ID')
+  .action(async (opts: { session?: string }) => {
+    await startTUI(opts.session, { tuiOnly: true });
   });
 
 program
@@ -1239,6 +1299,70 @@ ${chalk.dim(t('cli.about_footer'))}
 `);
   });
 
+// ─── 磁盘清理子命令 ───────────────────────────────────────────────────────────
+program
+  .command('clean')
+  .description('清理 ~/.lingxiao 下的多余磁盘占用（checkpoint 残留 tmp_pack / shadow git 仓库）')
+  .option('--apply', '真正删除（默认 dry-run 只扫描报告）')
+  .option('--all', '连同整个 checkpoint 仓库一起删除（放弃 /rewind 历史，回收最多空间）；默认只删 tmp_pack 死文件')
+  .option('--json', '以 JSON 输出报告')
+  .action((opts) => {
+    const scope = opts.all ? 'all' : 'tmp';
+    const report = cleanupLingxiaoDisk({ apply: opts.apply === true, scope });
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      process.exit(0);
+    }
+    const action = report.removed ? '已清理' : '可清理（dry-run，加 --apply 执行）';
+    const scopeLabel = scope === 'all' ? '全部 checkpoint 仓库' : 'tmp_pack 残留文件';
+    if (report.entries.length === 0) {
+      console.log(chalk.green('✓ 没有发现可清理项（' + scopeLabel + '）'));
+      process.exit(0);
+    }
+    console.log(chalk.bold('\n清理目标：' + scopeLabel));
+    for (const e of report.entries.slice(0, 30)) {
+      console.log('  • ' + formatBytes(e.bytes).padStart(10) + '  ' + e.path);
+    }
+    if (report.entries.length > 30) console.log(chalk.dim('  … 还有 ' + (report.entries.length - 30) + ' 项'));
+    console.log(chalk.cyan.bold('\n' + action + '：共 ' + report.entries.length + ' 项 / ' + formatBytes(report.totalBytes)));
+    if (!report.removed) console.log(chalk.dim('确认后运行：lingxiao clean --apply' + (scope === 'all' ? ' --all' : '')));
+    process.exit(0);
+  });
+
+// ─── 诊断子命令 ──────────────────────────────────────────────────────────────
+program
+  .command('diagnose')
+  .alias('bug')
+  .description('生成可提交的诊断包：聚合 lingxiao.log 尾部 + 最新 crash + agent_logs + 环境信息（已脱敏）')
+  .option('-s, --session <id>', '关联的会话 ID（用于优先采集该 session 的 agent_logs）')
+  .option('--no-zip', '仅生成 markdown，不打包 zip')
+  .option('--json', '以 JSON 输出文件路径列表')
+  .action(async (opts: { session?: string; zip?: boolean; json?: boolean }) => {
+    // CLI 子命令独立运行，不进 TUI：保留 console 输出以便用户看到路径。
+    const { buildDiagnosticsBundle } = await import('./core/Diagnostics.js');
+    try {
+      const bundle = await buildDiagnosticsBundle({
+        sessionId: opts.session,
+        zip: opts.zip !== false,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify({ files: bundle.files, bundlePath: bundle.bundlePath }, null, 2));
+      } else {
+        console.log(chalk.green('✓ 诊断包已生成（内容已脱敏）'));
+        if (bundle.files.length > 0) {
+          console.log(chalk.bold('\n生成的文件：'));
+          for (const f of bundle.files) console.log(`  • ${f}`);
+        } else {
+          console.log(chalk.yellow('注意：诊断文件落盘失败，请检查 ~/.lingxiao/logs 写入权限。'));
+        }
+        console.log(chalk.dim('\n可将 diagnostics-*.zip 或 diagnostics-*.md 附加到 GitHub issue。'));
+      }
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(`✗ 生成诊断包失败：${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    }
+  });
 // ─── Daemon 子命令 ───────────────────────────────────────────────────────────
 const daemonCmd = program.command('daemon').description('管理凌霄后台常驻服务');
 

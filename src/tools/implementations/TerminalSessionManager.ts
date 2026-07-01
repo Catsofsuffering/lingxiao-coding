@@ -132,14 +132,12 @@ export class TerminalSessionManager {
    * 启动定期清理任务
    */
   startCleanup(): void {
+    // 合并 orphanCheck 和 cleanup 为单一定时器，减少一个常驻 interval
     this.orphanCheckInterval = setInterval(
-      () => this.cleanupOrphaned(),
+      () => { this.cleanupOrphaned(); this.removeExpiredSessions(); },
       TERMINAL.ORPHAN_CHECK_INTERVAL_MS,
     );
-    this.cleanupInterval = setInterval(
-      () => this.removeExpiredSessions(),
-      TERMINAL.ORPHAN_CHECK_INTERVAL_MS,
-    );
+    this.orphanCheckInterval.unref?.();
   }
 
   /**
@@ -150,10 +148,8 @@ export class TerminalSessionManager {
       clearInterval(this.orphanCheckInterval);
       this.orphanCheckInterval = undefined;
     }
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = undefined;
-    }
+    // cleanupInterval 已合并到 orphanCheckInterval，清理历史引用
+    this.cleanupInterval = undefined;
   }
 
   // ── 生命周期 ──

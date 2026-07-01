@@ -15,6 +15,9 @@ import { getServerToken } from '../../api/headers';
 import { useThemeStore } from '../../stores/themeStore';
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('TerminalPane');
+
 
 interface Props {
   terminalId: string;
@@ -98,7 +101,7 @@ export default function TerminalPane({ terminalId }: Props) {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             if (!disposed && fit) {
-              try { fit.fit(); } catch (err) { console.warn('[TerminalPane] Initial terminal fit failed:', err); }
+              try { fit.fit(); } catch (err) { log.warn('[TerminalPane] Initial terminal fit failed:', err); }
             }
           });
         });
@@ -137,7 +140,7 @@ export default function TerminalPane({ terminalId }: Props) {
                   ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
                 }
               } catch (err) {
-                console.warn('[TerminalPane] Failed to send initial terminal size:', err);
+                log.warn('[TerminalPane] Failed to send initial terminal size:', err);
               }
             }
           };
@@ -156,7 +159,7 @@ export default function TerminalPane({ terminalId }: Props) {
                 setStatus('lost');
               }
             } catch (err) {
-              console.warn('[TerminalPane] Failed to handle terminal message:', err);
+              log.warn('[TerminalPane] Failed to handle terminal message:', err);
             }
           };
 
@@ -191,24 +194,32 @@ export default function TerminalPane({ terminalId }: Props) {
 
     initTerminal();
 
-    // Resize observer
-    const resizeObserver = new ResizeObserver(() => {
-      requestAnimationFrame(() => {
-        if (fitAddonRef.current && xtermRef.current) {
-          try {
-            fitAddonRef.current.fit();
-            // Send resize to PTY
-            const dims = fitAddonRef.current.proposeDimensions();
-            const ws = wsRef.current;
-            if (ws && ws.readyState === WebSocket.OPEN && dims) {
-              ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
+    // Resize observer — debounced to prevent rapid fit() calls during layout transitions
+    let resizeRafId: number | null = null;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedFit = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        if (disposed || disposedRef.current) return;
+        if (resizeRafId !== null) cancelAnimationFrame(resizeRafId);
+        resizeRafId = requestAnimationFrame(() => {
+          if (disposed || disposedRef.current) return;
+          if (fitAddonRef.current && xtermRef.current) {
+            try {
+              fitAddonRef.current.fit();
+              const dims = fitAddonRef.current.proposeDimensions();
+              const ws = wsRef.current;
+              if (ws && ws.readyState === WebSocket.OPEN && dims) {
+                ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
+              }
+            } catch (err) {
+              if (!disposed) log.warn('[TerminalPane] Failed to resize terminal:', err);
             }
-          } catch (err) {
-            console.warn('[TerminalPane] Failed to resize terminal:', err);
           }
-        }
-      });
-    });
+        });
+      }, 100);
+    };
+    const resizeObserver = new ResizeObserver(debouncedFit);
 
     if (terminalRef.current) {
       resizeObserver.observe(terminalRef.current);
@@ -220,6 +231,14 @@ export default function TerminalPane({ terminalId }: Props) {
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
+      }
+      if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+      }
+      if (resizeRafId !== null) {
+        cancelAnimationFrame(resizeRafId);
+        resizeRafId = null;
       }
       resizeObserver.disconnect();
       if (wsRef.current) {
@@ -268,7 +287,7 @@ export default function TerminalPane({ terminalId }: Props) {
                       const dims = fitAddonRef.current.proposeDimensions();
                       if (dims) ws.send(JSON.stringify({ type: 'resize', cols: dims.cols, rows: dims.rows }));
                     } catch (err) {
-                      console.warn('[TerminalPane] Failed to send retry terminal size:', err);
+                      log.warn('[TerminalPane] Failed to send retry terminal size:', err);
                     }
                   }
                 };
@@ -279,7 +298,7 @@ export default function TerminalPane({ terminalId }: Props) {
                       xtermRef.current.write(msg.data);
                     }
                   } catch (err) {
-                    console.warn('[TerminalPane] Failed to handle retry terminal message:', err);
+                    log.warn('[TerminalPane] Failed to handle retry terminal message:', err);
                   }
                 };
                 ws.onclose = () => { if (!disposedRef.current) setStatus('disconnected'); };

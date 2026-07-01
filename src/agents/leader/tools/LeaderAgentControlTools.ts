@@ -82,6 +82,48 @@ export function isAgentLogLlmEvent(eventType: string): boolean {
     || eventType === 'model_response';
 }
 
+function formatRuntimeAge(timestamp?: number, now = Date.now()): string | undefined {
+  if (!timestamp || !Number.isFinite(timestamp)) return undefined;
+  const elapsed = Math.max(0, now - timestamp);
+  if (elapsed < 60_000) return `${Math.round(elapsed / 1000)}s ago`;
+  if (elapsed < 3_600_000) return `${Math.round(elapsed / 60_000)}m ago`;
+  return `${Math.round(elapsed / 3_600_000)}h ago`;
+}
+
+export async function listRuntimeAgents(ctx: AgentControlContext, _args: Record<string, unknown>): Promise<string> {
+  const { leader } = ctx;
+  const now = Date.now();
+  const runningNames = new Set(leader.pool.getRunning().map((handle) => handle.name));
+  const agents = leader.pool.getAll().map((handle) => ({
+    agentId: handle.agentId,
+    agentName: handle.name,
+    roleType: handle.roleType,
+    displayRole: handle.displayRole,
+    taskId: handle.taskId,
+    status: handle.status,
+    exitReason: handle.exitReason,
+    running: runningNames.has(handle.name),
+    visibility: handle.visibility ?? 'ephemeral',
+    owner: handle.owner ?? 'leader',
+    currentToolName: handle.currentToolName ?? undefined,
+    lastProgressAt: handle.lastProgress,
+    lastProgressAgo: formatRuntimeAge(handle.lastProgress, now),
+    lastHeartbeatAt: handle.lastHeartbeat,
+    lastHeartbeatAgo: formatRuntimeAge(handle.lastHeartbeat, now),
+    recoveryLineage: handle.recoveryLineage,
+    consecutiveRespawnFailures: handle.consecutiveRespawnFailures ?? 0,
+  }));
+  const activeAgents = agents.filter((agent) => agent.status !== 'stopped');
+  return JSON.stringify({
+    ok: true,
+    total: agents.length,
+    active: activeAgents.length,
+    agents,
+    active_agent_names: activeAgents.map((agent) => agent.agentName),
+    all_agent_names: agents.map((agent) => agent.agentName),
+  }, null, 2);
+}
+
 function summarizeAgentLogContent(eventType: string, content: string): string {
   if (!content) return '';
   try {
@@ -584,27 +626,8 @@ export async function terminateAgent(
     throw fail(`Agent "${agentName}" 当前状态为 ${handle.status}，无法终止`);
   }
 
-  const lastCheckedAt = ctx.progressCheckEvidence.get(agentName);
-  // 心跳是进程存活信号，不是任务进展（见 AgentPoolRuntime.ts 注释：lastHeartbeat
-  // "Not proof of task progress"，且 "heartbeats must not refresh [progress]"；
-  // LeaderSupervisionPolicy 亦 "heartbeats are intentionally excluded"）。
-  // WorkerProcessEntry 的 30s 心跳定时器对「进程活着但任务卡死」的 agent 会持续刷新
-  // lastHeartbeat —— 若纳入比较，check 时间戳几乎永远落后于下一次心跳 tick，门禁永远
-  // 不可满足（即「check 了还不能终止」）。故只对比真实进展字段。
-  const checkedAfterLastActivity = lastCheckedAt !== undefined && lastCheckedAt >= Math.max(
-    handle.lastProgress || 0,
-    handle.lastTokenAt || 0,
-    handle.lastToolResultAt || 0,
-    handle.lastToolCallAt || 0,
-  );
-  if (!checkedAfterLastActivity) {
-    throw fail([
-      `拒绝终止 Agent "${agentName}"：terminate_agent 必须先调用 check_agent_progress，并基于检查结果判断。`,
-      '不能只看 task_board、任务耗时、DAG 或主观“卡住”判断就杀进程。',
-      `请先调用 check_agent_progress(agent_name="${agentName}")；若仍需处理，优先 nudge_agent / retry_agent_llm / intervene_agent。`,
-      '只有 check 明确显示无进展、工具卡死、心跳丢失或破坏性行为时，才允许再次调用 terminate_agent。',
-    ].join('\n'));
-  }
+  // 门控已移除：Leader 有权直接终止 Agent，不再强制先调用 check_agent_progress。
+  // Leader 仍可自行判断是否需要先 check，但这不是硬性前置条件。
 
   leader.pool.terminateAgent(agentName, reason);
 

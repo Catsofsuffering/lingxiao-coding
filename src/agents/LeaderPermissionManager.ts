@@ -26,6 +26,21 @@ import {
 import { SESSION_KEYS } from '../core/SessionStateKeys.js';
 import { t } from '../i18n.js';
 
+/**
+ * T-13 ToolFailureLoopGuard 升级 payload 类型。
+ * Worker 在 ToolFailureLoopGuard 熔断后发送 escalate_to_leader 时使用。
+ */
+export interface ToolFailureLoopEscalationPayload {
+  toolName: string;
+  argsHash: string;
+  errorKind: string;
+  errorCode: string;
+  count: number;
+  requiresEscalation: boolean;
+  lastErrorMessage: string;
+  workerName: string;
+}
+
 export interface LeaderPermissionManagerDeps {
   sessionId: string;
   db: DatabaseManager;
@@ -127,6 +142,87 @@ export class LeaderPermissionManager {
       });
     }
     this.emitPermissionMode();
+  }
+
+  /**
+   * T-13: 处理 ToolFailureLoopGuard 升级。
+   *
+   * 当 worker 检测到同 toolName+argsHash+errorKind 连续失败达到阈值时，
+   * 通过 bus 发送 escalate_to_leader 走本方法。设计目标：
+   *   1. 根据 errorKind 自动选众合理动作（不是上交互式审批）
+   *      - permission/network/sandbox：自动升一档权限模式后发送 approval
+   *      - mode/write_scope/schema：拒绝（表示需要在 leader 另起路径）
+   *      - 其他：转交互审批
+   *   2. 写入 audit log，可供 leader 事后调出证据链
+   *   3. 在 session_state 记录熔断记录供后续进度指示（distinct progress 维度）
+   *
+   * 返回 'approved' | 'rejected' | 'interactive' 供 caller 决定后续动作。
+   */
+  handleToolFailureLoopEscalation(
+    workerName: string,
+    payload: ToolFailureLoopEscalationPayload,
+    requestId: string,
+  ): 'approved' | 'rejected' | 'interactive' {
+    this.auditPermission({
+      actor: 'worker',
+      source: 'tool_failure_loop_escalation',
+      mode: this.permissionContext.mode,
+      toolName: payload.toolName,
+      reason: `ToolFailureLoopGuard tripped ${payload.count}x (${payload.errorKind}/${payload.errorCode}): ${payload.lastErrorMessage.slice(0, 200)}`,
+      requestId,
+      workerName,
+    });
+
+    // 记录该 key 的熔断状态，供 Leader 查 / 后续 Agent 避免重提
+    try {
+      this.db.setSessionState(
+        this.sessionId,
+        SESSION_KEYS.PERMISSION_AUDIT_LOG,
+        this.db.getSessionState(this.sessionId, SESSION_KEYS.PERMISSION_AUDIT_LOG),
+      );
+      const tripKey = `tool_failure_loop:${workerName}:${payload.toolName}:${payload.argsHash}`;
+      this.db.setSessionState(this.sessionId, tripKey, {
+        toolName: payload.toolName,
+        argsHash: payload.argsHash,
+        errorKind: payload.errorKind,
+        errorCode: payload.errorCode,
+        count: payload.count,
+        requiresEscalation: payload.requiresEscalation,
+        workerName,
+        lastTrippedAtMs: Date.now(),
+      });
+    } catch {
+      // 熔断状态记录失败不影响主路径
+    }
+
+    // 状态类错误分类自动响应
+    switch (payload.errorKind) {
+      case 'permission':
+      case 'network':
+        // 自动升级权限模式 + 发送 approval
+        try {
+          const newMode = this.permissionContext.mode === 'yolo' ? 'yolo' : 'networked';
+          this.applyPermissionUpdates([{ type: 'setMode', mode: newMode }], 'session');
+        } catch {
+          // fallthrough to interactive
+        }
+        return 'approved';
+      case 'sandbox':
+        // sandbox 错误通常是环境问题，自动放行不修复不了，但可以拒绝以让 leader 换路径
+        return 'rejected';
+      case 'mode':
+      case 'write_scope':
+      case 'schema':
+        // 这些需要改模式 / 改 args，重试本身无意义 → 拒绝
+        return 'rejected';
+      case 'execution':
+      case 'timeout':
+      case 'aborted':
+      case 'other':
+      default:
+        // 通用非状态类错误：走交互审批让 Leader 决定
+        return 'interactive';
+    }
   }
 
   applyPermissionUpdates(

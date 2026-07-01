@@ -19,6 +19,9 @@ import type { DatabaseManager } from '../core/Database.js';
 import { createWikiAgent } from './WikiAgentFactory.js';
 import { WikiFileScanner } from './WikiFileScanner.js';
 import { ChangeDetector } from './ChangeDetector.js';
+import { createLogger } from '../core/Log.js';
+
+const wikiLogger = createLogger('lingxiao.wiki');
 import {
   type WikiLanguage,
   type WikiOutline,
@@ -541,7 +544,7 @@ Create a documentation outline for this project.`;
         // 其他错误（权限/IO/截断）绝不能静默——否则增量更新会退化为全量覆写，破坏已编辑内容。
         const code = (err as NodeJS.ErrnoException | undefined)?.code;
         if (code !== 'ENOENT') {
-          console.warn(`[WikiGenerator] 读取既有文档失败，增量更新将跳过旧内容 (${docPath}):`, err instanceof Error ? err.message : String(err));
+          wikiLogger.warn('[WikiGenerator] failed to read existing doc, incremental update will skip old content', { docPath, error: String(err) });
         }
         existingContent = undefined;
       }
@@ -689,7 +692,7 @@ function loadCheckpoint(projectPath: string, lang: WikiLanguage): WikiCheckpoint
     return JSON.parse(fs.readFileSync(p, 'utf-8')) as WikiCheckpoint;
   } catch (err) {
     // 损坏/不可读的 checkpoint 不能静默：否则长篇 wiki 会无声地从零重生成，丢失进度且无可诊断线索。
-    console.warn(`[WikiGenerator] checkpoint 不可读，将从零重新生成 (${p}):`, err instanceof Error ? err.message : String(err));
+    wikiLogger.warn('[WikiGenerator] checkpoint unreadable, regenerating from scratch', { path: p, error: String(err) });
     return null;
   }
 }

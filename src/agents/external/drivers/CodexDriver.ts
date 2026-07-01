@@ -141,6 +141,8 @@ export class CodexDriver implements ExternalDriver {
             completion: usage.completion,
             total: usage.total,
             cacheRead: usage.cacheRead,
+            cacheCreation: usage.cacheCreation,
+            reasoning: usage.reasoning,
           });
         }
         break;

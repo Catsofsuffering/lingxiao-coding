@@ -9,6 +9,7 @@ import {
 } from '../contracts/adapters/EventAdapter.js';
 import { WORKFLOW_REALTIME_EVENT_NAMES } from '../contracts/types/Workflow.js';
 import type { WorkflowRealtimeEventName } from '../contracts/types/Workflow.js';
+import { serverLogger } from '../core/Log.js';
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -49,6 +50,8 @@ const SESSION_FORWARD_EVENTS = [
   'leader:tool_result',
   'leader:phase_change',
   'leader:text',
+  'leader:capability_intent',
+  'leader:autonomy_decision',
   'leader:llm_retry',
   'leader:tool_progress',
   'chat:user_message',
@@ -70,6 +73,8 @@ const SESSION_FORWARD_EVENTS = [
   'plan:submitted',
   'plan:updated',
   'plan:finalized',
+  // Canvas 版本栈实时更新
+  'canvas:version_pushed',
   // Orchestration（非 run_state）
   'orchestration:node_update',
   'orchestration:event_applied',
@@ -85,6 +90,7 @@ const SESSION_FORWARD_EVENTS = [
   'session:renamed',
   'run:explanation_updated',
   // Context（非 compacting / runtime_updated）
+  'context:mutation',
   'context:compressed',
   'context:overflow',
   'session:runtime_state',
@@ -92,6 +98,8 @@ const SESSION_FORWARD_EVENTS = [
   'langfuse:trace',
   // Git activity (commit/push/pull with agent identity + gate result)
   'git:activity',
+  // Generic agent activity (file writes / shell / git / external actions) with session + agent identity
+  'agent:activity',
 ] as const satisfies readonly (EventType & EventName)[];
 
 const AGENT_FORWARD_EVENTS = [
@@ -485,7 +493,7 @@ export class SseBridge {
     // 每次从 connectionManager.getClients() 获取当前活跃列表，不闭包持有 client 对象
     const STALE_THRESHOLD_MS = 5 * 60 * 1000;
     this.heartbeatInterval = setInterval(() => {
-      if (this._destroyed || !this._started) return;    if (this.heartbeatInterval) this.heartbeatInterval.unref();
+      if (this._destroyed || !this._started) return;
       const now = Date.now();
       const stats = this.connectionManager.getStats();
       for (const { sessionId } of stats.perSession) {
@@ -493,7 +501,7 @@ export class SseBridge {
         for (const client of clients) {
           // 检查是否过期
           if (now - client.lastActivity > STALE_THRESHOLD_MS) {
-            console.log(`[SseBridge] 清理过期连接: ${client.connectionId} (session=${sessionId})`);
+            serverLogger.debug('[SseBridge] stale connection cleaned', { connectionId: client.connectionId, sessionId });
             this.connectionManager.removeClient(client.connectionId);
             continue;
           }
@@ -720,7 +728,7 @@ export class SseBridge {
 
   private warnMissingAgentSession(agentId: string | undefined): void {
     if (process.env.NODE_ENV !== 'production') {
-      console.warn(`[SseBridge] 事件缺失 sessionId（agentId=${agentId ?? 'unknown'}），上游 emitter 应补字段`);
+      serverLogger.warn('[SseBridge] event missing sessionId, upstream emitter should supply it', { agentId: agentId ?? 'unknown' });
     }
   }
 

@@ -25,6 +25,9 @@ import { useTranslation } from 'react-i18next';
 import { useSessionStore } from '../../stores/sessionStore';
 import { usePopoverMaxHeight } from '../../hooks/usePopoverMaxHeight';
 import { getServerToken } from '../../api/headers';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('WorkspacePicker');
+
 
 // ─── helpers ──────────────────────────────────────────────────────
 
@@ -150,7 +153,7 @@ export default function WorkspacePicker() {
         setOpen(false);
         setView('main');
       } catch (e) {
-        console.error('[WorkspacePicker] switch failed:', e);
+        log.error('[WorkspacePicker] switch failed:', e);
       } finally {
         setSwitching(false);
       }

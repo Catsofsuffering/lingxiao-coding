@@ -16,6 +16,9 @@
  */
 
 import type { Message } from '../stores/sessionStore';
+import { createLogger } from './logger';
+
+const log = createLogger('historyDB');
 
 const DB_NAME = 'lingxiao-history';
 const DB_VERSION = 1;
@@ -96,7 +99,7 @@ export async function saveMessages(sessionId: string, messages: Message[]): Prom
     // 异步清理老旧 session（不阻塞当前写入）
     evictOldSessions().catch(() => {});
   } catch (e) {
-    console.warn('[historyDB] saveMessages failed:', e);
+    log.warn('saveMessages failed:', e);
   }
 }
 
@@ -121,7 +124,7 @@ export async function appendMessage(sessionId: string, msg: Message): Promise<vo
       t.onerror = () => reject(t.error);
     });
   } catch (e) {
-    console.warn('[historyDB] appendMessage failed:', e);
+    log.warn('appendMessage failed:', e);
   }
 }
 
@@ -136,7 +139,7 @@ export async function updateMessage(sessionId: string, msg: Message): Promise<vo
       t.onerror = () => reject(t.error);
     });
   } catch (e) {
-    console.warn('[historyDB] updateMessage failed:', e);
+    log.warn('updateMessage failed:', e);
   }
 }
 
@@ -152,7 +155,7 @@ export async function loadMessages(sessionId: string): Promise<Message[]> {
     );
     return rows.map(({ sessionId: _sid, ...msg }) => msg as Message);
   } catch (e) {
-    console.warn('[historyDB] loadMessages failed:', e);
+    log.warn('loadMessages failed:', e);
     throw new Error(`Failed to load persisted messages for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
@@ -172,7 +175,7 @@ export async function clearSession(sessionId: string): Promise<void> {
       t.onerror = () => reject(t.error);
     });
   } catch (e) {
-    console.warn('[historyDB] clearSession failed:', e);
+    log.warn('clearSession failed:', e);
   }
 }
 
@@ -191,6 +194,6 @@ async function evictOldSessions(): Promise<void> {
       await clearSession(meta.sessionId);
     }
   } catch (e) {
-    console.warn('[historyDB] evictOldSessions failed:', e);
+    log.warn('evictOldSessions failed:', e);
   }
 }

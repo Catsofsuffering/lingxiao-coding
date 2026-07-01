@@ -2,6 +2,9 @@ import { useState, useRef, useEffect } from 'react';
 import { Shield, ShieldAlert, Wifi, Zap, Check, ChevronDown } from 'lucide-react';
 import { acpClient } from '../../api/AcpClient';
 import { useSessionStore } from '../../stores/sessionStore';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('PermissionModeToggle');
+
 
 type PermissionMode = 'yolo' | 'networked' | 'dev' | 'strict';
 
@@ -56,7 +59,7 @@ export function PermissionModeToggle() {
       const nextMode = normalizeMode((result as { mode?: unknown } | null)?.mode ?? target);
       useSessionStore.setState({ permissionMode: nextMode });
     } catch (err) {
-      console.warn('[PermissionModeToggle] set_mode failed:', err);
+      log.warn('[PermissionModeToggle] set_mode failed:', err);
     } finally {
       setBusy(false);
     }

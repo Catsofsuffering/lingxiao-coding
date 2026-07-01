@@ -39,6 +39,7 @@ import { contentToPlainText, isContentPartArray } from './types.js';
 import { createProviderModel, type VercelAIProviderConfig } from './providers/index.js';
 import { estimateTokens } from './token_counter.js';
 import { supportsThinking, getThinkingParams } from './model_capabilities.js';
+import { extractTokenUsage } from './usageExtractor.js';
 import { getConfigValue } from '../config.js';
 import { resolveGuardedTemperature } from './reasoningSampling.js';
 
@@ -513,7 +514,7 @@ export class VercelAIContentGenerator implements ContentGenerator {
     text: string;
     reasoning: Array<{type: 'reasoning'; text: string; providerMetadata?: Record<string, Record<string, unknown>>}>;
     toolCalls: Array<{toolCallId: string; toolName: string; input?: unknown; args?: unknown}>;
-    usage: {inputTokens?: number; outputTokens?: number; totalTokens?: number};
+    usage: Record<string, unknown> & {inputTokens?: number; outputTokens?: number; totalTokens?: number};
     finishReason: string;
     response?: {modelId?: string};
   }): ChatResponse {
@@ -543,18 +544,20 @@ export class VercelAIContentGenerator implements ContentGenerator {
     };
   }
 
-  private convertUsage(usage: {
+  private convertUsage(usage: Record<string, unknown> & {
     inputTokens?: number | undefined;
     outputTokens?: number | undefined;
     totalTokens?: number | undefined;
   }): TokenUsage {
-    const prompt = usage.inputTokens ?? 0;
-    const completion = usage.outputTokens ?? 0;
-    const total = usage.totalTokens ?? (prompt + completion);
-    return {
-      prompt_tokens: prompt,
-      completion_tokens: completion,
-      total_tokens: total,
+    return extractTokenUsage({
+      ...usage,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      totalTokens: usage.totalTokens,
+    }) ?? {
+      prompt_tokens: usage.inputTokens ?? 0,
+      completion_tokens: usage.outputTokens ?? 0,
+      total_tokens: usage.totalTokens ?? ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)),
     };
   }
 }

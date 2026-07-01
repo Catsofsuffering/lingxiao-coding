@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { createHash } from 'crypto';
 import { Workspace } from './Workspace.js';
 import type { GraphNode, GraphSnapshot } from './blackboard/types.js';
 import type { ContractAllowedScope } from './ContractAllowedScope.js';
+import { getContractProvenance, shouldPreferContractNode } from './ContractProvenance.js';
 
 export interface ContractPackEntry {
   surface: string;
@@ -37,6 +38,9 @@ export const DEFAULT_MAX_RENDERED_CONTRACTS = 12;
 /** Context Manifest 摘要段渲染的契约条数上限 —— 摘要每条仅一行，可比全文多列几条。 */
 export const DEFAULT_MAX_MANIFEST_CONTRACTS = 16;
 const DEFAULT_MAX_CONTENT_CHARS = 2_400;
+const PROJECT_CONTRACT_PACK_LOCK_DIR = '.contract-pack.lock';
+const PROJECT_CONTRACT_PACK_LOCK_TIMEOUT_MS = 5_000;
+const PROJECT_CONTRACT_PACK_LOCK_STALE_MS = 30_000;
 
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
@@ -80,7 +84,7 @@ function hashContract(input: {
     .digest('hex');
 }
 
-function sanitizeSurfaceForFilename(surface: string): string {
+export function sanitizeSurfaceForFilename(surface: string): string {
   const sanitized = surface
     .trim()
     .replace(/^[a-z]+:/i, '')
@@ -112,6 +116,54 @@ export function getProjectContractPackPath(workspace?: string): string {
   return join(getProjectContractsDir(workspace), CONTRACT_PACK_FILENAME);
 }
 
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+function withProjectContractPackLock<T>(dir: string, fn: () => T): T {
+  const lockDir = join(dir, PROJECT_CONTRACT_PACK_LOCK_DIR);
+  const deadline = Date.now() + PROJECT_CONTRACT_PACK_LOCK_TIMEOUT_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      mkdirSync(lockDir);
+      writeFileSync(join(lockDir, 'owner'), `pid=${process.pid}\nacquiredAt=${new Date().toISOString()}\n`, 'utf8');
+      acquired = true;
+    } catch (err) {
+      try {
+        const ageMs = Date.now() - statSync(lockDir).mtimeMs;
+        if (ageMs > PROJECT_CONTRACT_PACK_LOCK_STALE_MS) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // Lock disappeared between mkdir and stat; retry immediately.
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for project contract-pack lock: ${lockDir}`);
+      }
+      sleepSync(25);
+      if (err instanceof Error && err.message.includes('EACCES')) {
+        throw err;
+      }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+function writeJsonAtomic(path: string, value: unknown): void {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  renameSync(tmp, path);
+}
+
 export function getContractSurface(node: Pick<GraphNode, 'tags' | 'title' | 'id'>): string {
   const surfaceTag = node.tags.find(tag => tag.startsWith('contract:'));
   if (surfaceTag) {
@@ -136,6 +188,7 @@ export function getContractVersion(node: Pick<GraphNode, 'tags' | 'title' | 'con
 export function graphNodeToContractPackEntry(
   node: GraphNode,
   contractsDir?: string,
+  workspace?: string,
 ): ContractPackEntry {
   const surface = getContractSurface(node);
   const version = getContractVersion(node);
@@ -143,27 +196,48 @@ export function graphNodeToContractPackEntry(
     ?.map(item => [item.type, item.ref, item.location].filter(Boolean).join(':'))
     .filter(Boolean);
   const tags = Array.from(new Set(node.tags));
+  const provenance = getContractProvenance(node.tags) || undefined;
+  const fileName = `${sanitizeSurfaceForFilename(surface)}.json`;
+  const entryPath = contractsDir ? join(contractsDir, fileName) : undefined;
+
+  // BUG FIX: provenance:template(Leader 薄模板)和 provenance:worker(compliance stub)
+  // 都不是完整契约正文。如果磁盘已有同 surface 的完整契约文件（worker 通过 file_create 写入），
+  // 用磁盘内容替代,防止 persistContractPack 用模板/stub 覆盖磁盘完整文件。
+  let content = node.content;
+  if ((provenance === 'template' || provenance === 'worker') && entryPath && existsSync(entryPath)) {
+    try {
+      const diskEntry = JSON.parse(readFileSync(entryPath, 'utf8')) as unknown;
+      if (diskEntry && typeof diskEntry === 'object'
+        && typeof (diskEntry as Record<string, unknown>).content === 'string'
+        && typeof (diskEntry as Record<string, unknown>).surface === 'string'
+        && (diskEntry as Record<string, string>).surface === surface) {
+        const diskContent = (diskEntry as Record<string, string>).content;
+        if (diskContent.length > 0) {
+          content = diskContent;
+        }
+      }
+    } catch { /* 磁盘文件非合法 JSON,用模板内容 */ }
+  }
+
   const sha256 = hashContract({
     surface,
     title: node.title,
     version,
-    content: node.content,
+    content,
     tags,
     allowedScope: node.contractAllowedScope,
   });
-  const provenance = node.tags.find((t) => t.startsWith('provenance:'))?.slice('provenance:'.length).trim() || undefined;
-  const fileName = `${sanitizeSurfaceForFilename(surface)}.json`;
   return {
     surface,
     title: node.title,
     ...(version !== undefined ? { version } : {}),
-    content: node.content,
+    content,
     nodeId: node.id,
     createdBy: node.createdBy,
     createdAt: node.createdAt,
     tags,
     ...(evidenceRefs && evidenceRefs.length > 0 ? { evidenceRefs } : {}),
-    ...(contractsDir ? { path: join(contractsDir, fileName) } : {}),
+    ...(entryPath ? { path: entryPath } : {}),
     ...(node.contractAllowedScope ? { allowedScope: node.contractAllowedScope } : {}),
     sha256,
     ...(provenance ? { provenance } : {}),
@@ -175,18 +249,19 @@ export function buildContractPackFromSnapshot(
   input: { sessionId: string; workspace?: string; generatedAt?: number },
 ): ContractPack {
   const contractsDir = getContractsDir(input.sessionId, input.workspace);
+  // ARCH FIX: provenance 权威排序——同 surface 多活节点时,最权威描述胜出;同权威再按 createdAt 取新。
   const latestBySurface = new Map<string, GraphNode>();
   for (const node of snapshot.nodes) {
     if (node.kind !== 'contract' || node.supersededBy) continue;
     const surface = getContractSurface(node);
     const existing = latestBySurface.get(surface);
-    if (!existing || node.createdAt > existing.createdAt) {
+    if (!existing || shouldPreferContractNode(node, existing)) {
       latestBySurface.set(surface, node);
     }
   }
   const entries = [...latestBySurface.values()]
     .sort((a, b) => getContractSurface(a).localeCompare(getContractSurface(b)))
-    .map(node => graphNodeToContractPackEntry(node, contractsDir));
+    .map(node => graphNodeToContractPackEntry(node, contractsDir, input.workspace));
   return {
     sessionId: input.sessionId,
     generatedAt: input.generatedAt ?? Date.now(),
@@ -199,9 +274,9 @@ export function persistContractPack(pack: ContractPack, workspace?: string): Con
   mkdirSync(pack.contractsDir, { recursive: true });
   for (const entry of pack.entries) {
     if (!entry.path) continue;
-    writeFileSync(entry.path, `${JSON.stringify(entry, null, 2)}\n`, 'utf8');
+    writeJsonAtomic(entry.path, entry);
   }
-  writeFileSync(join(pack.contractsDir, CONTRACT_PACK_FILENAME), `${JSON.stringify(pack, null, 2)}\n`, 'utf8');
+  writeJsonAtomic(join(pack.contractsDir, CONTRACT_PACK_FILENAME), pack);
   // 项目级双写(跨会话权威):workspace 给定时,契约同步落到 .lingxiao/contracts/ 供 loader 加载。
   if (workspace) {
     persistProjectContractPack(pack, workspace);
@@ -216,43 +291,96 @@ function persistProjectContractPack(pack: ContractPack, workspace: string): void
   const dir = getProjectContractsDir(workspace);
   mkdirSync(dir, { recursive: true });
 
-  // 读取已存在的项目级契约,合并而非覆写
-  const packPath = join(dir, CONTRACT_PACK_FILENAME);
-  const existingBySurface = new Map<string, ContractPackEntry>();
-  if (existsSync(packPath)) {
-    try {
-      const raw = readFileSync(packPath, 'utf8');
-      const parsed = JSON.parse(raw) as unknown;
-      if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).entries)) {
-        for (const e of (parsed as Record<string, unknown[]>).entries) {
-          if (e && typeof e === 'object'
-            && typeof (e as Record<string, unknown>).surface === 'string'
-            && typeof (e as Record<string, unknown>).content === 'string'
-            && typeof (e as Record<string, unknown>).sha256 === 'string') {
-            const entry = e as ContractPackEntry;
-            const key = entry.version !== undefined ? `${entry.surface}@v${entry.version}` : entry.surface;
-            existingBySurface.set(key, entry);
+  // 项目级契约是跨会话权威投影:读-合并-写必须跨进程串行,否则两个 session 同时刷新会丢更新。
+  withProjectContractPackLock(dir, () => {
+    // 读取已存在的项目级契约,合并而非覆写
+    const packPath = join(dir, CONTRACT_PACK_FILENAME);
+    const existingBySurface = new Map<string, ContractPackEntry>();
+    if (existsSync(packPath)) {
+      try {
+        const raw = readFileSync(packPath, 'utf8');
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).entries)) {
+          for (const e of (parsed as Record<string, unknown[]>).entries) {
+            if (e && typeof e === 'object'
+              && typeof (e as Record<string, unknown>).surface === 'string'
+              && typeof (e as Record<string, unknown>).content === 'string'
+              && typeof (e as Record<string, unknown>).sha256 === 'string') {
+              const entry = e as ContractPackEntry;
+              const key = entry.version !== undefined ? `${entry.surface}@v${entry.version}` : entry.surface;
+              existingBySurface.set(key, entry);
+            }
           }
         }
-      }
-    } catch { /* 容错:损坏则从当前 pack 重建 */ }
-  }
+      } catch { /* 容错:损坏则从当前 pack 重建 */ }
+    }
 
-  // 新 entry 覆盖同 surface@version 的旧 entry
-  for (const entry of pack.entries) {
+    // 新 entry 覆盖同 surface@version 的旧 entry
+    for (const entry of pack.entries) {
+      const key = entry.version !== undefined ? `${entry.surface}@v${entry.version}` : entry.surface;
+      existingBySurface.set(key, entry);
+    }
+
+    const mergedEntries = [...existingBySurface.values()].sort((a, b) =>
+      a.surface.localeCompare(b.surface) || (a.version ?? 0) - (b.version ?? 0),
+    );
+
+    for (const entry of mergedEntries) {
+      const fileName = `${sanitizeSurfaceForFilename(entry.surface)}.json`;
+      writeJsonAtomic(join(dir, fileName), entry);
+    }
+    writeJsonAtomic(packPath, { generatedAt: pack.generatedAt, contractsDir: dir, entries: mergedEntries });
+  });
+}
+
+/**
+ * 持久化单个契约条目到项目级 contracts 目录。
+ * 用于 Leader 的 write_contract 工具——绕过 BlackboardGraph 直接写契约。
+ * 内部走相同的锁和合并逻辑，保证跨会话一致性。
+ */
+export function persistProjectContractEntry(workspace: string, entry: ContractPackEntry): void {
+  const dir = getProjectContractsDir(workspace);
+  mkdirSync(dir, { recursive: true });
+
+  withProjectContractPackLock(dir, () => {
+    const packPath = join(dir, CONTRACT_PACK_FILENAME);
+    const existingBySurface = new Map<string, ContractPackEntry>();
+
+    // 读取已有契约
+    if (existsSync(packPath)) {
+      try {
+        const raw = readFileSync(packPath, 'utf8');
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === 'object' && Array.isArray((parsed as Record<string, unknown>).entries)) {
+          for (const e of (parsed as Record<string, unknown[]>).entries) {
+            if (e && typeof e === 'object'
+              && typeof (e as Record<string, unknown>).surface === 'string'
+              && typeof (e as Record<string, unknown>).content === 'string'
+              && typeof (e as Record<string, unknown>).sha256 === 'string') {
+              const existing = e as ContractPackEntry;
+              const key = existing.version !== undefined ? `${existing.surface}@v${existing.version}` : existing.surface;
+              existingBySurface.set(key, existing);
+            }
+          }
+        }
+      } catch { /* 容错 */ }
+    }
+
+    // 合并新 entry
     const key = entry.version !== undefined ? `${entry.surface}@v${entry.version}` : entry.surface;
     existingBySurface.set(key, entry);
-  }
 
-  const mergedEntries = [...existingBySurface.values()].sort((a, b) =>
-    a.surface.localeCompare(b.surface) || (a.version ?? 0) - (b.version ?? 0),
-  );
+    const mergedEntries = [...existingBySurface.values()].sort((a, b) =>
+      a.surface.localeCompare(b.surface) || (a.version ?? 0) - (b.version ?? 0),
+    );
 
-  for (const entry of mergedEntries) {
-    const fileName = `${sanitizeSurfaceForFilename(entry.surface)}.json`;
-    writeFileSync(join(dir, fileName), `${JSON.stringify(entry, null, 2)}\n`, 'utf8');
-  }
-  writeFileSync(packPath, `${JSON.stringify({ generatedAt: pack.generatedAt, contractsDir: dir, entries: mergedEntries }, null, 2)}\n`, 'utf8');
+    // 写入文件
+    for (const e of mergedEntries) {
+      const fileName = `${sanitizeSurfaceForFilename(e.surface)}.json`;
+      writeJsonAtomic(join(dir, fileName), e);
+    }
+    writeJsonAtomic(packPath, { generatedAt: Date.now(), contractsDir: dir, entries: mergedEntries });
+  });
 }
 
 export function buildAndPersistContractPackFromSnapshot(

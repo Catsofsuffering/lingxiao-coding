@@ -116,6 +116,7 @@ export class ClaudeCodeDriver implements ExternalDriver {
             total: usage.total,
             cacheRead: usage.cacheRead,
             cacheCreation: usage.cacheCreation,
+            reasoning: usage.reasoning,
           });
         }
       }
@@ -169,6 +170,7 @@ export class ClaudeCodeDriver implements ExternalDriver {
             total: usage.total,
             cacheRead: usage.cacheRead,
             cacheCreation: usage.cacheCreation,
+            reasoning: usage.reasoning,
           });
         }
       }

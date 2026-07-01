@@ -24,6 +24,7 @@ import {
   ENABLE_STREAMING,
   LEADER_MAX_RUNTIME_MINUTES,
   LEADER_MAX_TOOL_ROUNDS,
+  LEADER_ROUND_TIMEOUT_MS,
   config as runtimeConfig,
 } from '../../config.js';
 import { t } from '../../i18n.js';
@@ -88,6 +89,7 @@ export interface LeaderThinkingEngineOptions {
   isFinished: () => boolean;
   isWaitingForUser: () => boolean;
   isUserInterruptPending: () => boolean;
+  isToolUseSuppressedForCurrentTurn?: () => boolean;
   /** 是否有待处理的 Agent 完成信号 */
   isAgentCompletionPending?: () => boolean;
   setWaitingForUser: (v: boolean) => void;
@@ -173,7 +175,9 @@ export interface LeaderThinkingEngineOptions {
 
   // 黑板架构（feature flag: LINGXIAO_BLACKBOARD）
   /** 获取黑板图分析结果，用于注入 LLM 上下文 */
-  getBlackboardAnalysis?: () => import('../../core/blackboard/types.js').GraphAnalysis | null;
+  getBlackboardAnalysis?: () => import('../../core/blackboard/types.js').GraphAnalysis | null;  /** SharedLedger: 获取 constraint + decision 条目（compaction-safe） */
+  getSharedLedgerContext?: () => string | null;
+
   /** 注入统一上下文记忆召回结果 */
   appendContextMemoryIfChanged?: () => Promise<boolean>;
 }
@@ -400,9 +404,10 @@ export class LeaderThinkingEngine {
         this.opts.setWaitingForUser(true);
         return null;
       }
-      this.opts.addMessage({ role: input.continuationRole, content: verdict.continuationPrompt || '请基于当前上下文接续未完成部分，已输出内容用承接方式处理。' });
-      const c = this.opts.getConversation();
-      await db.saveConversationMessage(sessionId, c[c.length - 1]);
+
+      // 不注入任何 continuation prompt 到持久化历史
+      // 模型会基于当前上下文自然继续，无需显式提示
+      leaderLogger.info(`[LeaderContinuation] 续跑 (retry=${retry}, reason=${verdict.reason})，不注入 prompt`);
       return { done: false };
     }
 
@@ -412,9 +417,9 @@ export class LeaderThinkingEngine {
       return null;
     }
 
-    this.opts.addMessage({ role: input.continuationRole, content: hook.feedback || 'Stop Hook 要求继续推进当前会话。' });
-    const c = this.opts.getConversation();
-    await db.saveConversationMessage(sessionId, c[c.length - 1]);
+    // Stop hook 要求继续，但不注入到持久化历史
+    // 模型会基于当前上下文继续推进
+    leaderLogger.info(`[LeaderContinuation] Stop hook 要求继续，不注入 prompt`);
     return { done: false };
   }
 
@@ -451,6 +456,7 @@ export class LeaderThinkingEngine {
       setRawXmlRetryCount: (value) => this.opts.setRawXmlRetryCount(value),
       setEmptyResponseRetryCount: (value) => this.opts.setEmptyResponseRetryCount(value),
       isUserInterruptPending: () => this.opts.isUserInterruptPending(),
+      isToolUseSuppressedForCurrentTurn: () => this.opts.isToolUseSuppressedForCurrentTurn?.() ?? false,
       getActiveTeam: this.opts.getActiveTeam,
       getCollaborationMode: this.opts.getCollaborationMode,
       peekNextTaskIds: this.opts.peekNextTaskIds,
@@ -477,6 +483,8 @@ export class LeaderThinkingEngine {
         total: response.usage!.total_tokens,
         cache_read: response.usage!.cache_read_input_tokens,
         cache_creation: response.usage!.cache_creation_input_tokens,
+        reasoning: response.usage!.reasoning_tokens,
+        credit: response.usage!.credit,
       }, this.opts.getModel());
     } else {
       // 回退估算：当 provider 不返回 usage 或 usage 为 0 时，本地估算
@@ -658,10 +666,15 @@ export class LeaderThinkingEngine {
     this.opts.setLastProgressAtMs(Date.now());
     emitter.emit('leader:busy', { sessionId, isBusy: true, queueLength: 0 });
 
-    // Hot-reload model config
-    const latestModel = runtimeConfig.llm.leader_model;
-    if (latestModel && latestModel !== this.opts.getModel()) {
-      this.opts.setModel(latestModel);
+    // Hot-reload model config — respect session-level model override.
+    // If the user switched model via the chat UI (which writes CURRENT_MODEL to
+    // session state), do NOT clobber it with the global default.
+    const sessionModelOverride = db.getSessionState(sessionId, SESSION_KEYS.CURRENT_MODEL);
+    if (!sessionModelOverride) {
+      const latestModel = runtimeConfig.llm.leader_model;
+      if (latestModel && latestModel !== this.opts.getModel()) {
+        this.opts.setModel(latestModel);
+      }
     }
 
     try {
@@ -669,45 +682,38 @@ export class LeaderThinkingEngine {
       this.opts.appendRuntimeContextManifestIfChanged();
       await this.opts.appendContextMemoryIfChanged?.();
 
-      // 黑板架构：注入图分析上下文（作为 system 消息，不影响 LLM 决策）
+      // SharedLedger 注入：constraint + decision 条目永远保留在 Leader 上下文中
+      if (this.opts.getSharedLedgerContext) {
+        const ledgerContent = this.opts.getSharedLedgerContext();
+        if (ledgerContent) {
+          if (this.opts.upsertSystemSlot) {
+            this.opts.upsertSystemSlot({ kind: 'prefix', prefix: '## Shared Ledger' }, ledgerContent);
+          } else {
+            this.opts.addMessage({ role: 'system', content: ledgerContent });
+          }
+        }
+      }
+
+      // 向后兼容：如果仍有 blackboard analysis provider，保留旧注入
       if (this.opts.getBlackboardAnalysis) {
         const analysis = this.opts.getBlackboardAnalysis();
-        if (analysis) {
-          const parts: string[] = ['## 黑板图分析（自动注入，供你参考已有知识）'];
-          // 始终显示已知事实及其内容摘要（避免 LLM 误判黑板为空）
+        if (analysis && (analysis.recentFacts.length > 0 || analysis.openIntents.length > 0)) {
+          const parts: string[] = ['## 黑板图分析（向后兼容）'];
           if (analysis.recentFacts.length > 0) {
             parts.push(`已知事实 (${analysis.recentFacts.length}):`);
-            for (const f of analysis.recentFacts.slice(0, 5)) {
-              const contentPreview = f.content ? f.content.slice(0, 300) : '';
+            for (const f of analysis.recentFacts.slice(0, 3)) {
               parts.push(`  - [${f.id}] ${f.title}`);
-              if (contentPreview) parts.push(`    摘要: ${contentPreview}`);
             }
           }
           if (analysis.openIntents.length > 0) {
             parts.push(`开放 Intent (${analysis.openIntents.length}):`);
-            for (const i of analysis.openIntents.slice(0, 5)) {
-              parts.push(`  - [${i.id}] ${i.title}${i.content ? `: ${i.content.slice(0, 100)}` : ''}`);
+            for (const i of analysis.openIntents.slice(0, 3)) {
+              parts.push(`  - [${i.id}] ${i.title}`);
             }
           }
-          if (analysis.unresolvedContradictions.length > 0) {
-            parts.push(`矛盾 (${analysis.unresolvedContradictions.length}):`);
-            for (const c of analysis.unresolvedContradictions.slice(0, 3)) {
-              parts.push(`  - ${c.nodeA.title} ↔ ${c.nodeB.title}`);
-            }
-          }
-          if (analysis.knowledgeGaps.length > 0) {
-            parts.push(`知识缺口: ${analysis.knowledgeGaps.slice(0, 3).join(', ')}`);
-          }
-          if (analysis.completionSignals.length > 0) {
-            parts.push(`完成信号: ${analysis.completionSignals.join(', ')}`);
-          }
-          if (analysis.recentFacts.length === 0 && analysis.openIntents.length === 0) {
-            parts.push('黑板当前无数据。');
-          }
-          // 黑板图分析是状态镜像（每轮刷新、最新值即权威）→ 单槽 in-place，避免每轮 append 堆积。
           const blackboardContent = parts.join('\n');
           if (this.opts.upsertSystemSlot) {
-            this.opts.upsertSystemSlot({ kind: 'prefix', prefix: '## 黑板图分析（自动注入' }, blackboardContent);
+            this.opts.upsertSystemSlot({ kind: 'prefix', prefix: '## 黑板图分析（向后兼容' }, blackboardContent);
           } else {
             this.opts.addMessage({ role: 'system', content: blackboardContent });
           }
@@ -808,6 +814,23 @@ export class LeaderThinkingEngine {
             const llmAbort = new AbortController();
             this.opts.setCurrentLlmAbortController(llmAbort);
 
+            // P1: per-round wall-clock 安全网 — 兜底 LlmGuard 内部 hang watchdog (240s) 失效或
+            // 内层重试循环 (3×180s+backoff ≈ 540s+) 运行过久。600s 高于 LlmGuard 最坏情况，
+            // 仅在极端场景触发；触发后 abort 当前 LLM 调用，按可重试错误走外层 retry 计数器。
+            let roundTimeoutFired = false;
+            const roundTimer = setTimeout(() => {
+              roundTimeoutFired = true;
+              llmAbort.abort();
+              leaderLogger.error(
+                `Leader 单轮 wall-clock 超时 (${LEADER_ROUND_TIMEOUT_MS / 1000}s)，abort LLM 调用`,
+              );
+              emitter.emit('leader:status', {
+                sessionId,
+                status: `⏱️ 单轮超时 (${LEADER_ROUND_TIMEOUT_MS / 1000}s)，正在重试...`,
+              });
+            }, LEADER_ROUND_TIMEOUT_MS);
+            roundTimer.unref?.();
+
             // 对齐 CodeBuddy: LLM 请求发出前 emit model_requesting phase
             emitter.emit('leader:phase_change', { sessionId, phase: 'model_requesting' });
 
@@ -846,48 +869,68 @@ export class LeaderThinkingEngine {
                 // 防漂移：Leader 主推理走确定性温度(默认 0)，避免任务分解/工具选择随机抖动
                 getReasoningGenerateOptions(),
               );
+              clearTimeout(roundTimer);
             } catch (error) {
+              clearTimeout(roundTimer);
               // 用户中断（ESC / interrupt）不应重试，直接退出思考循环
               const errorMsg = error instanceof Error ? error.message : String(error);
               if (errorMsg.includes('aborted by caller') || llmAbort.signal.aborted) {
+                if (roundTimeoutFired) {
+                  // 单轮 wall-clock 超时触发 abort — 按可重试处理，计入外层 retry 计数器
+                  leaderLogger.warn('Leader 单轮 wall-clock 超时，abort 后计入外层重试');
+                  const toRetry = this.opts.getLlmErrorRetryCount() + 1;
+                  this.opts.setLlmErrorRetryCount(toRetry);
+                  const outerMax = this.opts.getLlmMaxErrorRetries();
+                  if (toRetry >= outerMax) {
+                    leaderLogger.error(
+                      `Leader 单轮超时连续 ${toRetry}/${outerMax} 次，停下等待用户介入`,
+                    );
+                    emitter.emit('leader:status', {
+                      sessionId,
+                      status: '⏱️ 单轮超时次数耗尽，等待人工介入',
+                    });
+                    // 抢救 partial content：LLM 超时前可能已输出部分内容，注入对话历史避免白输
+                    const partial = (error as unknown as Record<string, unknown>).partialContent;
+                    if (typeof partial === 'string' && partial.trim()) {
+                      this.opts.addMessage({ role: 'assistant', content: partial });
+                      const pc = this.opts.getConversation();
+                      await db.saveConversationMessage(sessionId, pc[pc.length - 1]);
+                      leaderLogger.info(`Leader 单轮超时终态：已抢救 partial content (${partial.length} chars)`);
+                    }
+                    this.opts.addMessage({
+                      role: 'system',
+                      content: `⏱️ [系统终止] Leader 单轮 LLM 调用连续超时 ${toRetry}/${outerMax} 次。请检查 provider 状态或网络连接。`,
+                    });
+                    const c2 = this.opts.getConversation();
+                    await db.saveConversationMessage(sessionId, c2[c2.length - 1]);
+                    this.opts.setLlmErrorRetryCount(0);
+                    this.opts.setWaitingForUser(true);
+                    return { type: 'break' };
+                  }
+                  return { type: 'continue' };
+                }
                 leaderLogger.info('LLM 调用被用户中断，退出思考循环');
                 return { type: 'break' };
               }
 
-              // CircuitBreaker OPEN：provider 整体不可用，主动 sleep 到探针窗口
-              // 而不是 200ms 高频 retry 形成死循环。sleep 期间 emit 等待状态。
+              // CircuitBreaker OPEN：LlmGuard 已回收旧 LLM client / keep-alive socket 池，并重置该
+              // provider 的 CB 状态。这里不 sleep、不注入错误、不累计外层 retry，直接按 ESC
+              // 中断语义结束当前 attempt，下一轮重新发起同模型请求。
               if (error instanceof CircuitOpenError) {
-                const waitMs = error.retryAfterMs;
-                const waitSec = Math.ceil(waitMs / 1000);
                 leaderLogger.warn(
-                  `Leader CB OPEN provider="${error.providerKey}"，sleep ${waitSec}s 等待 HALF_OPEN 探针窗口`,
+                  `Leader CB OPEN provider="${error.providerKey}"，已回收旧连接并重新请求`,
                 );
                 emitter.emit('leader:status', {
                   sessionId,
-                  status: `🛑 Provider 暂不可用，${waitSec}s 后自动重试...`,
+                  status: '🔄 Provider 连接已回收，重新请求中...',
                 });
-                emitter.emit('leader:error', { sessionId, error: classifyLLMError(error) });
-                await new Promise((resolve) => setTimeout(resolve, waitMs));
-                // 不再 setLlmErrorRetryCount(0) — 那会清零外层计数器导致无限 sleep 循环。
-                // 用外层 retry 计数器追踪连续 CB OPEN sleep，到达上限后停下等待用户介入。
-                const cbRetry = this.opts.getLlmErrorRetryCount() + 1;
-                this.opts.setLlmErrorRetryCount(cbRetry);
-                const outerMax = this.opts.getLlmMaxErrorRetries();
-                if (cbRetry >= outerMax) {
-                  leaderLogger.error(
-                    `Leader CB OPEN 已连续 ${cbRetry}/${outerMax} 次仍未恢复，停下等待用户介入`,
-                  );
-                  emitter.emit('leader:status', {
-                    sessionId,
-                    status: `🛑 Provider 持续不可用：等待人工介入`,
-                  });
-                  const stopMsg = `🛑 [系统终止] Provider 持续不可用（Circuit Breaker 已连续触发 ${cbRetry}/${outerMax} 次）。请检查 provider 状态或更换模型后再继续。`;
-                  this.opts.addMessage({ role: 'system', content: stopMsg });
-                  const c2 = this.opts.getConversation();
-                  await db.saveConversationMessage(sessionId, c2[c2.length - 1]);
-                  this.opts.setLlmErrorRetryCount(0);
-                  this.opts.setWaitingForUser(true);
-                  return { type: 'break' };
+                // 抢救 partial content（理论上 CB OPEN 发生在请求前，通常为空；保留兜底）。
+                const partialCb = (error as unknown as Record<string, unknown>).partialContent;
+                if (typeof partialCb === 'string' && partialCb.trim()) {
+                  this.opts.addMessage({ role: 'assistant', content: partialCb });
+                  const pcb = this.opts.getConversation();
+                  await db.saveConversationMessage(sessionId, pcb[pcb.length - 1]);
+                  leaderLogger.info(`Leader CB OPEN 重请求：已抢救 partial content (${partialCb.length} chars)`);
                 }
                 return { type: 'continue' };
               }
@@ -895,6 +938,30 @@ export class LeaderThinkingEngine {
               const classified = classifyLLMError(error);
               const errorLabel = formatLLMErrorLabel(classified);
               const retryCount = llmGuard.getRetryCount();
+
+              // === 超时错误：LlmGuard 已不重试直接抛出。走 ESC 中断语义：不注入错误消息、
+              // 不累加外层重试计数，直接 continue 让主循环重新发起 LLM 请求。
+              // CircuitBreaker 已在 LlmGuard 内累积失败计数，持续超时最终熔断走 CircuitOpenError 停下。
+              if (
+                classified.llmErrorKind === 'request_timeout' ||
+                classified.llmErrorKind === 'connect_timeout' ||
+                classified.llmErrorKind === 'stream_timeout'
+              ) {
+                leaderLogger.warn(`Leader LLM 超时 (${errorLabel})，中断当前轮次并重新请求`);
+                emitter.emit('leader:status', {
+                  sessionId,
+                  status: `⏱️ LLM 超时，重新请求中...`,
+                });
+                // 抢救 partial content
+                const partialTimeout = (error as unknown as Record<string, unknown>).partialContent;
+                if (typeof partialTimeout === 'string' && partialTimeout.trim()) {
+                  this.opts.addMessage({ role: 'assistant', content: partialTimeout });
+                  const pc = this.opts.getConversation();
+                  await db.saveConversationMessage(sessionId, pc[pc.length - 1]);
+                  leaderLogger.info(`Leader 超时重请求：已抢救 partial content (${partialTimeout.length} chars)`);
+                }
+                return { type: 'continue' };
+              }
 
               // 打印完整错误详情（含堆栈）
               const rawDetail = error instanceof Error
@@ -910,6 +977,14 @@ export class LeaderThinkingEngine {
                 const ctxMgr = this.opts.contextManager;
                 const tokens = await ctxMgr.getTokenCount().catch(() => 0);
                 const threshold = ctxMgr.getThreshold();
+                // 安全阀：如果 token 远低于阈值（<50%），说明可能是误分类
+                // （如消息格式错误被当作 overflow）。此时不压缩，直接抛错。
+                if (threshold > 0 && tokens < threshold * 0.5) {
+                  leaderLogger.warn(
+                    `Leader 收到 context_overflow 但 token 使用率很低 (${tokens}/${threshold} = ${Math.round(tokens / threshold * 100)}%)，疑似误分类，跳过压缩`,
+                  );
+                  throw classified;
+                }
                 leaderLogger.warn(
                   `Leader 收到 ${classified.statusCode ?? '?'} ${errorLabel}，先同步压缩再重试`,
                 );
@@ -984,6 +1059,14 @@ export class LeaderThinkingEngine {
                   sessionId,
                   status: `🛑 LLM 反复失败 (${errorLabel})：等待人工介入`,
                 });
+                // 抢救 partial content：LlmGuard 内部重试时可能已累积部分输出
+                const partialFinal = (error as unknown as Record<string, unknown>).partialContent;
+                if (typeof partialFinal === 'string' && partialFinal.trim()) {
+                  this.opts.addMessage({ role: 'assistant', content: partialFinal });
+                  const pfc = this.opts.getConversation();
+                  await db.saveConversationMessage(sessionId, pfc[pfc.length - 1]);
+                  leaderLogger.info(`Leader 外层重试耗尽终态：已抢救 partial content (${partialFinal.length} chars)`);
+                }
                 const stopMsg = `🛑 [系统终止] LLM 调用反复失败（${errorLabel}: ${classified.message}），外层已自动重试 ${outerRetry}/${outerMax} 次仍未恢复。请检查网络 / provider 状态后再继续。\n完整错误: ${rawDetail}`;
                 this.opts.addMessage({ role: 'system', content: stopMsg });
                 const c2 = this.opts.getConversation();

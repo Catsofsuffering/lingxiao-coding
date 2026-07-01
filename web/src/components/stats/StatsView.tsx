@@ -23,7 +23,7 @@ import {
   Activity, Timer, Hash, ArrowUpRight, ArrowDownRight, Database,
   Cpu, DollarSign,
 } from 'lucide-react';
-import { calculateCost, formatCost } from '../../utils/costCalculator';
+import { calculateCostDetailed, formatCost } from '../../utils/costCalculator';
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -61,6 +61,8 @@ interface ModelSummary {
   totalPrompt: number;
   totalCompletion: number;
   totalTokens: number;
+  cacheRead?: number;
+  cacheCreation?: number;
 }
 
 interface AgentStat {
@@ -71,6 +73,8 @@ interface AgentStat {
   totalPrompt: number;
   totalCompletion: number;
   totalTokens: number;
+  cacheRead?: number;
+  cacheCreation?: number;
 }
 
 interface ToolStat {
@@ -94,6 +98,10 @@ interface CostBreakdown {
   cacheReadCost: number;
   cacheCreationCost: number;
   totalCost: number;
+  /** 定价不可用，totalCost 为 0 */
+  pricingMissing?: boolean;
+  /** cache 子价被回退为 input — cache 段费用是估算 */
+  pricingPartial?: boolean;
 }
 
 interface CostSummary {
@@ -105,6 +113,10 @@ interface CostSummary {
   totalCost: number;
   cacheHitRate: number;
   cacheSavings: number;
+  /** 任一模型 cache 子价被回退为 input 价 */
+  pricingPartial?: boolean;
+  /** 任一模型完整定价缺失 */
+  pricingMissing?: boolean;
 }
 
 // ── 中国风配色常量 ────────────────────────────────────────────────────
@@ -941,7 +953,12 @@ function ModelsTab({ modelSummary, totalModelTokens, totalModelCalls, t }: Model
         <StatCard icon={<Brain className="w-4 h-4" />} label={t('stats.tab.models')} value={modelSummary.length} />
         <StatCard icon={<Activity className="w-4 h-4" />} label={t('stats.totalCalls')} value={totalModelCalls} />
         <StatCard icon={<Database className="w-4 h-4" />} label={t('stats.totalTokens')} value={formatTokens(totalModelTokens)} />
-        <StatCard icon={<DollarSign className="w-4 h-4" />} label={t('stats.totalCost')} value={formatCost(modelSummary.reduce((s, m) => s + calculateCost(m.name, { prompt: m.totalPrompt, completion: m.totalCompletion }), 0))} />
+        <StatCard
+          icon={<DollarSign className="w-4 h-4" />}
+          label={t('stats.totalCost')}
+          value={`~${formatCost(modelSummary.reduce((s, m) => s + calculateCostDetailed(m.name, { prompt: m.totalPrompt, completion: m.totalCompletion, cache_read: m.cacheRead, cache_creation: m.cacheCreation }).total, 0))}`}
+          sub="≈ estimated"
+        />
       </div>
 
       {/* Token 分布 — 双色堆叠条形图 */}
@@ -1006,7 +1023,9 @@ function ModelsTab({ modelSummary, totalModelTokens, totalModelCalls, t }: Model
                     <td className="px-4 py-2.5 text-right font-mono text-xs" style={{ color: CN_COLORS.purple }}>{formatTokens(m.totalPrompt)}</td>
                     <td className="px-4 py-2.5 text-right font-mono text-xs" style={{ color: CN_COLORS.green }}>{formatTokens(m.totalCompletion)}</td>
                     <td className="px-4 py-2.5 text-right text-accent-brand font-mono text-xs font-medium">{formatTokens(m.totalTokens)}</td>
-                    <td className="px-4 py-2.5 text-right text-accent-green font-mono text-xs">{formatCost(calculateCost(m.name, { prompt: m.totalPrompt, completion: m.totalCompletion }))}</td>
+                    <td className="px-4 py-2.5 text-right text-accent-green font-mono text-xs">
+                      {formatCost(calculateCostDetailed(m.name, { prompt: m.totalPrompt, completion: m.totalCompletion, cache_read: m.cacheRead, cache_creation: m.cacheCreation }).total)}
+                    </td>
                     <td className="px-4 py-2.5 text-right text-text-secondary font-mono text-xs">{pct.toFixed(1)}%</td>
                   </tr>
                 );
@@ -1045,7 +1064,12 @@ function AgentsTab({ agentStats, aggregatedAgents, totalAgentTokens, heatmapAgen
         <StatCard icon={<Bot className="w-4 h-4" />} label={t('stats.tab.agents')} value={aggregatedAgents.length} />
         <StatCard icon={<Cpu className="w-4 h-4" />} label={t('stats.modelsUsed')} value={new Set(agentStats.map(a => a.modelName)).size} />
         <StatCard icon={<Database className="w-4 h-4" />} label={t('stats.totalTokens')} value={formatTokens(totalAgentTokens)} />
-        <StatCard icon={<DollarSign className="w-4 h-4" />} label={t('stats.totalCost')} value={formatCost(agentStats.reduce((s, a) => s + calculateCost(a.modelName, { prompt: a.totalPrompt, completion: a.totalCompletion }), 0))} />
+        <StatCard
+          icon={<DollarSign className="w-4 h-4" />}
+          label={t('stats.totalCost')}
+          value={`~${formatCost(agentStats.reduce((s, a) => s + calculateCostDetailed(a.modelName, { prompt: a.totalPrompt, completion: a.totalCompletion, cache_read: a.cacheRead, cache_creation: a.cacheCreation }).total, 0))}`}
+          sub="≈ estimated"
+        />
       </div>
 
       {/* Agent token 甜甜圈图 */}
@@ -1108,7 +1132,9 @@ function AgentsTab({ agentStats, aggregatedAgents, totalAgentTokens, heatmapAgen
                   <td className="px-4 py-2.5 text-right font-mono text-xs" style={{ color: CN_COLORS.purple }}>{formatTokens(a.totalPrompt)}</td>
                   <td className="px-4 py-2.5 text-right font-mono text-xs" style={{ color: CN_COLORS.green }}>{formatTokens(a.totalCompletion)}</td>
                   <td className="px-4 py-2.5 text-right text-accent-brand font-mono text-xs font-medium">{formatTokens(a.totalTokens)}</td>
-                  <td className="px-4 py-2.5 text-right text-accent-green font-mono text-xs">{formatCost(calculateCost(a.modelName, { prompt: a.totalPrompt, completion: a.totalCompletion }))}</td>
+                  <td className="px-4 py-2.5 text-right text-accent-green font-mono text-xs">
+                    {formatCost(calculateCostDetailed(a.modelName, { prompt: a.totalPrompt, completion: a.totalCompletion, cache_read: a.cacheRead, cache_creation: a.cacheCreation }).total)}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -1226,9 +1252,51 @@ function CostTab({ costSummary, t }: CostTabProps) {
 
   return (
     <div className="p-4 space-y-5">
+      {/* Pricing status banner — 避免 CostTab 把 partial/missing 数据伪精确呈现 */}
+      {costSummary.pricingMissing && (
+        <div
+          data-testid="cost-pricing-missing"
+          className="flex items-start gap-2 rounded-md border border-accent-red/40 bg-accent-red/5 px-3 py-2 text-xs text-accent-red"
+        >
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-medium">Pricing unavailable for some models</div>
+            <div className="text-accent-red/80 mt-0.5">
+              Totals are incomplete: cost is shown as $0 for models without pricing. Set <code className="font-mono text-[10px]">model_providers.&lt;provider&gt;.pricing</code> to enable.
+            </div>
+          </div>
+        </div>
+      )}
+      {!costSummary.pricingMissing && costSummary.pricingPartial && (
+        <div
+          data-testid="cost-pricing-partial"
+          className="flex items-start gap-2 rounded-md border border-accent-yellow/40 bg-accent-yellow/5 px-3 py-2 text-xs text-accent-yellow/90"
+        >
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-medium">≈ Partial pricing — cache segment is estimated</div>
+            <div className="text-accent-yellow/80 mt-0.5">
+              One or more models are missing cache read/write sub-prices. Cache cost is approximated using the input rate, so the cache savings may be understated.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top-level cost cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <StatCard icon={<DollarSign className="w-4 h-4" />} label="Total cost" value={formatCost(costSummary.totalCost)} sub={`${costSummary.models.length} models`} accent="text-accent-green" />
+        <StatCard
+          icon={<DollarSign className="w-4 h-4" />}
+          label="Total cost"
+          value={costSummary.pricingMissing ? formatCost(0) : `~${formatCost(costSummary.totalCost)}`}
+          sub={
+            costSummary.pricingMissing
+              ? 'pricing unavailable'
+              : costSummary.pricingPartial
+                ? `≈ partial · ${costSummary.models.length} models`
+                : `${costSummary.models.length} models`
+          }
+          accent={costSummary.pricingMissing ? 'text-accent-red' : costSummary.pricingPartial ? 'text-accent-yellow' : 'text-accent-green'}
+        />
         <StatCard icon={<Database className="w-4 h-4" />} label="Cache hit rate" value={`${costSummary.cacheHitRate.toFixed(1)}%`} sub={`${formatTokens(costSummary.totalCacheReadTokens)} cache reads`} accent={costSummary.cacheHitRate >= 30 ? 'text-accent-green' : costSummary.cacheHitRate >= 10 ? 'text-accent-yellow' : 'text-text-tertiary'} />
         <StatCard icon={<ArrowDownRight className="w-4 h-4" />} label="Cache savings" value={formatCost(costSummary.cacheSavings)} sub={costSummary.totalCost > 0 ? `${((costSummary.cacheSavings / (costSummary.totalCost + costSummary.cacheSavings)) * 100).toFixed(1)}% off` : undefined} accent="text-accent-green" />
         <StatCard icon={<Hash className="w-4 h-4" />} label="Tokens (in/out)" value={`${formatTokens(costSummary.totalInputTokens)} / ${formatTokens(costSummary.totalOutputTokens)}`} sub={`+${formatTokens(costSummary.totalCacheCreationTokens)} cache write`} />
@@ -1282,6 +1350,22 @@ function CostTab({ costSummary, t }: CostTabProps) {
                       {m.cacheReadTokens > 0 && (
                         <span className="ml-2 text-[10px] text-accent-green">{hitRate.toFixed(0)}% cached</span>
                       )}
+                      {m.pricingPartial && (
+                        <span
+                          className="ml-2 text-[10px] px-1 rounded-sm border border-accent-yellow/40 text-accent-yellow bg-accent-yellow/5"
+                          title="Cache read/write sub-price missing — cache segment cost is estimated using input rate"
+                        >
+                          ≈ partial
+                        </span>
+                      )}
+                      {m.pricingMissing && (
+                        <span
+                          className="ml-2 text-[10px] px-1 rounded-sm border border-accent-red/40 text-accent-red bg-accent-red/5"
+                          title="Pricing unavailable — total is $0"
+                        >
+                          pricing n/a
+                        </span>
+                      )}
                     </td>
                     <td className="px-4 py-2.5 text-right font-mono text-xs" style={{ color: CN_COLORS.purple }}>
                       {formatTokens(m.netInputTokens)}
@@ -1299,7 +1383,16 @@ function CostTab({ costSummary, t }: CostTabProps) {
                       {formatTokens(m.cacheCreationTokens)}
                       <div className="text-[10px] text-text-tertiary">{formatCost(m.cacheCreationCost)}</div>
                     </td>
-                    <td className="px-4 py-2.5 text-right text-accent-brand font-mono text-xs font-medium">{formatCost(m.totalCost)}</td>
+                    <td className="px-4 py-2.5 text-right text-accent-brand font-mono text-xs font-medium">
+                      {m.pricingMissing ? (
+                        <span className="text-text-tertiary" title="Pricing unavailable">—</span>
+                      ) : (
+                        <>
+                          <span aria-hidden>~</span>
+                          {formatCost(m.totalCost)}
+                        </>
+                      )}
+                    </td>
                   </tr>
                 );
               })}

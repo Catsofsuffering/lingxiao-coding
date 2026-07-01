@@ -271,7 +271,9 @@ const AgentsGroupSchema = z.object({
   permission_timeout_ms: z.number().default(D.AGENT.PERMISSION_TIMEOUT_MS),
   tool_result_max_chars: z.number().default(D.AGENT.TOOL_RESULT_MAX_CHARS),
   max_conversation_messages: z.number().default(D.AGENT.MAX_CONVERSATION_MESSAGES),
+  max_conversation_bytes: z.number().int().positive().default(D.AGENT.MAX_CONVERSATION_BYTES),
   max_agent_messages: z.number().default(D.AGENT.MAX_AGENT_MESSAGES),
+  max_agent_messages_bytes: z.number().int().positive().default(D.AGENT.MAX_AGENT_MESSAGES_BYTES),
   max_continuation_depth: z.number().default(D.AGENT.MAX_CONTINUATION_DEPTH),
   worker_completion_judge_enabled: z.boolean().default(false),
   external_agents_enabled: z.boolean().default(D.AGENT.EXTERNAL_AGENTS_ENABLED),
@@ -293,6 +295,7 @@ const VerificationGroupSchema = z.object({
 const LeaderGroupSchema = z.object({
   max_tool_rounds: z.number().default(D.LEADER.MAX_TOOL_ROUNDS),
   max_runtime_minutes: z.number().default(D.LEADER.MAX_RUNTIME_MINUTES),
+  round_timeout_ms: z.number().default(D.LEADER.ROUND_TIMEOUT_MS),
   probe_silence_seconds: z.number().default(D.LEADER.PROBE_SILENCE_SECONDS),
   probe_max_interval_seconds: z.number().default(D.LEADER.PROBE_MAX_INTERVAL_SECONDS),
   probe_backoff_multiplier: z.number().default(D.LEADER.PROBE_BACKOFF_MULTIPLIER),
@@ -619,7 +622,7 @@ const NetworkGroupSchema = z.object({
 });
 
 const SecurityGroupSchema = z.object({
-  permission_mode: z.enum(['strict', 'dev', 'networked', 'yolo']).default('yolo'),
+  permission_mode: z.enum(['strict', 'dev', 'networked', 'yolo']).default('dev'),
   auto_allow_bash_if_sandboxed: z.boolean().default(true),
   dangerous_command_guard: z.boolean().default(false),
   block_private_network: z.boolean().default(false),
@@ -627,7 +630,6 @@ const SecurityGroupSchema = z.object({
    * 身份/系统提示探测的 LLM 二次判定。默认关闭，避免每次模糊安全判定额外消耗
    * 一次模型请求；关闭时仅使用硬规则拦截明确的系统提示/隐藏指令探测。
    */
-  identity_judge_llm_enabled: z.boolean().default(false),
   /**
    * 企业内网加固模式总开关（默认 false，现状零改动）。
    * 开启后一键收紧子进程 env 透传、沙箱绑定、SSRF/私网防护、危险命令守卫、
@@ -671,11 +673,11 @@ const MemoryGroupSchema = z.object({
   }),
   // /distill 资产提炼：会话回溯天数、独立自动触发间隔（mimo=30天）。
   distill: z.object({
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().default(false),
     auto_interval_days: z.number().int().positive().default(30),
     session_lookback_days: z.number().int().positive().default(14),
   }).default({
-    enabled: true,
+    enabled: false,
     auto_interval_days: 30,
     session_lookback_days: 14,
   }),
@@ -710,11 +712,15 @@ const MemoryGroupSchema = z.object({
 });
 
 const CheckpointGroupSchema = z.object({
-  file_checkpointing_enabled: z.boolean().default(true),
+  /** 默认关闭：shadow git 快照在大工作区会反复全量入库并触发 gc，撑爆磁盘
+   *  （历史 bug：~/.lingxiao/checkpoints 下堆积 10GB+ 的 tmp_pack）。
+   *  需要 /rewind 代码回退能力的用户可手动开启。 */
+  file_checkpointing_enabled: z.boolean().default(false),
   /** 每个项目 shadow git 仓库保留的最大 commit 数量，超出时自动裁剪旧快照 */
   max_checkpoints: z.number().int().min(5).default(50),
-  /** 是否自动对 shadow git 仓库执行 gc --prune=now 回收磁盘空间 */
-  auto_gc_enabled: z.boolean().default(true),
+  /** 默认关闭：自动 gc 即使不带 --aggressive 也可能在大库产生巨大临时 pack。
+   *  开启时走温和的 git gc --auto，并在 gc 前清理遗留 tmp_pack。 */
+  auto_gc_enabled: z.boolean().default(false),
   /** 工作目录文件数安全上限，超过此值时拒绝做快照（防止对系统目录/主目录爆炸） */
   max_workspace_files: z.number().int().min(1000).default(100_000),
 });
@@ -728,7 +734,8 @@ const UiGroupSchema = z.object({
 const AdvancedGroupSchema = z.object({
   cleanup_period_days: z.number().default(30),
   image_history_retain_rounds: z.number().min(1).default(2),
-  defer_tool_loading: z.boolean().default(false),
+  tool_result_retain_rounds: z.number().min(1).default(50),
+  defer_tool_loading: z.boolean().default(true),
   ignore_gitignore: z.boolean().default(false),
   hook_output_collapsed: z.boolean().default(true),
   env: z.record(z.string(), z.string()).default({}),
@@ -737,6 +744,7 @@ const AdvancedGroupSchema = z.object({
 const MessageBusGroupSchema = z.object({
   warning_threshold: z.number().default(D.MESSAGE_BUS.WARNING_THRESHOLD),
   critical_threshold: z.number().default(D.MESSAGE_BUS.CRITICAL_THRESHOLD),
+  max_history_bytes: z.number().int().positive().default(D.MESSAGE_BUS.MAX_HISTORY_BYTES),
 });
 
 const LangfuseConfigSchema = z.object({
@@ -816,6 +824,7 @@ const BlackboardGroupSchema = z.object({
   enabled: z.boolean().default(D.BLACKBOARD.ENABLED),
   max_nodes: z.number().int().positive().default(D.BLACKBOARD.MAX_GRAPH_NODES),
   max_edges: z.number().int().positive().default(D.BLACKBOARD.MAX_GRAPH_EDGES),
+  max_node_content_chars: z.number().int().positive().default(D.BLACKBOARD.MAX_NODE_CONTENT_CHARS),
 });
 
 /**
@@ -841,6 +850,22 @@ const RolesGroupSchema = z.object({
 export type RoleOverrideConfig = z.infer<typeof RoleOverrideSchema>;
 export type RolesGroupConfig = z.infer<typeof RolesGroupSchema>;
 
+/**
+ * Prompts group — 系统 prompt override 管理
+ *
+ * 允许用户自定义 Leader 和 worker 角色的系统提示词。
+ * overrides 是一个 key→content 的映射，key 格式：
+ *   - leader_solo / leader_team / leader_workflow
+ *   - research / explore / coding / verify / review / frontend / backend / fullstack / qa / ux_designer / planner / evaluator / architect
+ * 运行时：worker prompts 在 collectBuiltinRoles 时覆盖 zh/en 两个 locale；
+ * Leader prompts 在 getSystemPrompt() 中按 profile 检查。
+ */
+const PromptsGroupSchema = z.object({
+  overrides: z.record(z.string(), z.string()).default({}),
+});
+
+export type PromptsGroupConfig = z.infer<typeof PromptsGroupSchema>;
+
 const CONFIG_DEFAULT_GROUPS = [
   'llm',
   'llm_gateway',
@@ -858,6 +883,7 @@ const CONFIG_DEFAULT_GROUPS = [
   'mcp',
   'tools',
   'roles',
+  'prompts',
   'server',
   'network',
   'security',
@@ -985,6 +1011,7 @@ export const ConfigSchema = z.preprocess(withDefaultConfigGroups, z.object({
   mcp: McpGroupSchema.default({ enabled: true, servers: [], tool_timeout_ms: 60_000 }),
   tools: ToolsGroupSchema.default({ user_defined: [], disabled_names: [], execution_timeout_ms: D.TOOLS.EXECUTION_TIMEOUT_MS }),
   roles: RolesGroupSchema.default({ basic_tools_enabled: true, overrides: {} }),
+  prompts: PromptsGroupSchema.default({ overrides: {} }),
   server: ServerGroupSchema,
   network: NetworkGroupSchema.default({ user_agent: D.NETWORK.USER_AGENT, proxy: DEFAULT_NETWORK_PROXY }),
   browser: BrowserGroupSchema.default({ daemon: false }),
@@ -1012,7 +1039,8 @@ export const ConfigSchema = z.preprocess(withDefaultConfigGroups, z.object({
   advanced: AdvancedGroupSchema.default({
     cleanup_period_days: 30,
     image_history_retain_rounds: 2,
-    defer_tool_loading: false,
+    tool_result_retain_rounds: 50,
+    defer_tool_loading: true,
     ignore_gitignore: false,
     hook_output_collapsed: true,
     env: {},
@@ -1040,6 +1068,8 @@ const ENV_OVERRIDE_MAP: EnvMapping[] = [
   { env: 'LINGXIAO_MAX_CONCURRENT_AGENTS', path: 'agents.max_concurrent', type: 'number' },
   { env: 'LINGXIAO_AGENT_MAX_ITERATIONS', path: 'agents.max_iterations', type: 'number' },
   { env: 'LINGXIAO_AGENT_MAX_RUNTIME_MINUTES', path: 'agents.max_runtime_minutes', type: 'number' },
+  { env: 'LINGXIAO_MAX_CONVERSATION_BYTES', path: 'agents.max_conversation_bytes', type: 'number' },
+  { env: 'LINGXIAO_MAX_AGENT_MESSAGES_BYTES', path: 'agents.max_agent_messages_bytes', type: 'number' },
   { env: 'LINGXIAO_WORKER_COMPLETION_JUDGE', path: 'agents.worker_completion_judge_enabled', type: 'boolean' },
   { env: 'LINGXIAO_VERIFICATION_COMPLETION_GATE', path: 'verification.completion_gate_enabled', type: 'boolean' },
   { env: 'LINGXIAO_VERIFICATION_TYPECHECK', path: 'verification.typecheck', type: 'boolean' },
@@ -1051,6 +1081,7 @@ const ENV_OVERRIDE_MAP: EnvMapping[] = [
   { env: 'LINGXIAO_REMOTE_WORKERS_ENABLED', path: 'scaling.remoteWorkers.enabled', type: 'boolean' },
   { env: 'LINGXIAO_LEADER_MAX_TOOL_ROUNDS', path: 'leader.max_tool_rounds', type: 'number' },
   { env: 'LINGXIAO_LEADER_MAX_RUNTIME_MINUTES', path: 'leader.max_runtime_minutes', type: 'number' },
+  { env: 'LINGXIAO_LEADER_ROUND_TIMEOUT_MS', path: 'leader.round_timeout_ms', type: 'number' },
   { env: 'LINGXIAO_LEADER_PROBE_SILENCE_SECONDS', path: 'leader.probe_silence_seconds', type: 'number' },
   { env: 'LINGXIAO_LEADER_PROBE_MAX_INTERVAL_SECONDS', path: 'leader.probe_max_interval_seconds', type: 'number' },
   { env: 'LINGXIAO_LEADER_PROBE_BACKOFF_MULTIPLIER', path: 'leader.probe_backoff_multiplier', type: 'number' },
@@ -1069,11 +1100,13 @@ const ENV_OVERRIDE_MAP: EnvMapping[] = [
   { env: 'LINGXIAO_WEB_PORT', path: 'server.port', type: 'number' },
   { env: 'LINGXIAO_WEB_HOST', path: 'server.host', type: 'string' },
   { env: 'LINGXIAO_BLACKBOARD', path: 'blackboard.enabled', type: 'boolean' },
+  { env: 'LINGXIAO_BLACKBOARD_MAX_NODES', path: 'blackboard.max_nodes', type: 'number' },
+  { env: 'LINGXIAO_BLACKBOARD_MAX_EDGES', path: 'blackboard.max_edges', type: 'number' },
+  { env: 'LINGXIAO_BLACKBOARD_MAX_NODE_CONTENT_CHARS', path: 'blackboard.max_node_content_chars', type: 'number' },
   { env: 'LINGXIAO_PROXY_URL', path: 'network.proxy.url', type: 'string' },
   { env: 'LINGXIAO_PROXY_LLM', path: 'network.proxy.llm_enabled', type: 'boolean' },
   { env: 'LINGXIAO_PROXY_TOOLS', path: 'network.proxy.tools_enabled', type: 'boolean' },
   { env: 'LINGXIAO_USER_AGENT', path: 'network.user_agent', type: 'string' },
-  { env: 'LINGXIAO_IDENTITY_JUDGE_LLM', path: 'security.identity_judge_llm_enabled', type: 'boolean' },
   // 企业部署：运维可经 env 单向强制开启加固模式（不能经 Web UI 关闭，锁定逻辑见 HardeningPolicy）
   { env: 'LINGXIAO_HARDENED_MODE', path: 'security.hardened_mode', type: 'boolean' },
 ];
@@ -1456,6 +1489,19 @@ export function saveSettings(cfg: Config): void {
   }
 }
 
+/**
+ * 动态更新配置并持久化到 settings.json。
+ * 用于运行时修改配置（如 Web UI 开关）。
+ */
+export async function updateConfig(partial: Partial<Config>): Promise<void> {
+  const current = loadSettings();
+  const merged = { ...current, ...partial };
+  saveSettings(merged);
+  // 刷新全局 config 对象
+  Object.assign(config, merged);
+  fireConfigReload();
+}
+
 export function generateDefaultSettings(): void {
   if (existsSync(SETTINGS_FILE)) {
     configLogger.info(`[Config] settings.json 已存在，跳过自动生成 (${SETTINGS_FILE})`);
@@ -1476,10 +1522,55 @@ export function generateDefaultSettings(): void {
 
 export const config = loadSettings();
 
+/**
+ * 原始（未填 schema 默认值）的 llm 配置快照。
+ * 用于区分「用户显式设定」与「schema 默认值」——例如 thinking_budget_tokens
+ * 的 schema 默认 32000 不应覆盖用户配置的 reasoning_effort 强度档位。
+ * 仅记录 settings.json + env 覆盖后真实出现的键。
+ */
+const rawLlmConfig: Record<string, unknown> = (() => {
+  try {
+    let raw: Record<string, unknown> = {};
+    if (existsSync(SETTINGS_FILE)) {
+      raw = JSON.parse(readFileSync(SETTINGS_FILE, 'utf-8'));
+    }
+    for (const group of ['llm']) {
+      if (!raw[group]) raw[group] = {};
+    }
+    raw = applyEnvOverrides(raw);
+    const llm = raw.llm;
+    return (llm && typeof llm === 'object' && !Array.isArray(llm))
+      ? llm as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+})();
+
+/**
+ * 判断某个 llm.* 配置键是否被用户显式设定（settings.json 或环境变量），
+ * 而非来自 ConfigSchema 的默认值。用于让用户配置优先生效、避免 schema
+ * 默认值静默覆盖更高优先级的语义（如 reasoning_effort 强度档位）。
+ */
+export function isLlmConfigUserSet(path: string): boolean {
+  const keys = path.split('.').filter(Boolean);
+  if (keys[0] === 'llm') keys.shift();
+  let current: unknown = rawLlmConfig;
+  for (const key of keys) {
+    if (current === null || current === undefined || typeof current !== 'object') return false;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current !== undefined;
+}
+
 export function refreshRuntimeConfig(): Config {
   const latest = loadSettings();
-  // 深拷贝避免嵌套对象引用不一致
-  const fresh = structuredClone(latest);
+  // 浅拷贝顶层 + 针对性深拷贝已知可变嵌套对象，替代 structuredClone 全量深拷贝
+  const fresh = { ...latest } as Config;
+  // 针对性深拷贝嵌套可变对象
+  if (latest.llm) fresh.llm = structuredClone(latest.llm);
+  if (latest.mcp) fresh.mcp = structuredClone(latest.mcp);
+  if (latest.agents) fresh.agents = structuredClone(latest.agents);
   for (const key of Object.keys(config) as (keyof Config)[]) {
     delete config[key];
   }
@@ -1571,6 +1662,7 @@ export let AGENT_MAX_ITERATIONS = config.agents.max_iterations;
 export let AGENT_MAX_RUNTIME_MINUTES = config.agents.max_runtime_minutes;
 export let LEADER_MAX_TOOL_ROUNDS = config.leader.max_tool_rounds;
 export let LEADER_MAX_RUNTIME_MINUTES = config.leader.max_runtime_minutes;
+export let LEADER_ROUND_TIMEOUT_MS = config.leader.round_timeout_ms;
 export let LEADER_PROBE_SILENCE_SECONDS = config.leader.probe_silence_seconds;
 export let LEADER_PROBE_MAX_INTERVAL_SECONDS = config.leader.probe_max_interval_seconds;
 export let LEADER_PROBE_BACKOFF_MULTIPLIER = config.leader.probe_backoff_multiplier;
@@ -1579,7 +1671,9 @@ export let PLAN_REVIEW_ENABLED = config.leader.plan_review_enabled;
 export let ENABLE_STREAMING = config.llm.enable_streaming;
 export let ENABLE_THINKING_INSTRUCTION = config.llm.enable_thinking_instruction;
 export let MAX_CONVERSATION_MESSAGES = config.agents.max_conversation_messages;
+export let MAX_CONVERSATION_BYTES = config.agents.max_conversation_bytes;
 export let MAX_AGENT_MESSAGES = config.agents.max_agent_messages;
+export let MAX_AGENT_MESSAGES_BYTES = config.agents.max_agent_messages_bytes;
 export let HEALTH_POLL_INTERVAL_SECONDS = config.health.poll_interval_seconds;
 export let HEALTH_STALL_THRESHOLD_SECONDS = config.health.stall_threshold_seconds;
 export let HEALTH_STUCK_THRESHOLD_SECONDS = config.health.stuck_threshold_seconds;
@@ -1599,6 +1693,7 @@ export function syncDerivedConstants(): void {
   AGENT_MAX_RUNTIME_MINUTES = config.agents.max_runtime_minutes;
   LEADER_MAX_TOOL_ROUNDS = config.leader.max_tool_rounds;
   LEADER_MAX_RUNTIME_MINUTES = config.leader.max_runtime_minutes;
+  LEADER_ROUND_TIMEOUT_MS = config.leader.round_timeout_ms;
   LEADER_PROBE_SILENCE_SECONDS = config.leader.probe_silence_seconds;
   LEADER_PROBE_MAX_INTERVAL_SECONDS = config.leader.probe_max_interval_seconds;
   LEADER_PROBE_BACKOFF_MULTIPLIER = config.leader.probe_backoff_multiplier;
@@ -1607,7 +1702,11 @@ export function syncDerivedConstants(): void {
   ENABLE_STREAMING = config.llm.enable_streaming;
   ENABLE_THINKING_INSTRUCTION = config.llm.enable_thinking_instruction;
   MAX_CONVERSATION_MESSAGES = config.agents.max_conversation_messages;
+  MAX_CONVERSATION_BYTES = config.agents.max_conversation_bytes;
   MAX_AGENT_MESSAGES = config.agents.max_agent_messages;
+  MAX_AGENT_MESSAGES_BYTES = config.agents.max_agent_messages_bytes;
+  // AGENT_TOOL_RESULT_MAX_CHARS 不需要 syncDerivedConstants —— BaseAgentRuntime 直接读 runtimeConfig.agents.tool_result_max_chars，
+  // 配置热加载后 runtimeConfig 对象原地更新，下一轮工具调用自动生效。
   HEALTH_POLL_INTERVAL_SECONDS = config.health.poll_interval_seconds;
   HEALTH_STALL_THRESHOLD_SECONDS = config.health.stall_threshold_seconds;
   HEALTH_STUCK_THRESHOLD_SECONDS = config.health.stuck_threshold_seconds;

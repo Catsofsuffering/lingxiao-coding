@@ -94,6 +94,9 @@ export async function processToolCallResponse<TDone extends { done: boolean; res
       tool_calls: toolCalls,
       ...(thinking && thinking.length > 0 ? { thinking } : {}),
     };
+    // ⚠️ 关键：persistAssistantMessage 会立即把 assistant 加入内存 conversation，
+    // 即使数据库还没写入。如果后续流程异常/中断，必须确保对应的 tool 结果也被补齐，
+    // 否则会导致 conversation 残缺（有 tool_calls 但无 tool 结果）→ provider 400 错误。
     await persistAssistantMessage(assistantMessage);
 
     for (const toolCall of toolCalls) {
@@ -102,6 +105,14 @@ export async function processToolCallResponse<TDone extends { done: boolean; res
 
     const executed = await executeToolCallsBatch(toolCalls);
     let earlyStop: TDone | null = null;
+
+    // ── 关键修复：先处理所有工具结果，最后才检查 shouldStop ──
+    // 原逻辑在每个工具结果后立即调用 shouldStopAfterToolResult()，
+    // 导致如果第一个工具触发了某个终止条件（如 agent completion），
+    // 后续工具的结果虽然已经执行完（executeToolCallsBatch 已 await），
+    // 但不会被持久化——造成"工具执行了但结果丢失"的现象。
+    //
+    // 修复：把 shouldStopAfterToolResult 移到循环外，确保所有结果都持久化后再判断终止。
     for (const { toolCall, result } of executed) {
       const renderedResult = transformToolResult(toolCall, result);
 
@@ -120,11 +131,12 @@ export async function processToolCallResponse<TDone extends { done: boolean; res
       await persistToolMessage(toolMessage, toolCall, result, renderedResult);
       emitToolResult(toolCall, toolMessageContent);
       await afterToolResult?.(toolCall, result, renderedResult);
+    }
 
-      const stop = shouldStopAfterToolResult?.();
-      if (stop) {
-        earlyStop ??= stop;
-      }
+    // 所有工具结果处理完毕后，统一检查是否需要提前终止
+    const stop = shouldStopAfterToolResult?.();
+    if (stop) {
+      earlyStop = stop;
     }
 
     // earlyStop 存在时（无论 done true/false）都执行清理回调，

@@ -42,7 +42,7 @@ import {
 } from './types.js';
 import { classifyLLMError, createLLMError } from './errors.js';
 import { extractTokenUsage } from './usageExtractor.js';
-import { applyThinkingParams, supportsThinking, getThinkingParams } from './model_capabilities.js';
+import { applyThinkingParams, supportsThinking, getThinkingParams, toAnthropicEffort } from './model_capabilities.js';
 import { getInitialMaxTokens, getEscalatedMaxTokens, getModelOutputLimit } from './tokenLimits.js';
 import { createHeartbeatTimer } from './provider_runtime.js';
 import {
@@ -242,6 +242,15 @@ export class AnthropicContentGenerator implements ContentGenerator {
 
     applyThinkingParams(this.modelId, requestBody);
     this.clampThinkingBudget(requestBody);
+
+    // 2026-06-25 修复「思考强度未传递」：Anthropic 顶层 output_config.effort 是网关/远程
+    // 识别「思考强度档位」的唯一信号。旧实现只发 thinking.budget_tokens（预算），从不发
+    // effort，导致凌霄代理网关等远端显示「没有思考强度指定」——budget_tokens 是预算量纲、
+    // 不是强度档位，无法表达用户配置的 reasoning_effort（low/medium/high/xhigh/max）。
+    // 现在把用户 reasoning_effort 映射到 Anthropic 合法 effort（low|medium|high|max），
+    // 合并进 output_config。仅当 thinking 实际开启且能映射出合法档位时才下发，避免给
+    // 非思考请求或 adaptive/none 强度注入无意义字段。
+    this.applyOutputConfigEffort(requestBody);
 
     // 防漂移：推理/编排/判定调用默认采样温度 0(确定性解码)。
     // 注意：Anthropic extended thinking 开启时 API 强制要求 temperature=1，此时
@@ -619,17 +628,56 @@ export class AnthropicContentGenerator implements ContentGenerator {
     const thinking = requestBody.thinking as Record<string, unknown> | undefined;
     if (!thinking || thinking.type !== 'enabled') return;
 
-    const maxTokens = typeof requestBody.max_tokens === 'number'
+    // 2026-06-23 修复「思考预算被压扁」：旧实现只用本次请求的 max_tokens（默认上限仅
+    // 16384，见 CAPPED_MAX_TOKENS）来夹预算，导致高强度档位（xhigh=48000 / max=64000）
+    // 即便正确生成也会被 clamp 回 ~12k，等于变相关闭深度思考。
+    // 现在以「模型真实输出上限」作为 budget 的硬天花板，再以「本次请求 max_tokens」
+    // 保证可见输出有预留空间，两者取较宽松但仍安全的上界。
+    const requestMaxTokens = typeof requestBody.max_tokens === 'number'
       ? requestBody.max_tokens
-      : getModelOutputLimit(String(requestBody.model || ''));
+      : 0;
+    const modelOutputLimit = getModelOutputLimit(String(requestBody.model || ''));
     const currentBudget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : 0;
-    // 预留可见输出下限：max(1024, 25% of maxTokens)。旧的固定 `maxTokens - 1024` 在小 max_tokens
-    // （如 16384）下会把思考预算顶到几乎整个窗口，只剩 ~1024 给可见回答，输出被截断。
-    const outputReserve = Math.max(1_024, Math.floor(maxTokens * 0.25));
-    const maxBudget = Math.max(1_024, maxTokens - outputReserve);
+
+    // budget 不得超模型输出上限；同时给可见输出预留 max(1024, 25% 请求 max_tokens)。
+    // 当请求 max_tokens 较小（如 16384）时，仍允许 budget 上探到模型输出上限附近，
+    // 由 provider 侧自行约束（Anthropic 要求 budget_tokens < max_tokens，下面统一收敛）。
+    const reserveFromRequest = Math.max(1_024, Math.floor(requestMaxTokens * 0.25));
+    const maxBudgetFromRequest = requestMaxTokens > 0
+      ? Math.max(1_024, requestMaxTokens - reserveFromRequest)
+      : modelOutputLimit;
+    // Anthropic API 硬约束：budget_tokens 必须 < max_tokens。最终 budget 取
+    // min(用户/effort 预算, 请求级上限, 模型输出上限 - 1)，并兜底 ≥1024。
+    const maxBudget = Math.max(1_024, Math.min(maxBudgetFromRequest, modelOutputLimit - 1));
     if (!currentBudget || currentBudget > maxBudget) {
       requestBody.thinking = { ...thinking, budget_tokens: maxBudget };
     }
+  }
+
+  /**
+   * 把用户配置的 reasoning_effort 强度档位注入 Anthropic 顶层 output_config.effort。
+   *
+   * 背景（2026-06-25）：thinking.budget_tokens 只是「思考预算量纲」，不是「强度档位」。
+   * 凌霄代理网关及部分 Anthropic 兼容远端依据 output_config.effort 判定思考强度；
+   * 旧实现只发 budget_tokens 不发 effort → 远端显示「没有思考强度指定」。
+   *
+   * 仅当本次 thinking 实际开启（type=enabled 或 adaptive）时才下发 effort，
+   * 避免给非思考请求注入无意义字段。effort 档位映射见 toAnthropicEffort。
+   */
+  private applyOutputConfigEffort(requestBody: Record<string, unknown>): void {
+    const thinking = requestBody.thinking as Record<string, unknown> | undefined;
+    if (!thinking) return;
+    // 仅在 thinking 开启相关态下下发强度：enabled（显式预算）/ adaptive（自适应）。
+    // disabled / 未配置时不发 effort，避免误导远端开启思考。
+    if (thinking.type !== 'enabled' && thinking.type !== 'adaptive') return;
+
+    const effort = String(getConfigValue('llm.reasoning_effort') || 'high');
+    const anthropicEffort = toAnthropicEffort(effort);
+    if (!anthropicEffort) return;
+
+    const existing =
+      isRecord(requestBody.output_config) ? requestBody.output_config as Record<string, unknown> : {};
+    requestBody.output_config = { ...existing, effort: anthropicEffort };
   }
 
   private getMaxOutputTokens(model: string, escalated = false): number {
@@ -746,7 +794,8 @@ export class AnthropicContentGenerator implements ContentGenerator {
         return [{ type: 'text', text: part.text }];
       }
       if (part.type === 'image_blob_ref') {
-        return [{ type: 'text', text: `[image stored as blob:${part.blob_id.slice(0, 12)}]` }];
+        const blobId = part.blob_id ?? 'unknown';
+        return [{ type: 'text', text: `[image stored as blob:${blobId.slice(0, 12)}]` }];
       }
       if (part.type === 'mcp_app') {
         return [{ type: 'text', text: part.title ? `[mcp-app: ${part.title}]` : '[mcp-app]' }];
@@ -859,10 +908,74 @@ export class AnthropicContentGenerator implements ContentGenerator {
       }
     }
 
-    // cache_control 策略
+    // ── Bedrock/Anthropic tool_result/tool_use 配对修复 ──────────────────────
+    // Bedrock 严格要求每个 user 消息中的 tool_result 数量不超过前一个 assistant 的 tool_use 数量。
+    // 历史消息损坏（压缩残留、resume 不完整、上游流截断）可能导致 mismatch。
+    // 在发送前做最终验证和修复，避免 TOOL_USE_RESULT_MISMATCH 400 错误。
+    for (let i = 1; i < anthropicMessages.length; i++) {
+      const msg = anthropicMessages[i];
+      if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
+      const toolResults = (msg.content as unknown as Array<Record<string, unknown>>).filter(b => b.type === 'tool_result');
+      if (toolResults.length === 0) continue;
+
+      // 找到前一个 assistant 消息
+      let prevAssistant: MessageParam | undefined;
+      for (let j = i - 1; j >= 0; j--) {
+        if (anthropicMessages[j].role === 'assistant') {
+          prevAssistant = anthropicMessages[j];
+          break;
+        }
+      }
+      if (!prevAssistant || !Array.isArray(prevAssistant.content)) continue;
+
+      const toolUseIds = new Set(
+        (prevAssistant.content as unknown as Array<Record<string, unknown>>)
+          .filter(b => b.type === 'tool_use')
+          .map(b => b.id as string),
+      );
+
+      // 只保留 tool_use_id 与前一个 assistant 的 tool_use 匹配的 tool_results
+      if (toolResults.length > toolUseIds.size) {
+        const filtered = (msg.content as unknown as Array<Record<string, unknown>>).filter(
+          b => b.type !== 'tool_result' || toolUseIds.has(b.tool_use_id as string),
+        );
+        if (filtered.length === 0) {
+          // 全部是孤儿 tool_results → 移除整个消息
+          anthropicMessages.splice(i, 1);
+          i--;
+        } else {
+          (msg as { content: unknown }).content = filtered;
+        }
+      }
+    }
+
+    // cache_control 策略：优先把断点放在最后一个稳定 system block。
+    // runtime/context manifest、memory、blackboard、mode hint 等 system 块会频繁变化，
+    // 如果盲目给最后一个 system block 打 cache_control，会把 volatile 内容纳入缓存前缀，
+    // 造成频繁 cache miss。没有稳定块时回退到历史行为。
     if (systemBlocks.length > 0) {
-      systemBlocks[systemBlocks.length - 1] = {
-        ...systemBlocks[systemBlocks.length - 1],
+      const isVolatileSystemBlock = (block: TextBlockParam): boolean => {
+        const text = typeof block.text === 'string' ? block.text : '';
+        return text.includes('slot=leader_runtime')
+          || text.includes('slot=leader_memory')
+          || text.includes('slot=leader_init')
+          || text.includes('slot=worker_runtime')
+          || text.includes('slot=worker_memory')
+          || text.trimStart().startsWith('## 黑板图分析（自动注入')
+          || text.includes('[Solo 模式]')
+          || text.includes('[Team 模式]')
+          || text.includes('[Execution preference]')
+          || text.includes('[执行偏好]');
+      };
+      let cacheSystemIndex = systemBlocks.length - 1;
+      for (let i = systemBlocks.length - 1; i >= 0; i -= 1) {
+        if (!isVolatileSystemBlock(systemBlocks[i])) {
+          cacheSystemIndex = i;
+          break;
+        }
+      }
+      systemBlocks[cacheSystemIndex] = {
+        ...systemBlocks[cacheSystemIndex],
         cache_control: CACHE_CONTROL_EPHEMERAL,
       };
     }

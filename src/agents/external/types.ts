@@ -1,5 +1,6 @@
 import type { ChildProcess } from 'child_process';
 import type { CoreExternalAgentStatus } from '../../contracts/adapters/StatusAdapter.js';
+import type { TokenUsageView } from '../../types/canonical.js';
 
 export type ExternalBackend = 'claude' | 'codex';
 
@@ -48,7 +49,7 @@ export type ExternalEvent =
   | { kind: 'thinking_delta'; text: string }
   | { kind: 'tool_call'; toolCallId: string; name: string; input?: unknown }
   | { kind: 'tool_result'; toolCallId: string; tool?: string; output: string; isError?: boolean }
-  | { kind: 'usage'; prompt: number; completion: number; total: number; cacheRead?: number; cacheCreation?: number }
+  | { kind: 'usage'; prompt: number; completion: number; total: number; cacheRead?: number; cacheCreation?: number; reasoning?: number }
   | { kind: 'complete'; result: string; durationMs?: number; modelUsage?: Record<string, unknown> }
   | { kind: 'error'; message: string; fatal: boolean };
 
@@ -100,6 +101,6 @@ export interface ExternalRunResult {
   stderrLogPath?: string;
   stdoutTail: string[];
   stderrTail: string[];
-  tokenUsage?: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number };
+  tokenUsage?: TokenUsageView;
   toolTrace?: ExternalArtifactTrace;
 }

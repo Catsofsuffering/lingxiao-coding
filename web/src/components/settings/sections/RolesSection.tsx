@@ -9,7 +9,7 @@ import { settingsApiFetch } from '../settingsApi';
 
 type JsonRecord = Record<string, unknown>;
 type RoleSource = 'preset' | 'custom';
-type CustomAgentScope = 'project' | 'global';
+type CustomAgentScope = 'project' | 'global' | 'runtime';
 type CustomAgentMode = 'create' | 'edit';
 
 interface RoleDefinitionMeta {
@@ -478,7 +478,10 @@ export function RolesSection() {
   const deleteCustomAgent = async (roleName: string, scope: CustomAgentScope) => {
     setBusyRole(roleName);
     try {
-      await settingsApiFetch(`/roles/custom/${encodeURIComponent(roleName)}?scope=${encodeURIComponent(scope)}`, {
+      const endpoint = scope === 'runtime'
+        ? `/roles/runtime/${encodeURIComponent(roleName)}`
+        : `/roles/custom/${encodeURIComponent(roleName)}?scope=${encodeURIComponent(scope)}`;
+      await settingsApiFetch(endpoint, {
         method: 'DELETE',
       });
       setRestartHint(true);
@@ -697,7 +700,13 @@ export function RolesSection() {
               const addableTools = knownTools.filter((tool) => !effectiveToolSet.has(tool));
               const selectedTool = toolDrafts[role.name] || addableTools[0] || '';
               const editableDefinition = role.source === 'custom' && role.definition?.editable;
-              const customScope: CustomAgentScope = role.definition?.source === 'global' ? 'global' : 'project';
+              const runtimeDefinition = role.source === 'custom' && role.definition?.source === 'runtime';
+              const deletableCustomRole = editableDefinition || runtimeDefinition;
+              const customScope: CustomAgentScope = role.definition?.source === 'global'
+                ? 'global'
+                : role.definition?.source === 'runtime'
+                  ? 'runtime'
+                  : 'project';
               return (
                 <div key={role.name} className="px-2 py-2.5">
                   <div className="flex items-start gap-3">
@@ -728,26 +737,26 @@ export function RolesSection() {
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
                       {editableDefinition && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => editCustomAgent(role)}
-                            disabled={busyRole === role.name}
-                            className="p-1 text-text-tertiary hover:text-accent-brand disabled:cursor-not-allowed disabled:opacity-40"
-                            title={t('settings.roles.agent.edit')}
-                          >
-                            <Pencil className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmAction({ kind: 'delete_agent', roleName: role.name, scope: customScope })}
-                            disabled={busyRole === role.name}
-                            className="p-1 text-text-tertiary hover:text-accent-red disabled:cursor-not-allowed disabled:opacity-40"
-                            title={t('settings.roles.agent.delete')}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </>
+                        <button
+                          type="button"
+                          onClick={() => editCustomAgent(role)}
+                          disabled={busyRole === role.name}
+                          className="p-1 text-text-tertiary hover:text-accent-brand disabled:cursor-not-allowed disabled:opacity-40"
+                          title={t('settings.roles.agent.edit')}
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                      {deletableCustomRole && (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmAction({ kind: 'delete_agent', roleName: role.name, scope: customScope })}
+                          disabled={busyRole === role.name}
+                          className="p-1 text-text-tertiary hover:text-accent-red disabled:cursor-not-allowed disabled:opacity-40"
+                          title={t('settings.roles.agent.delete')}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       )}
                       <button
                         type="button"

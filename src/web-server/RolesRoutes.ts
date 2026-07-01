@@ -3,6 +3,10 @@
  *
  *   GET    /api/v1/roles                列出所有角色（内置 + 自定义），含 tools / tier / 是否被 override
  *   GET    /api/v1/roles/basic-tools    返回默认基础工具集（read/write/搜索/python/shell/structured_patch）
+ *   POST   /api/v1/roles/custom         新增持久化 custom agent 文件
+ *   PUT    /api/v1/roles/custom/:name   更新持久化 custom agent 文件
+ *   DELETE /api/v1/roles/custom/:name   删除持久化 custom agent 文件
+ *   DELETE /api/v1/roles/runtime/:name  删除当前 active session 的 runtime 自定义角色
  *   PATCH  /api/v1/roles/settings       更新 settings.roles.basic_tools_enabled
  *   PATCH  /api/v1/roles/:name          更新某角色的 tools_added / tools_removed
  *   DELETE /api/v1/roles/:name/override 清空某角色的 override
@@ -10,8 +14,8 @@
  * 写入路径：runtimeConfig.roles → ConfigSchema.parse → saveSettings；
  * 同时给 emitter 抛 'roles:changed'，让 Leader/SessionManager 在下一次注册时拿到新值。
  *
- * 本路由"不"动态修改已经注册到 RoleRegistry 中的角色（避免运行时和已派活的 task 之间状态错位）；
- * 改动会在下一次 leader 启动 / session 创建时生效，前端需提示用户。
+ * 持久化 custom agent 文件与 tools override 的改动会通过 roles:changed 热加载或下一次 leader 启动生效；
+ * runtime 自定义角色删除只作用于当前 active session 的 RoleRegistry，并会同步 SESSION_KEYS.CUSTOM_ROLES。
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -43,6 +47,7 @@ import {
   validateAgentDefinitionName,
 } from '../agents/AgentDefinitionService.js';
 import { collectAvailableSkills, resolveDisabledSkillNames } from '../core/SkillCatalog.js';
+import { SESSION_KEYS } from '../core/SessionStateKeys.js';
 
 type ExternalAgentAvailabilityProvider = () => ExternalAgentAvailabilityLite;
 
@@ -108,6 +113,58 @@ function getActiveLeaderRoles(deps: RolesRoutesDeps): AgentRole[] | null {
     return registry?.listRoles?.() ?? null;
   } catch {/* expected: operation may fail gracefully */
     return null;
+  }
+}
+
+function deleteActiveRuntimeRole(deps: RolesRoutesDeps, roleName: string): { ok: true; removed: boolean; sessionId?: string } | { ok: false; status: number; error: string; message: string } {
+  if (!deps.sessionManager) {
+    return { ok: false, status: 409, error: 'no_active_session', message: 'No active session manager is available.' };
+  }
+  try {
+    const ids = deps.sessionManager.getActiveSessionIds();
+    if (ids.length === 0) {
+      return { ok: false, status: 404, error: 'no_active_session', message: 'No active session found.' };
+    }
+    const sessionId = ids[0];
+    const session = deps.sessionManager.getSession(sessionId);
+    const leader = session?.leader as {
+      getRoleRegistry?: () => {
+        get?: (name: string) => AgentRole | undefined;
+        unregister?: (name: string) => AgentRole | undefined;
+        toDict?: () => Record<string, AgentRole>;
+      };
+      board?: { getAllTasks?: () => Array<{ id: string; status: string; agent_type?: string }> };
+      db?: { setSessionState?: (sid: string, key: string, value: unknown) => unknown };
+    } | undefined;
+    const registry = leader?.getRoleRegistry?.();
+    if (!registry?.get || !registry.unregister || !registry.toDict) {
+      return { ok: false, status: 409, error: 'registry_unavailable', message: 'Active leader role registry is unavailable.' };
+    }
+    const role = registry.get(roleName);
+    if (!role) return { ok: true, removed: false, sessionId };
+    if (role.createdBy === 'system') {
+      return { ok: false, status: 400, error: 'preset_role', message: 'Preset roles cannot be deleted.' };
+    }
+    if (role.createdBy === 'user') {
+      return { ok: false, status: 400, error: 'file_backed_role', message: 'File-backed custom agents must be deleted via /roles/custom/:name.' };
+    }
+    const activeRefs = leader?.board?.getAllTasks?.()
+      .filter((task) => task.agent_type === roleName && task.status !== 'terminal')
+      .map((task) => `${task.id}:${task.status}`) ?? [];
+    if (activeRefs.length > 0) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'role_in_use',
+        message: `Runtime role is still referenced by non-terminal tasks: ${activeRefs.join(', ')}`,
+      };
+    }
+    const removed = registry.unregister(roleName);
+    if (!removed) return { ok: true, removed: false, sessionId };
+    leader?.db?.setSessionState?.(sessionId, SESSION_KEYS.CUSTOM_ROLES, JSON.stringify(registry.toDict()));
+    return { ok: true, removed: true, sessionId };
+  } catch (error) {
+    return { ok: false, status: 500, error: 'runtime_delete_failed', message: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -379,6 +436,24 @@ export function registerRolesRoutes(fastify: FastifyInstance, deps: RolesRoutesD
       reply.status(400);
       return { error: 'invalid_agent_definition', message: error instanceof Error ? error.message : String(error) };
     }
+  });
+
+  // ── DELETE /api/v1/roles/runtime/:name ──────────────────────
+  // 删除 define_agent_role/create_task(role_definition) 在当前 active session 中创建的临时角色。
+  fastify.delete<{ Params: { name: string } }>('/api/v1/roles/runtime/:name', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    const name = typeof request.params.name === 'string' ? request.params.name.trim() : '';
+    if (!name) {
+      reply.status(400);
+      return { error: 'invalid_role', message: 'role name required' };
+    }
+    const result = deleteActiveRuntimeRole(deps, name);
+    if (!result.ok) {
+      reply.status(result.status);
+      return { error: result.error, message: result.message };
+    }
+    if (result.removed) emitChange(deps, { action: 'runtime_role_deleted', name });
+    return { success: true, name, removed: result.removed, requiresRestart: false, sessionId: result.sessionId };
   });
 
   // ── PATCH /api/v1/roles/settings ─────────────────────────────

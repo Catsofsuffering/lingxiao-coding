@@ -96,6 +96,8 @@ export function addTokenUsage(acc: TokenUsage, usage?: Partial<TokenUsage>): Tok
     total: acc.total + (usage.total || 0),
     cache_read: (acc.cache_read ?? 0) + (usage.cache_read || 0),
     cache_creation: (acc.cache_creation ?? 0) + (usage.cache_creation || 0),
+    reasoning: (acc.reasoning ?? 0) + (usage.reasoning || 0),
+    credit: (acc.credit ?? 0) + (usage.credit || 0),
   };
 }
 
@@ -103,7 +105,7 @@ export function computeGlobalTokenUsage(
   agentConversations: Record<string, AgentConversation>,
   pendingTokens?: Record<string, TokenUsage>,
 ): TokenUsage {
-  let total: TokenUsage = { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
+  let total: TokenUsage = emptyTokenUsage();
   for (const conversation of Object.values(agentConversations)) {
     total = addTokenUsage(total, conversation.tokenUsage);
   }
@@ -114,7 +116,7 @@ export function computeGlobalTokenUsage(
 }
 
 export function emptyTokenUsage(): TokenUsage {
-  return { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
+  return { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 };
 }
 
 export function emptySessionRuntimeState(): Partial<SessionState> {
@@ -721,6 +723,77 @@ export function coerceEternalRuntimeSnapshot(raw: unknown): SessionRuntimeSnapsh
   };
 }
 
+function defaultCapabilityIntentProfile(): SessionRuntimeSnapshot['modes']['intentProfile'] {
+  return {
+    primaryIntent: 'diagnose',
+    scope: { kind: 'read_only' },
+    phase: 'understand',
+    grants: ['read'],
+    denies: ['write', 'shell', 'task', 'dispatch'],
+    requiredGates: ['confirm_before_write', 'confirm_before_command', 'confirm_before_dispatch', 'confirm_before_workflow_apply', 'confirm_before_scope_expansion'],
+    constraints: { maxRisk: 'low', requireEvidence: false },
+    confidence: 0,
+    reason: 'intent_profile_not_recorded',
+    turnId: null,
+    recordedAt: 0,
+    source: 'runtime_default',
+  };
+}
+
+function coerceStringArray(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim()) : [];
+}
+
+function coerceCapabilityIntentProfile(raw: unknown): SessionRuntimeSnapshot['modes']['intentProfile'] {
+  const record = asRecord(raw);
+  const scope = asRecord(record.scope);
+  const primaryIntent = stringValue(record.primaryIntent) as SessionRuntimeSnapshot['modes']['intentProfile']['primaryIntent'] | undefined;
+  const phase = stringValue(record.phase) as SessionRuntimeSnapshot['modes']['intentProfile']['phase'] | undefined;
+  const scopeKind = stringValue(scope.kind) as SessionRuntimeSnapshot['modes']['intentProfile']['scope']['kind'] | undefined;
+  const reason = stringValue(record.reason);
+  if (!primaryIntent || !phase || !scopeKind || !reason) return defaultCapabilityIntentProfile();
+  return {
+    primaryIntent,
+    scope: {
+      kind: scopeKind,
+      paths: coerceStringArray(scope.paths),
+      surfaces: coerceStringArray(scope.surfaces),
+      taskIds: coerceStringArray(scope.taskIds),
+      subsystemIds: coerceStringArray(scope.subsystemIds),
+      externalTargets: coerceStringArray(scope.externalTargets),
+    },
+    phase,
+    grants: coerceStringArray(record.grants) as SessionRuntimeSnapshot['modes']['intentProfile']['grants'],
+    denies: coerceStringArray(record.denies) as SessionRuntimeSnapshot['modes']['intentProfile']['denies'],
+    requiredGates: coerceStringArray(record.requiredGates) as SessionRuntimeSnapshot['modes']['intentProfile']['requiredGates'],
+    constraints: asRecord(record.constraints) as SessionRuntimeSnapshot['modes']['intentProfile']['constraints'],
+    confidence: Math.max(0, Math.min(1, numberValue(record.confidence) ?? 0)),
+    reason,
+    turnId: numberValue(record.turnId) ?? null,
+    recordedAt: numberValue(record.recordedAt) ?? 0,
+    source: stringValue(record.source) ?? 'record_capability_intent',
+  };
+}
+
+function coerceAutonomyDecisionTrace(raw: unknown): SessionRuntimeSnapshot['modes']['lastDecisionTrace'] {
+  const record = asRecord(raw);
+  const decision = asRecord(record.decision);
+  const toolName = stringValue(record.toolName);
+  const recordedAt = numberValue(record.recordedAt);
+  const gateResult = record.gateResult === 'allow' || record.gateResult === 'blocked' || record.gateResult === 'confirmation_required'
+    ? record.gateResult
+    : null;
+  if (!toolName || recordedAt === undefined || !gateResult || Object.keys(decision).length === 0) return null;
+  return {
+    toolName,
+    decision: decision as NonNullable<SessionRuntimeSnapshot['modes']['lastDecisionTrace']>['decision'],
+    gateResult,
+    gateKind: record.gateKind === 'forbidden' || record.gateKind === 'confirmation_required' ? record.gateKind : null,
+    recordedAt,
+    source: stringValue(record.source) ?? 'leader_tool_gate',
+  };
+}
+
 function coerceSessionModeRuntimeProjection(raw: unknown, leader: Record<string, unknown>): SessionRuntimeSnapshot['modes'] {
   const modes = asRecord(raw);
   const route = asRecord(modes.route);
@@ -754,6 +827,17 @@ function coerceSessionModeRuntimeProjection(raw: unknown, leader: Record<string,
     permission.mode === 'yolo'
       ? permission.mode
       : 'yolo';
+  const autonomy = modes.autonomy === 'review_first' || modes.autonomy === 'autonomous'
+    ? modes.autonomy
+    : 'balanced';
+  const intentProfile = coerceCapabilityIntentProfile(modes.intentProfile);
+  const lifecyclePhase = modes.lifecyclePhase === 'active' || modes.lifecyclePhase === 'recovery' || modes.lifecyclePhase === 'stable'
+    ? modes.lifecyclePhase
+    : 'bootstrap';
+  const modeGeneration = (() => {
+    const n = numberValue(modes.modeGeneration);
+    return n !== undefined && n >= 1 ? Math.trunc(n) : 1;
+  })();
 
   return {
     controlMode,
@@ -782,6 +866,13 @@ function coerceSessionModeRuntimeProjection(raw: unknown, leader: Record<string,
       summary: stringValue(permission.summary),
     },
     blueprint: (modes.blueprint ?? null) as ProjectBlueprint | null,
+    autonomy,
+    intentProfile,
+    lifecyclePhase,
+    modeGeneration,
+    policyId: stringValue(modes.policyId) ?? null,
+    policyHash: stringValue(modes.policyHash) ?? null,
+    lastDecisionTrace: coerceAutonomyDecisionTrace(modes.lastDecisionTrace),
   };
 }
 
@@ -826,6 +917,8 @@ export function coerceSessionRuntimeSnapshot(raw: unknown): SessionRuntimeSnapsh
       executionMode: stringValue(leader.executionMode),
       executionReason: stringValue(leader.executionReason),
       permissionSummary: stringValue(leader.permissionSummary),
+      leaderModel: stringValue(leader.leaderModel) || undefined,
+      agentModel: stringValue(leader.agentModel) || undefined,
     },
     pendingUserInput: Object.keys(pendingInput).length > 0
       ? { raw: pendingInput.raw, kind: pendingKind, preview: stringValue(pendingInput.preview) }
@@ -939,7 +1032,11 @@ export function applyRuntimeSnapshotPatch(
     if (!existing) {
       agentConversations[worker.agentId] = { agentId: worker.agentId, agentName: worker.name || worker.agentId, role: worker.roleType || 'worker', status: 'running', taskId: worker.taskId, messages: [] };
     } else {
-      agentConversations[worker.agentId] = { ...existing, agentName: existing.agentName || worker.name || worker.agentId, role: existing.role || worker.roleType || 'worker', status: mergeAgentStatus(existing.status, 'running') as AgentConversation['status'], taskId: existing.taskId ?? worker.taskId };
+      // runningWorkers is a backend liveness fact from the active AgentPool. It must
+      // override a stale optimistic terminal status left by stopAgent(); otherwise a
+      // stopped agent that is respawned keeps rendering as interrupted even though
+      // the runtime snapshot already proves it is running again.
+      agentConversations[worker.agentId] = { ...existing, agentName: existing.agentName || worker.name || worker.agentId, role: existing.role || worker.roleType || 'worker', status: 'running', taskId: existing.taskId ?? worker.taskId };
     }
   }
   if (noWorkersRemain && !busy) {

@@ -18,6 +18,9 @@ const {
   ensureStreamingAssistantMessage,
   finalizeAssistantMessage,
   shouldMergeAssistantSnapshot,
+  addTokenUsage,
+  computeGlobalTokenUsage,
+  emptyTokenUsage,
 } = utils;
 
 function assistant(id: string, content: string, patch: Partial<Message> = {}): Message {
@@ -31,6 +34,51 @@ function assistant(id: string, content: string, patch: Partial<Message> = {}): M
     ...patch,
   };
 }
+
+test('token usage helpers accumulate cache and reasoning fields', () => {
+  assert.deepEqual(addTokenUsage(emptyTokenUsage(), {
+    prompt: 10,
+    completion: 3,
+    total: 13,
+    cache_read: 7,
+    cache_creation: 2,
+    reasoning: 1,
+    credit: 0.01,
+  }), {
+    prompt: 10,
+    completion: 3,
+    total: 13,
+    cache_read: 7,
+    cache_creation: 2,
+    reasoning: 1,
+    credit: 0.01,
+  });
+});
+
+test('global token usage includes pending cache and reasoning fields', () => {
+  const global = computeGlobalTokenUsage({
+    a1: {
+      agentId: 'a1',
+      agentName: 'A1',
+      role: 'worker',
+      status: 'running',
+      messages: [],
+      tokenUsage: { prompt: 10, completion: 5, total: 15, cache_read: 4, reasoning: 2 },
+    },
+  }, {
+    a2: { prompt: 3, completion: 1, total: 4, cache_creation: 2, reasoning: 1 },
+  });
+
+  assert.deepEqual(global, {
+    prompt: 13,
+    completion: 6,
+    total: 19,
+    cache_read: 4,
+    cache_creation: 2,
+    reasoning: 3,
+    credit: 0,
+  });
+});
 
 test('leader streaming starts a new assistant after previous final output', () => {
   const first = assistant('a1', 'first answer');
@@ -92,6 +140,13 @@ test('runtime snapshot modes default to Solo/manual/yolo/direct when omitted', (
   assert.equal(snapshot.modes.route.preference, 'auto');
   assert.equal(snapshot.modes.collaboration.mode, 'solo');
   assert.equal(snapshot.modes.collaboration.teamEnabled, false);
+  assert.equal(snapshot.modes.autonomy, 'balanced');
+  assert.equal(snapshot.modes.intentProfile.primaryIntent, 'diagnose');
+  assert.equal(snapshot.modes.intentProfile.scope.kind, 'read_only');
+  assert.equal(snapshot.modes.lifecyclePhase, 'bootstrap');
+  assert.equal(snapshot.modes.modeGeneration, 1);
+  assert.equal(snapshot.modes.policyId, null);
+  assert.equal(snapshot.modes.policyHash, null);
 });
 
 test('runtime snapshot modes are preserved and mirrored into local control/permission fields', () => {
@@ -107,6 +162,25 @@ test('runtime snapshot modes are preserved and mirrored into local control/permi
         workflow: { enabled: true, activeExecutionCount: 2 },
         blackboard: { mode: 'full', source: 'team' },
         permission: { mode: 'networked', summary: 'networked mode' },
+        autonomy: 'autonomous',
+        intentProfile: {
+          primaryIntent: 'fix',
+          scope: { kind: 'workspace' },
+          phase: 'execute',
+          grants: ['read', 'write'],
+          denies: [],
+          requiredGates: ['confirm_before_scope_expansion'],
+          constraints: {},
+          confidence: 0.9,
+          reason: 'fix requested',
+          turnId: 1,
+          recordedAt: 2,
+          source: 'record_capability_intent',
+        },
+        lifecyclePhase: 'stable',
+        modeGeneration: 7,
+        policyId: 'autonomy_policy_autonomous_7',
+        policyHash: 'autonomous:stable:7',
       },
       leader: { running: false },
       runningWorkers: [],
@@ -124,6 +198,13 @@ test('runtime snapshot modes are preserved and mirrored into local control/permi
   assert.equal(snapshot.modes.workflow.activeExecutionCount, 2);
   assert.equal(snapshot.modes.blackboard.mode, 'full');
   assert.equal(snapshot.modes.permission.mode, 'networked');
+  assert.equal(snapshot.modes.autonomy, 'autonomous');
+  assert.equal(snapshot.modes.intentProfile.primaryIntent, 'fix');
+  assert.equal(snapshot.modes.intentProfile.phase, 'execute');
+  assert.equal(snapshot.modes.lifecyclePhase, 'stable');
+  assert.equal(snapshot.modes.modeGeneration, 7);
+  assert.equal(snapshot.modes.policyId, 'autonomy_policy_autonomous_7');
+  assert.equal(snapshot.modes.policyHash, 'autonomous:stable:7');
 
   const patch = applyRuntimeSnapshotPatch({
     ...emptySessionRuntimeState(),
@@ -237,6 +318,52 @@ test('runtime snapshot preserves explicit leader busy for reconnect resync', () 
     sessions: [{ id: 's1', workspace: '/repo', status: 'active', createdAt: 1 }],
   } as never, snapshot, true);
 
+  assert.equal(patch.phase, 'preparing');
+});
+
+test('runtime snapshot running worker overrides stale terminal agent conversation status', () => {
+  const snapshot = coerceSessionRuntimeSnapshot({
+    runtimeState: {
+      sessionId: 's1',
+      workspace: '/repo',
+      sessionStatus: 'active',
+      leader: { running: false, busy: false },
+      runningWorkers: [{
+        agentId: 'a1',
+        name: 'worker-1',
+        roleType: 'coding',
+        taskId: 'T-1',
+        status: 'running',
+        lastActivity: 123,
+      }],
+      runningWorkerCount: 1,
+      hasRunningWorkers: true,
+      eternal: { enabled: false },
+    },
+  });
+
+  assert.ok(snapshot);
+
+  const patch = applyRuntimeSnapshotPatch({
+    ...emptySessionRuntimeState(),
+    sessionId: 's1',
+    activeSessionId: 's1',
+    sessions: [{ id: 's1', workspace: '/repo', status: 'active', createdAt: 1 }],
+    agents: [{ agentId: 'a1', agentName: 'worker-1', role: 'coding', status: 'interrupted', taskId: 'T-1' }],
+    agentConversations: {
+      a1: {
+        agentId: 'a1',
+        agentName: 'worker-1',
+        role: 'coding',
+        status: 'interrupted',
+        taskId: 'T-1',
+        messages: [],
+      },
+    },
+  } as never, snapshot, true);
+
+  assert.equal(patch.agents?.find((agent) => agent.agentId === 'a1')?.status, 'running');
+  assert.equal(patch.agentConversations?.a1?.status, 'running');
   assert.equal(patch.phase, 'preparing');
 });
 

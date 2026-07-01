@@ -1,5 +1,6 @@
 import type { ChatMessage, MessageContent, MessageContentPart, ToolCall } from './types.js';
 import { isEmptyContent, contentToPlainText } from './types.js';
+import { llmLogger } from '../core/Log.js';
 
 function cloneToolCallWithId(toolCall: ToolCall, fallbackId: string): ToolCall {
   return {
@@ -119,13 +120,29 @@ export function sanitizeOpenAIToolMessageSequence(messages: ChatMessage[]): Chat
   const repaired = dropMalformedToolCallArguments(messages);
   const sanitized: ChatMessage[] = [];
   let pendingToolCalls: ToolCall[] = [];
+  // 被夹在 tool_call 与其 tool_result 之间的 user/system 消息（事件处理器在工具执行
+  // 期间注入，如 orchestration:dag_updated → [Orchestration] status=...，或中断后用户
+  // 继续输入）。OpenAI-compatible provider（DeepSeek 等）要求 assistant.tool_calls 的
+  // 所有 tool 结果必须连续紧跟其后，中间不得插入 user/system，否则 400
+  // `insufficient tool messages following tool_calls`。因此这些消息先暂存，待本批
+  // tool 结果（含补齐的 missing 占位）全部排出后再按原序追加，协议合规且内容无损。
+  let deferredBetween: ChatMessage[] = [];
 
-  const flushMissingToolResults = () => {
-    if (pendingToolCalls.length === 0) return;
+  const flushDeferredBetween = () => {
+    if (deferredBetween.length === 0) return;
+    for (const deferred of deferredBetween) {
+      sanitized.push(deferred);
+    }
+    deferredBetween = [];
+  };
+
+  // 收尾当前 tool_calls 批次：补齐未配对的 tool_call 占位，再排出被推迟的 user/system。
+  const flushPendingBatch = () => {
     for (const toolCall of pendingToolCalls) {
       sanitized.push(makeMissingToolResult(toolCall));
     }
     pendingToolCalls = [];
+    flushDeferredBetween();
   };
 
   for (const original of repaired) {
@@ -152,21 +169,33 @@ export function sanitizeOpenAIToolMessageSequence(messages: ChatMessage[]): Chat
         ...message,
         tool_call_id: matchedToolCall.id,
       });
+      // 本批 tool_calls 全部配齐 → 立即排出被推迟的 user/system，恢复原始相对顺序。
+      if (pendingToolCalls.length === 0) {
+        flushDeferredBetween();
+      }
       continue;
     }
 
-    flushMissingToolResults();
-
-    if (message.role === 'assistant' && message.tool_calls?.length) {
+    // assistant 消息开启新的 tool_calls 批次：先收尾上一批（补齐占位 + 排出推迟消息）。
+    if (message.role === 'assistant') {
+      flushPendingBatch();
       sanitized.push(message);
-      pendingToolCalls = [...message.tool_calls];
+      if (message.tool_calls?.length) {
+        pendingToolCalls = [...message.tool_calls];
+      }
       continue;
     }
 
-    sanitized.push(message);
+    // user/system 消息：若正处于某批 tool_calls 等待 tool 结果的过程中，推迟其输出
+    // （见 deferredBetween 注释），不打断 assistant→tool 的连续性；否则原样排出。
+    if (pendingToolCalls.length > 0) {
+      deferredBetween.push(message);
+    } else {
+      sanitized.push(message);
+    }
   }
 
-  flushMissingToolResults();
+  flushPendingBatch();
   return sanitized;
 }
 
@@ -295,6 +324,10 @@ function ensureHasUserMessage(messages: ChatMessage[]): ChatMessage[] {
  */
 export function sanitizeMessageSequence(messages: ChatMessage[]): ChatMessage[] {
   if (!messages || messages.length === 0) return messages;
+
+  const beforeCount = messages.length;
+  const beforeRoles = countByRole(messages);
+
   const merged1 = mergeConsecutiveAssistantMessages(messages);
   const merged2 = mergeConsecutiveUserMessages(merged1);
   const coalesced = coalesceMiddleSystemMessages(merged2);
@@ -303,7 +336,35 @@ export function sanitizeMessageSequence(messages: ChatMessage[]): ChatMessage[] 
   const toolSequenced = sanitizeOpenAIToolMessageSequence(contentSanitized);
   // GLM/Qwen 等模型拒绝只有 system 消息、没有 user 消息的请求（返回 400）。
   // 兜底：如果序列中没有 user 消息，把最后一条非 tool 消息转为 user。
-  return ensureHasUserMessage(toolSequenced);
+  const final = ensureHasUserMessage(toolSequenced);
+
+  const afterCount = final.length;
+  const afterRoles = countByRole(final);
+
+  // 如果有变化，打印统计日志
+  if (afterCount !== beforeCount || JSON.stringify(beforeRoles) !== JSON.stringify(afterRoles)) {
+    llmLogger.debug(`[MessageSanitizer] before=${beforeCount} after=${afterCount} beforeRoles=${JSON.stringify(beforeRoles)} afterRoles=${JSON.stringify(afterRoles)}`);
+
+    const mergedAssistants = beforeRoles.assistant - afterRoles.assistant;
+    const mergedUsers = beforeRoles.user - afterRoles.user;
+    const coalescedSystems = beforeRoles.system - afterRoles.system;
+    const removedTools = beforeRoles.tool - afterRoles.tool;
+
+    if (mergedAssistants > 0) llmLogger.debug(`  mergedAssistants=${mergedAssistants}`);
+    if (mergedUsers > 0) llmLogger.debug(`  mergedUsers=${mergedUsers}`);
+    if (coalescedSystems > 0) llmLogger.debug(`  coalescedSystems=${coalescedSystems}`);
+    if (removedTools > 0) llmLogger.debug(`  removedOrphanTools=${removedTools}`);
+  }
+
+  return final;
+}
+
+function countByRole(messages: ChatMessage[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const msg of messages) {
+    counts[msg.role] = (counts[msg.role] || 0) + 1;
+  }
+  return counts;
 }
 
 /**

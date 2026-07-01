@@ -104,7 +104,7 @@ function draftToEntry(draft: RawDraft, contractsDir: string): ContractPackEntry 
     ...(evidence.length > 0 ? { evidence } : {}),
     ...(draft.allowedScope ? { contractAllowedScope: draft.allowedScope } : {}),
   };
-  return graphNodeToContractPackEntry(node, contractsDir);
+  return graphNodeToContractPackEntry(node, contractsDir, undefined);
 }
 
 export class ContractAuditGenerator {

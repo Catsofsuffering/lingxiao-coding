@@ -415,6 +415,7 @@ export class ExternalAgentRunner {
           total: event.total,
           cache_read: event.cacheRead,
           cache_creation: event.cacheCreation,
+          reasoning: event.reasoning,
         };
         this.deps.tokenTracker.addUsage(input.agentId, ctx.tokenUsage, input.model.id);
         break;

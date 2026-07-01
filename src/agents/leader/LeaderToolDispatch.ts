@@ -7,6 +7,8 @@ import type { ToolResultContent } from '../runtime/ToolResponseProcessor.js';
 import { executeToolCallsWithTruncationGuard } from '../runtime/ToolCallSafety.js';
 import { isStopFinishReason } from '../runtime/CompletionTerminationPolicy.js';
 import { FILE_MODIFYING_TOOLS } from '../runtime/parallelToolBatch.js';
+import { truncateAgentToolResult } from '../AgentRuntimeUtilities.js';
+import { config as runtimeConfig } from '../../config.js';
 import { registerLeaderFlush, unregisterLeaderFlush } from '../../core/RuntimeGuards.js';
 
 export type LeaderToolDispatchResult = { done: boolean; result?: string };
@@ -24,6 +26,7 @@ export interface LeaderToolDispatchOptions {
   setRawXmlRetryCount(value: number): void;
   setEmptyResponseRetryCount(value: number): void;
   isUserInterruptPending(): boolean;
+  isToolUseSuppressedForCurrentTurn?: () => boolean;
   getActiveTeam?: () => string | null;
   getCollaborationMode?: () => 'solo' | 'team';
   peekNextTaskIds?: (count: number) => string[];
@@ -276,8 +279,8 @@ export function createLeaderToolScheduler(
         }
       }
 
-      if (options.isUserInterruptPending()) {
-        leaderLogger.info('[UserInterrupt] 检测到用户中断信号，跳过剩余工具调用');
+      if (options.isUserInterruptPending() || options.isToolUseSuppressedForCurrentTurn?.()) {
+        leaderLogger.info('[UserInterrupt] 检测到用户中断信号或本轮禁用工具，跳过剩余工具调用');
         return { done: true };
       }
       // 记录本批将执行的 tool_calls（ask_user gate 可能已 splice 截断），
@@ -328,7 +331,11 @@ export function createLeaderToolScheduler(
         callId: toolCall.id,
       });
     },
-    transformToolResult: (_toolCall, rawResult) => rawResult,
+    transformToolResult: (toolCall, rawResult) => truncateAgentToolResult(
+      toolCall.function.name,
+      rawResult,
+      runtimeConfig.agents.tool_result_max_chars,
+    ),
     persistToolMessage: (message) => {
       options.addMessage(message);
       const conv = options.getConversation();

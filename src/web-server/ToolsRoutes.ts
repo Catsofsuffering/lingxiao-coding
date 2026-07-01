@@ -18,6 +18,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import type { EventEmitter } from '../core/EventEmitter.js';
+import { serverLogger } from '../core/Log.js';
 import type { SessionManager } from '../core/SessionManager.js';
 import type { AuthFn } from './types.js';
 import {
@@ -172,7 +173,7 @@ function emitChange(
     deps.emitter?.emit('tools:changed', payload);
   } catch (err) {
     // 监听器抛出会静默打断 tool 变更传播，导致 Web UI 工具列表与后端失步；debug 记录以便定位。
-    console.debug('[ToolsRoutes] tools:changed 监听器抛出，已忽略:', err instanceof Error ? err.message : String(err));
+    serverLogger.debug('[ToolsRoutes] tools:changed listener threw, ignored', { error: String(err) });
   }
 }
 

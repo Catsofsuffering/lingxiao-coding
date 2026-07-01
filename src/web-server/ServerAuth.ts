@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { CONFIG_DIR } from '../config.js';
 import { requireTokenInHeaderOnly } from '../core/HardeningPolicy.js';
+import { serverLogger } from '../core/Log.js';
 
 const TOKEN_FILE = join(CONFIG_DIR, 'server-token');
 
@@ -32,7 +33,7 @@ export class ServerAuth {
       }
     } catch (err: unknown) {
       // Token file exists but couldn't be read - log and regenerate
-      console.error(`[ServerAuth] Failed to read token file ${TOKEN_FILE}:`, err instanceof Error ? err.message : err);
+      serverLogger.error('[ServerAuth] Failed to read token file', { tokenFile: TOKEN_FILE, error: err instanceof Error ? err.message : String(err) });
     }
 
     // Generate new token and persist
@@ -42,12 +43,8 @@ export class ServerAuth {
       writeFileSync(TOKEN_FILE, token, { encoding: 'utf-8', mode: 0o600 });
     } catch (err: unknown) {
       // Token generated in-memory but NOT persisted — next restart will get a different token.
-      // This is a real problem: log prominently so operators can fix permissions.
-      console.error(
-        `[ServerAuth] WARN: token generated but failed to persist to ${TOKEN_FILE}. ` +
-        `Clients using this token will lose access on daemon restart. Error:`,
-        err instanceof Error ? err.message : err,
-      );
+      serverLogger.error('[ServerAuth] token generated but failed to persist; clients will lose access on daemon restart', { tokenFile: TOKEN_FILE, error: err instanceof Error ? err.message : String(err) });
+
     }
     return token;
   }

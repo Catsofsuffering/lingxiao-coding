@@ -23,6 +23,9 @@ import {
   normalizeQQBotStatus,
   type CoreDaemonStatus,
 } from '@contracts/adapters/StatusAdapter';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('DaemonView');
+
 
 interface DaemonStatus {
   status: CoreDaemonStatus;
@@ -147,7 +150,7 @@ export default function DaemonView() {
           const sessData = await apiFetch<{ data: SessionInfo[] }>('/daemon/sessions');
           setDaemonSessions(Array.isArray(sessData.data) ? sessData.data : []);
         } catch (err) {
-          console.warn('[DaemonView] Failed to fetch daemon sessions:', err);
+          log.warn('[DaemonView] Failed to fetch daemon sessions:', err);
           setDaemonSessions([]);
         }
       } else {

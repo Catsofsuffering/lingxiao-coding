@@ -34,6 +34,8 @@ import type {
   BlackboardEvent,
 } from './types.js';
 import { isNodeReady, type DagNodeLike, type DagSchedulerDeps } from '../DagScheduler.js';
+import { shouldPreferContractNode, shouldSupersedeExistingContract } from '../ContractProvenance.js';
+import { config as runtimeConfig } from '../../config.js';
 
 /** 黑板 intent 依赖视图节点(适配通用 DagScheduler):聚合并非节点字段的 depends_on 图边。
  *  graphNode 缺省表示依赖源节点不存在(黑板语义:视为已解决)。 */
@@ -64,8 +66,37 @@ const DEFAULT_SUBGRAPH_DEPTH = 2;
 /** 黑板图谱单 session 节点/边硬上限。超出即按 superseded→resolved→最旧 策略剪枝，
  *  防止长会话图谱无界增长（snapshot token 成本随规模线性膨胀 + DB 行堆积）。
  *  worker 批量路径走 applyWorkerOutputAndPrune；其余 addX 入口走 persistNodeAndBound 自动限流。 */
-const MAX_GRAPH_NODES = 500;
-const MAX_GRAPH_EDGES = 1000;
+function getBlackboardLimits(): { maxNodes: number; maxEdges: number; maxNodeContentChars: number } {
+  return {
+    maxNodes: runtimeConfig.blackboard.max_nodes,
+    maxEdges: runtimeConfig.blackboard.max_edges,
+    maxNodeContentChars: runtimeConfig.blackboard.max_node_content_chars,
+  };
+}
+
+function truncateNodeContent(content: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || content.length <= maxChars) return content;
+  const marker = `\n\n[blackboard content truncated: original_chars=${content.length}, kept_chars=${maxChars}]`;
+  return content.slice(0, Math.max(0, maxChars - marker.length)) + marker;
+}
+
+function normalizeContractSurface(surface: string): string {
+  return surface.startsWith('contract:') ? surface.slice('contract:'.length) : surface;
+}
+
+function contractTagForSurface(surface: string): string {
+  return `contract:${normalizeContractSurface(surface)}`;
+}
+
+function isContractEvidenceKind(kind: NodeKind): boolean {
+  return kind === 'design_doc' || kind === 'fact';
+}
+
+function containsContractSemanticEvidence(node: GraphNode, surface: string): boolean {
+  const normalizedSurface = normalizeContractSurface(surface).toLowerCase();
+  const haystack = `${node.title}\n${node.content}`.toLowerCase();
+  return haystack.includes(normalizedSurface) && /contract|契约/.test(haystack);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // BlackboardGraph
@@ -212,7 +243,13 @@ export class BlackboardGraph {
     };
     this.persistNodeAndBound(node);
     this.emit({ type: 'node_added', sessionId: node.sessionId, nodeId: node.id, timestamp: node.createdAt });
+
+    // ARCH FIX: provenance 分级 supersede 守卫。
+    // 薄模板不 supersede 非模板节点,避免任务模板凭时间戳覆盖真实契约。
     for (const old of liveContracts) {
+      if (!shouldSupersedeExistingContract(node, old)) {
+        continue;
+      }
       this.store.updateNode(old.id, input.sessionId, { supersededBy: node.id });
       this.emit({ type: 'node_superseded', sessionId: input.sessionId, nodeId: old.id, timestamp: Date.now() });
     }
@@ -272,11 +309,36 @@ export class BlackboardGraph {
   }
 
   getActiveContract(sessionId: string, surface: string): GraphNode | null {
-    const tag = surface.startsWith('contract:') ? surface : `contract:${surface}`;
+    const tag = contractTagForSurface(surface);
     const live = this.store.getNodesByTag(sessionId, tag)
-      .filter(node => node.kind === 'contract' && !node.supersededBy)
+      .filter(node => node.kind === 'contract' && !node.supersededBy);
+    return live.reduce<GraphNode | null>((best, node) => {
+      if (!best || shouldPreferContractNode(node, best)) return node;
+      return best;
+    }, null);
+  }
+
+  /**
+   * 返回可解除 contract gate 的黑板证据。
+   *
+   * 正式 contract 节点优先；同时兼容 Leader/Worker 通过 blackboard(write_fact)
+   * 记录的契约事实，避免只有 kind='contract' 才能解锁实现任务。
+   */
+  getContractEvidence(sessionId: string, surface: string): GraphNode | null {
+    const activeContract = this.getActiveContract(sessionId, surface);
+    if (activeContract) return activeContract;
+
+    const tag = contractTagForSurface(surface);
+    const taggedEvidence = this.store.getNodesByTag(sessionId, tag)
+      .filter(node => isContractEvidenceKind(node.kind) && !node.supersededBy)
       .sort((a, b) => b.createdAt - a.createdAt);
-    return live[0] ?? null;
+    if (taggedEvidence[0]) return taggedEvidence[0];
+
+    const semanticEvidence = this.store.getNodesBySession(sessionId)
+      .filter(node => isContractEvidenceKind(node.kind) && !node.supersededBy)
+      .filter(node => containsContractSemanticEvidence(node, surface))
+      .sort((a, b) => b.createdAt - a.createdAt);
+    return semanticEvidence[0] ?? null;
   }
 
   setOrigin(sessionId: string, content: string, title = 'Origin'): GraphNode {
@@ -334,7 +396,7 @@ export class BlackboardGraph {
    * 解决 Leader update_task 修改 description 后 Intent 节点停留在 createTask 快照的问题。
    */
   updateNode(nodeId: string, sessionId: string, updates: Partial<Pick<GraphNode,
-    'title' | 'content' | 'tags' | 'intentStatus' | 'priority'
+    'title' | 'content' | 'tags' | 'intentStatus' | 'priority' | 'evidence'
   >>): void {
     this.store.updateNode(nodeId, sessionId, updates);
   }
@@ -457,14 +519,27 @@ export class BlackboardGraph {
    * GraphBridge、collaboration 事件（review/verdict/decision）。未超上限时仅一次 COUNT 查询即返回；
    * 剪枝失败不阻断写入（addX 仍返回刚插入的节点）。
    */
+  private normalizeNodeForStorage(node: GraphNode): GraphNode {
+    const { maxNodeContentChars } = getBlackboardLimits();
+    const content = truncateNodeContent(node.content, maxNodeContentChars);
+    if (content === node.content) return node;
+    return {
+      ...node,
+      content,
+      tags: Array.from(new Set([...node.tags, 'content_truncated'])),
+    };
+  }
+
   private persistNodeAndBound(node: GraphNode): void {
-    this.store.insertNode(node);
-    const sid = node.sessionId;
-    if (this.store.getNodeCount(sid) <= MAX_GRAPH_NODES && this.store.getEdgeCount(sid) <= MAX_GRAPH_EDGES) return;
+    const boundedNode = this.normalizeNodeForStorage(node);
+    this.store.insertNode(boundedNode);
+    const sid = boundedNode.sessionId;
+    const { maxNodes, maxEdges } = getBlackboardLimits();
+    if (this.store.getNodeCount(sid) <= maxNodes && this.store.getEdgeCount(sid) <= maxEdges) return;
     try {
-      this.prune(sid, MAX_GRAPH_NODES, MAX_GRAPH_EDGES);
+      this.prune(sid, maxNodes, maxEdges);
     } catch (err) {
-      coreLogger.warn(`[BlackboardGraph] auto-prune failed (node=${node.id}): ${err instanceof Error ? err.message : String(err)}`);
+      coreLogger.warn(`[BlackboardGraph] auto-prune failed (node=${boundedNode.id}): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -808,8 +883,8 @@ export class BlackboardGraph {
     sessionId: string,
     taskId: string,
     output: WorkerGraphOutput,
-    maxNodes: number = MAX_GRAPH_NODES,
-    maxEdges: number = MAX_GRAPH_EDGES,
+    maxNodes: number = getBlackboardLimits().maxNodes,
+    maxEdges: number = getBlackboardLimits().maxEdges,
   ): void {
     this.applyWorkerOutput(sessionId, taskId, output);
     this.prune(sessionId, maxNodes, maxEdges);

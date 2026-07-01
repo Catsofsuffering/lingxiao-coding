@@ -15,7 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { Zap, Coins } from 'lucide-react';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useViewStore } from '../../stores/viewStore';
-import { calculateCost, formatCost } from '../../utils/costCalculator';
+import { calculateCostDetailed, formatCost } from '../../utils/costCalculator';
 
 /** 紧凑 token 格式:1234 → 1.2K,1_200_000 → 1.2M。 */
 function formatTokens(n: number): string {
@@ -31,8 +31,11 @@ function UsageCardBase(): ReactElement {
   const setMainView = useViewStore((s) => s.setMainView);
 
   const total = tokenUsage?.total ?? 0;
-  const cost = useMemo(
-    () => calculateCost('default', {
+  // 计算费用并携带 estimated/partial 标志,避免侧边栏伪精确。
+  // 'default' 模型在 resolveModelPricing 中走 DEFAULT_PRICING → estimated+partial,
+  // 因此默认一定带 ≈ 标记。
+  const costInfo = useMemo(
+    () => calculateCostDetailed('default', {
       prompt: tokenUsage?.prompt ?? 0,
       completion: tokenUsage?.completion ?? 0,
       cache_read: tokenUsage?.cache_read,
@@ -41,6 +44,11 @@ function UsageCardBase(): ReactElement {
     [tokenUsage],
   );
   const hasUsage = total > 0;
+  const costBadgeKey = costInfo.partial
+    ? 'chat.cost.partialBadge'
+    : costInfo.estimated
+      ? 'chat.cost.estimatedBadge'
+      : null;
 
   return (
     <button
@@ -60,9 +68,31 @@ function UsageCardBase(): ReactElement {
           <Zap size={11} className="text-accent-yellow" aria-hidden />
           {hasUsage ? formatTokens(total) : '——'}
         </span>
+        {hasUsage && ((tokenUsage?.cache_read ?? 0) + (tokenUsage?.cache_creation ?? 0) > 0 || (tokenUsage?.reasoning ?? 0) > 0) && (
+          <span className="text-[9px] text-text-tertiary tabular-nums">
+            {((tokenUsage?.cache_read ?? 0) + (tokenUsage?.cache_creation ?? 0)) > 0 ? `cache ${formatTokens((tokenUsage?.cache_read ?? 0) + (tokenUsage?.cache_creation ?? 0))}` : ''}
+            {(tokenUsage?.reasoning ?? 0) > 0 ? `${((tokenUsage?.cache_read ?? 0) + (tokenUsage?.cache_creation ?? 0)) > 0 ? ' · ' : ''}think ${formatTokens(tokenUsage?.reasoning ?? 0)}` : ''}
+          </span>
+        )}
         <span className="text-[10px] text-text-muted">·</span>
-        <span className="text-xs font-semibold tabular-nums text-accent-red">
-          {hasUsage ? formatCost(cost) : '——'}
+        <span className="flex items-center gap-1 text-xs font-semibold tabular-nums text-accent-red">
+          {hasUsage ? (
+            <>
+              <span aria-hidden>~</span>
+              <span data-pricing-partial={costInfo.partial ? 'true' : undefined} data-pricing-estimated={costInfo.estimated ? 'true' : undefined}>
+                {formatCost(costInfo.total)}
+              </span>
+              {costBadgeKey && (
+                <span className={`text-[9px] font-normal px-1 rounded-sm border ${
+                  costInfo.partial
+                    ? 'border-accent-yellow/30 text-accent-yellow/80 bg-accent-yellow/5'
+                    : 'border-text-tertiary/30 text-text-tertiary'
+                }`}>
+                  {t(costBadgeKey)}
+                </span>
+              )}
+            </>
+          ) : '——'}
         </span>
       </div>
     </button>

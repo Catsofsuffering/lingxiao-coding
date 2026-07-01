@@ -9,10 +9,7 @@ import {
   renderSpeculativeOrchestrationPlan,
   type SpeculativeProjectEvidence,
 } from '../../core/SpeculativeOrchestrationPlanner.js';
-import {
-  AdaptiveHarness,
-  renderAdaptiveStrategyPlan,
-} from '../../core/AdaptiveHarness.js';
+// v1.0.4: AdaptiveHarness removed — static defaults used inline
 import { SESSION_KEYS } from '../../core/SessionStateKeys.js';
 import { resolveModeRuntimeProjection } from '../../core/ModeRuntimeProjection.js';
 import { enrichTaskContext } from '../../core/TaskContextEnricher.js';
@@ -29,12 +26,62 @@ import type { AgentRole } from '../RoleRegistry.js';
 import type { AgentHandle } from '../AgentPoolRuntime.js';
 import { getPromptLocale } from '../prompts/i18n/catalog.js';
 import { parseBlueprint, computeBlueprintCoverage, type ProjectBlueprint } from '../../core/ProjectBlueprint.js';
+import { config as runtimeConfig } from '../../config.js';
+import type { ChatMessage } from '../../llm/types.js';
+import {
+  estimateChatMessagesBytes,
+  stripOldImageParts,
+} from '../messageMemoryBudget.js';
 
 type LoggerLike = {
   warn?: (msg: string, ...args: unknown[]) => void;
   info?: (msg: string, ...args: unknown[]) => void;
   debug?: (msg: string, ...args: unknown[]) => void;
 };
+
+type WorkerConversationHistory = NonNullable<WorkerTaskPayload['conversationHistory']>;
+
+function normalizeWorkerHistoryForBudget(history: WorkerConversationHistory): ChatMessage[] {
+  return history
+    .filter((msg): msg is WorkerConversationHistory[number] & { role: ChatMessage['role'] } => (
+      msg.role === 'system' || msg.role === 'user' || msg.role === 'assistant' || msg.role === 'tool'
+    ))
+    .map((msg) => ({
+      role: msg.role,
+      content: msg.content as ChatMessage['content'],
+      ...(msg.tool_calls ? { tool_calls: msg.tool_calls as ChatMessage['tool_calls'] } : {}),
+      ...(msg.tool_call_id ? { tool_call_id: msg.tool_call_id } : {}),
+      ...(msg.thinking ? { thinking: msg.thinking as ChatMessage['thinking'] } : {}),
+      ...(msg.timestamp ? { timestamp: msg.timestamp } : {}),
+    }));
+}
+
+function trimWorkerConversationHistory(
+  history: WorkerConversationHistory | undefined,
+  agentName: string,
+  logger?: LoggerLike,
+): WorkerConversationHistory | undefined {
+  if (!history || history.length === 0) return undefined;
+
+  const normalized = normalizeWorkerHistoryForBudget(history);
+  if (normalized.length === 0) return undefined;
+
+  // Only strip old image base64 payloads — do not remove any messages (including tool results).
+  // Message trimming is exclusively handled by the compact path.
+  const imageSafe = stripOldImageParts(normalized, {
+    retainImageMessages: runtimeConfig.advanced.image_history_retain_rounds,
+    protectedCount: 2,
+  });
+
+  if (imageSafe.length !== normalized.length) {
+    const beforeBytes = estimateChatMessagesBytes(normalized);
+    const afterBytes = estimateChatMessagesBytes(imageSafe);
+    logger?.info?.(
+      `[AgentPool] @${agentName} worker payload history image-stripped ${normalized.length}→${imageSafe.length} messages, ${beforeBytes}→${afterBytes} bytes`,
+    );
+  }
+  return imageSafe as WorkerConversationHistory;
+}
 
 export interface WorkerPayloadBuilderInput {
   sessionId: string;
@@ -71,7 +118,7 @@ export async function loadInheritedWorkerHistory(input: {
       return undefined;
     }
     input.logger?.info?.(`[AgentPool] @${input.agentName} 复用同名 worker，继承 ${history.length} 条历史对话 (agentId=${input.agentId})`);
-    return history.map((msg) => ({
+    const mapped = history.map((msg) => ({
       role: msg.role,
       content: msg.content,
       tool_calls: msg.tool_calls,
@@ -79,6 +126,7 @@ export async function loadInheritedWorkerHistory(input: {
       thinking: msg.thinking,
       timestamp: msg.timestamp,
     }));
+    return trimWorkerConversationHistory(mapped, input.agentName, input.logger);
   } catch (error) {
     input.logger?.warn?.(`[AgentPool] 加载 @${input.agentName} 继承历史失败: ${error instanceof Error ? error.message : String(error)}`);
     return undefined;
@@ -152,6 +200,11 @@ function buildProjectExecutionMemory(input: {
 
 export async function buildWorkerPayload(input: WorkerPayloadBuilderInput): Promise<WorkerTaskPayload> {
   const options = input.options ?? {};
+  const conversationHistory = trimWorkerConversationHistory(
+    options.conversationHistory,
+    input.handle.name,
+    input.logger,
+  );
   const leaderContextSummary = input.db
     ? (input.db.getSessionState(input.sessionId, SESSION_KEYS.LEADER_CONTEXT_SUMMARY) as string | null) ?? undefined
     : undefined;
@@ -233,17 +286,13 @@ export async function buildWorkerPayload(input: WorkerPayloadBuilderInput): Prom
       : speculativeSection;
   }
 
-  const adaptiveHarness = new AdaptiveHarness();
-  const adaptivePlan = adaptiveHarness.buildPlan({
-    task: input.task,
-    projectModel: projectMemory.model,
-  });
-  const adaptiveSection = renderAdaptiveStrategyPlan(adaptivePlan);
-  if (adaptiveSection) {
-    enrichedContext = enrichedContext
-      ? `${enrichedContext}\n\n${adaptiveSection}`
-      : adaptiveSection;
-  }
+  // v1.0.4: AdaptiveHarness 移除——用静态默认值替代动态策略
+  const adaptivePlan = {
+    strategy: 'standard' as const,
+    params: { maxRounds: 25, timeoutMs: 10 * 60_000, parallelToolCalls: true },
+    signals: {},
+  };
+  // 不再注入 adaptive section 到 worker context
 
   // B-B: 注入蓝图定位段,让 Worker 知道自己在整体项目中的位置(防局部优化)。
   // 从 session state 读蓝图,反查 task 属于哪个子系统,投影定位 + 整体进度 + 依赖链。
@@ -290,7 +339,7 @@ export async function buildWorkerPayload(input: WorkerPayloadBuilderInput): Prom
     ...(speculativePlan ? { speculativePlan } : {}),
     agentType: input.task.agent_type,
     ...(input.role.gitIdentity ? { gitIdentity: input.role.gitIdentity } : {}),
-    ...(options.conversationHistory ? { conversationHistory: options.conversationHistory } : {}),
+    ...(conversationHistory ? { conversationHistory } : {}),
     ...(options.inheritHistoryMode ? { inheritHistoryMode: options.inheritHistoryMode } : {}),
   };
 }

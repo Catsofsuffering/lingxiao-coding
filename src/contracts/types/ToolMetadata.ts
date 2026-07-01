@@ -82,21 +82,8 @@ export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.free
   // Blackboard
   blackboard: write('blackboard', { dangerous: false, resultShape: 'json' }),
 
-  // Office / artifacts
-  generate_xlsx: write('office', { resultShape: 'file' }),
-  edit_xlsx: write('office', { requiresReadFirst: true, resultShape: 'file' }),
-  generate_docx: write('office', { resultShape: 'file' }),
-  edit_docx: write('office', { requiresReadFirst: true, resultShape: 'file' }),
-  inspect_docx: read('office', { resultShape: 'json' }),
-  generate_pptx: write('office', { resultShape: 'file' }),
-  edit_pptx: write('office', { requiresReadFirst: true, resultShape: 'file' }),
-  inspect_pptx: read('office', { resultShape: 'json' }),
+  // Office / artifacts（仅保留验收 runtime 工具；generate_*/edit_*/inspect_* 固定 schema 工具已废弃，改走 JS+shell 自由生成）
   office_ops: write('office', { dangerous: false, resultShape: 'json' }),
-  generate_canvas: write('office', { resultShape: 'file' }),
-  generate_html_presentation: write('office', { resultShape: 'file' }),
-  generate_html_document: write('office', { resultShape: 'file' }),
-  generate_slidev: write('office', { resultShape: 'file' }),
-  generate_pdf: write('office', { resultShape: 'file' }),
 
   // Design asset library
   design_asset: read('session', { core: true, parallelSafe: true, resultShape: 'json' }),
@@ -108,10 +95,12 @@ export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.free
   git: execute('git', { privileged: true, resultShape: 'text' }),
 
   // Leader-only meta tools (not ToolRegistry tools, but governed by same metadata map)
-  create_task: write('workflow', { visibility: 'leader', leaderParallelSafe: true, dangerous: false, resultShape: 'json' }),
+  // create_task 不再 leaderParallelSafe：通过 nextTaskId() 顺序分配 task_id，并行会破坏依赖解析时序（与 tools/ToolMetadata.ts 保持一致）。
+  create_task: write('workflow', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
   update_task: write('workflow', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
   delete_task: write('workflow', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
   define_agent_role: write('team', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
+  delete_agent_role: write('team', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
   list_available_roles: read('team', { visibility: 'leader' }),
   dispatch_agent: write('team', { visibility: 'leader', dangerous: false, resultShape: 'json' }),
   send_message_to_agent: read('communication', { visibility: 'leader', resultShape: 'json' }),
@@ -126,6 +115,7 @@ export const TOOL_METADATA: Readonly<Record<string, ToolMetadata>> = Object.free
   intervene_agent: read('communication', { visibility: 'leader', resultShape: 'json' }),
   terminate_agent: write('team', { visibility: 'leader', dangerous: true, resultShape: 'json' }),
   confirm_intervention: read('team', { visibility: 'leader' }),
+  list_runtime_agents: read('team', { visibility: 'leader' }),
   check_agent_progress: read('team', { visibility: 'leader' }),
   ask_user: read('communication', { visibility: 'leader', resultShape: 'json' }),
   submit_plan: read('communication', { visibility: 'leader', resultShape: 'json' }),

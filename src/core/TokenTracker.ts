@@ -1,4 +1,4 @@
-import type { TokenUsage } from '../types/canonical.js';
+import type { TokenUsage, TokenUsageView } from '../types/canonical.js';
 import type { DatabaseManager } from './Database.js';
 import type { EventEmitter } from './EventEmitter.js';
 import { coreLogger } from './Log.js';
@@ -11,11 +11,7 @@ export type { TokenUsage } from '../types/canonical.js';
 /**
  * Agent Token 汇总
  */
-export interface AgentTokenSummary {
-  prompt: number;
-  completion: number;
-  total: number;
-}
+export type AgentTokenSummary = TokenUsageView;
 
 /**
  * TokenTracker - Token 使用追踪器
@@ -46,13 +42,17 @@ export class TokenTracker {
   async record(agentId: string, agentName: string, usage: TokenUsage): Promise<void> {
     // 初始化 Agent 的用量记录
     if (!this.usage.has(agentId)) {
-      this.usage.set(agentId, { prompt: 0, completion: 0, total: 0 });
+      this.usage.set(agentId, { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 });
     }
 
     const agentUsage = this.usage.get(agentId)!;
     agentUsage.prompt += usage.prompt_tokens || 0;
     agentUsage.completion += usage.completion_tokens || 0;
     agentUsage.total += usage.total_tokens || 0;
+    agentUsage.cache_read = (agentUsage.cache_read ?? 0) + (usage.cache_read_input_tokens ?? 0);
+    agentUsage.cache_creation = (agentUsage.cache_creation ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+    agentUsage.reasoning = (agentUsage.reasoning ?? 0) + (usage.reasoning_tokens ?? 0);
+    agentUsage.credit = (agentUsage.credit ?? 0) + (usage.credit ?? 0);
 
     let persisted = true;
     let persistError: string | undefined;
@@ -63,7 +63,10 @@ export class TokenTracker {
         agentName,
         usage.prompt_tokens || 0,
         usage.completion_tokens || 0,
-        usage.total_tokens || 0
+        usage.total_tokens || 0,
+        undefined,
+        usage.cache_read_input_tokens || 0,
+        usage.cache_creation_input_tokens || 0
       );
     } catch (error) {
       persisted = false;
@@ -79,6 +82,10 @@ export class TokenTracker {
         prompt: usage.prompt_tokens || 0,
         completion: usage.completion_tokens || 0,
         total: usage.total_tokens || 0,
+        ...(usage.cache_read_input_tokens != null ? { cache_read: usage.cache_read_input_tokens } : {}),
+        ...(usage.cache_creation_input_tokens != null ? { cache_creation: usage.cache_creation_input_tokens } : {}),
+        ...(usage.reasoning_tokens != null ? { reasoning: usage.reasoning_tokens } : {}),
+        ...(usage.credit != null ? { credit: usage.credit } : {}),
       },
       persisted,
       persistError,
@@ -139,13 +146,15 @@ export class TokenTracker {
         const agentId = log.agent_id;
         
         if (!this.usage.has(agentId)) {
-          this.usage.set(agentId, { prompt: 0, completion: 0, total: 0 });
+          this.usage.set(agentId, { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 });
         }
 
         const agentUsage = this.usage.get(agentId)!;
         agentUsage.prompt += log.prompt || 0;
         agentUsage.completion += log.completion || 0;
         agentUsage.total += log.total || 0;
+        agentUsage.cache_read = (agentUsage.cache_read ?? 0) + (log.cache_read ?? 0);
+        agentUsage.cache_creation = (agentUsage.cache_creation ?? 0) + (log.cache_creation ?? 0);
       }
 
       const sessionTotal = this.getSessionTotal();

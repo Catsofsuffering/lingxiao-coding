@@ -7,6 +7,7 @@ import { getPythonExecutable, getShellCommand } from '../../utils/platform.js';
 import { getDefaultToolPermissionContext, type ToolPermissionContext } from '../../core/PermissionSystem.js';
 import { prepareExecutionSandbox, type SandboxNetworkMode } from './ExecutionSandbox.js';
 import { Workspace } from '../../core/Workspace.js';
+import { coreLogger } from '../../core/Log.js';
 
 /**
  * PythonExec - Python 代码执行工具
@@ -228,7 +229,7 @@ export class PythonExec {
         try {
           unlinkSync(tmpPath);
         } catch (cleanupError) {
-          console.warn('[PythonExec] 清理临时文件失败:', cleanupError);
+          coreLogger.warn('[PythonExec] 清理临时文件失败:', cleanupError);
         }
       }
     }

@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { homedir } from 'os';
+import { coreLogger } from './Log.js';
 
 /**
  * 工作阶段枚举
@@ -131,7 +132,7 @@ export class WorkNoteManager {
       if (getErrorCode(error) === 'ENOENT') {
         // 文件不存在是正常情况（首次写入前），不需要警告
       } else {
-        console.warn('[WorkNoteManager] Failed to read notes file:', error);
+        coreLogger.warn('[WorkNoteManager] Failed to read notes file:', error);
       }
     }
 
@@ -237,7 +238,7 @@ export class WorkNoteManager {
       }
     } catch (error: unknown) {
       if (getErrorCode(error) !== 'ENOENT') {
-        console.warn('[WorkNoteManager] Failed to discover agents directory:', error);
+        coreLogger.warn('[WorkNoteManager] Failed to discover agents directory:', error);
       }
     }
   }

@@ -8,6 +8,7 @@ import type { FastifyInstance } from 'fastify';
 import type { DatabaseRepositoryAdapter } from '../core/DatabaseRepositories.js';
 import type { AuthFn } from './types.js';
 import { buildSessionAgentHistory } from './AgentHistoryRoutes.js';
+import { serverLogger } from '../core/Log.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -310,7 +311,7 @@ export function registerStatsRoutes(
       };
     } catch (err) {
       // 聚合失败（DB 查询/记录损坏/算术）不应静默返回全零 —— 否则用户误以为数据丢失。
-      console.warn('[StatsRoutes] 会话统计聚合失败，返回默认零值:', err instanceof Error ? err.message : String(err));
+      serverLogger.warn('[StatsRoutes] 会话统计聚合失败，返回默认零值', { error: err instanceof Error ? err.message : String(err) });
       return { data: { totalSessions: 0, totalMessages: 0 } };
     }
   });

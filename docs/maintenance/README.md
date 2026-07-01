@@ -10,6 +10,7 @@
 | [security-hardening.md](./security-hardening.md) | 安全加固指南：路径遍历、XSS、SSRF、认证修复 |
 | [timer-cleanup.md](./timer-cleanup.md) | 定时器 unref 修复和资源清理指南 |
 | [mega-file-refactoring.md](./mega-file-refactoring.md) | 巨型文件拆分计划 |
+| [autonomy-governor-roadmap.md](./autonomy-governor-roadmap.md) | Autonomy Governor 落地路线图：自主边界、模式同步、Agent loop 止损、PromptSegment 与计费改造 |
 
 ## 问题统计
 

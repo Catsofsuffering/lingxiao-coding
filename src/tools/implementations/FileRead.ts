@@ -1,10 +1,12 @@
 import { z } from 'zod';
 import { Tool, type ToolContext, type ToolResult } from '../Tool.js';
 import { createReadStream } from 'fs';
-import { access, stat as statFile } from 'fs/promises';
+import { access, readFile, stat as statFile } from 'fs/promises';
 import { readBinaryProbeAsync, resolveWorkspacePath } from './utils.js';
 import { basename, extname } from 'path';
 import { tempDownloadRegistry } from '../../core/TempDownloadRegistry.js';
+import { supportsVisionFromProvider } from '../../llm/model_capabilities.js';
+import { ocrImage } from '../../llm/local_vision_fallback.js';
 import { createInterface } from 'readline';
 
 const FileReadSchema = z.object({
@@ -15,6 +17,10 @@ const FileReadSchema = z.object({
 
 const MAX_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
+const MAX_FILE_SIZE_WITHOUT_RANGE = 256 * 1024; // 256KB - CodeBuddy 启发的前置守卫
+const ESTIMATED_CHARS_PER_TOKEN = 4; // 粗略估算：4 个字符 ≈ 1 token
+const MAX_OUTPUT_TOKENS = parseInt(process.env.LINGXIAO_FILE_READ_MAX_TOKENS || '20000', 10);
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new Error('file_read aborted');
@@ -80,6 +86,11 @@ const PREVIEWABLE_BINARY_EXTENSIONS: Record<string, string> = {
   '.mp3': 'audio/mpeg',
   '.wav': 'audio/wav',
 };
+
+// vision 模型可直接读取的位图格式（svg 是文本矢量、pdf/视频/音频不走图像协议）。
+const VISION_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+// 内联 base64 的图片大小上限：超过则回退下载链接，避免撑爆上下文 / 触发 provider 图片大小限制。
+const MAX_IMAGE_INLINE_BYTES = 8 * 1024 * 1024;
 
 // Code file extensions that should be wrapped in code blocks
 const CODE_EXTENSIONS = new Set([
@@ -169,12 +180,55 @@ export class FileReadTool extends Tool {
         const ext = extname(p).toLowerCase();
         const mimeType = PREVIEWABLE_BINARY_EXTENSIONS[ext];
         if (mimeType) {
+          // 始终生成下载/预览卡片（前端 Artifact 面板预览用）
           const artifact = tempDownloadRegistry.create({
             path: p,
             name: basename(p),
             mimeType,
             sessionId: context?.sessionId,
           });
+
+          // 图片格式：按当前模型能力把图像内容真正交付给 LLM，而非只给一个下载链接。
+          //  - vision 模型 → image_url content part（走多模态协议，下游 externalize 成 blob 引用）
+          //  - 非 vision 模型 → 本地 OCR 兜底
+          // 仍附下载链接，前端可预览。与 ScreenshotTool 同源逻辑。
+          if (VISION_IMAGE_EXTENSIONS.has(ext) && stat.size <= MAX_IMAGE_INLINE_BYTES) {
+            const base64 = (await readFile(p)).toString('base64');
+            const dataUri = `data:${mimeType};base64,${base64}`;
+            const model = typeof context?.model === 'string' ? context.model : '';
+            const visionCapable = model ? supportsVisionFromProvider(model) : false;
+            const header = [
+              `🖼 图片文件: ${p}`,
+              `大小: ${(stat.size / 1024).toFixed(1)}KB · ${mimeType}`,
+              `预览链接: ${artifact.url}`,
+            ].join('\n');
+
+            if (visionCapable) {
+              return {
+                success: true,
+                data: [
+                  { type: 'text', text: header },
+                  { type: 'image_url', image_url: { url: dataUri, detail: 'auto' } },
+                ],
+              };
+            }
+
+            const ocrText = await ocrImage(dataUri, 1);
+            const ocrSection = ocrText && ocrText.trim()
+              ? ocrText
+              : `[OCR 未提取到文字。当前模型 ${model || 'unknown'} 不支持 vision，图片已保存至 ${p}。]`;
+            return {
+              success: true,
+              data: [
+                header,
+                '[System: 当前模型不支持图片输入，已用本地 OCR 替代图像内容。]',
+                '',
+                ocrSection,
+              ].join('\n'),
+            };
+          }
+
+          // 非图片可预览二进制（pdf/视频/音频/svg），或图片过大：返回下载/预览卡片。
           return {
             success: true,
             data: {
@@ -224,15 +278,43 @@ export class FileReadTool extends Tool {
         };
       }
 
+      // 前置守卫：大文件未指定范围时直接拒绝（学习 CodeBuddy）
+      const hasRange = params.start_line !== undefined || params.end_line !== undefined;
+      if (!hasRange && stat.size > MAX_FILE_SIZE_WITHOUT_RANGE) {
+        const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
+        const maxKB = Math.round(MAX_FILE_SIZE_WITHOUT_RANGE / 1024);
+        return {
+          success: false,
+          data: null,
+          error: `ERROR: 文件过大 (${sizeMB}MB)，超过无范围读取上限 (${maxKB}KB)。\n` +
+                 `提示：请使用 start_line 和 end_line 参数分段读取，例如：\n` +
+                 `   - start_line=1, end_line=500（读取前500行）\n` +
+                 `   - start_line=501, end_line=1000（读取501-1000行）`,
+        };
+      }
+
       const s = Math.max(1, params.start_line || 1);
       const e = params.end_line !== undefined ? params.end_line : Number.MAX_SAFE_INTEGER;
       const result = await readLineWindow(p, s, e, context?.abortSignal);
       const lines = [...result.lines];
 
       if (result.hitLineLimit) {
-        lines.push(`...... (⚠️ 已读取 ${MAX_LINES} 行并截断。请使用 start_line=${result.lastLine + 1} 继续读取)`);
+        lines.push(`...... (已读取 ${MAX_LINES} 行并截断。请使用 start_line=${result.lastLine + 1} 继续读取)`);
       }
       const fileContent = lines.join('\n') || '(空文本内容)';
+
+      // 前置守卫：输出 token 估算超限时拒绝（学习 CodeBuddy）
+      const estimatedTokens = Math.ceil(fileContent.length / ESTIMATED_CHARS_PER_TOKEN);
+      if (estimatedTokens > MAX_OUTPUT_TOKENS) {
+        return {
+          success: false,
+          data: null,
+          error: `ERROR: 文件内容过长（估算约 ${estimatedTokens} tokens），超过上限 (${MAX_OUTPUT_TOKENS} tokens)。\n` +
+                 `提示：请缩小读取范围：\n` +
+                 `   - 当前已读 ${result.lines.length} 行，建议分多次读取\n` +
+                 `   - 或使用 code_search 工具搜索特定内容`,
+        };
+      }
 
       return {
         success: true,

@@ -71,11 +71,6 @@ import {
 } from './runtime/WorkerCompletionPolicy.js';
 import { runCompletionVerification } from './runtime/MandatoryVerification.js';
 import {
-  extractAdversarialBreakerPolicy,
-  formatAdversarialBreakerFeedback,
-  runAdversarialBreaker,
-} from '../core/AdversarialVerifier.js';
-import {
   assertCoreAgentTransition,
   isAgentRuntimeActiveStatus,
   isCoreWorkerTerminalStatus,
@@ -117,12 +112,7 @@ import {
   assertSpeculativeWinnerEvidenceVerified,
   type SpeculativeWinnerEvidence,
 } from '../core/SpeculativeExecutionController.js';
-import {
-  AdaptiveHarness,
-  renderAdaptiveStrategyPlan,
-  type AdaptiveStrategyPlan,
-  type EscalationTrigger,
-} from '../core/AdaptiveHarness.js';
+// v1.0.4: AdaptiveHarness removed — static defaults in WorkerPayloadBuilder
 
 function getPositiveIntFromEnv(name: string, fallback: number): number {
   const rawValue = process.env[name];
@@ -276,6 +266,8 @@ export interface AgentHandle {
   lastToolResultAt?: number;
   /** Current tool being executed (null if not in tool) */
   currentToolName?: string | null;
+  /** Brief preview of the last tool result (truncated, for Leader runtime state injection) */
+  lastToolResultPreview?: string;
   /** Whether agent is waiting for permission approval */
   pendingPermission?: boolean;
   toolCalls?: number;
@@ -444,8 +436,6 @@ export class AgentPool {
   private readonly faultRecovery = new FaultRecovery();
   private readonly slotScheduler: SlotScheduler;
   private readonly traceMemory?: ExecutionTraceMemory;
-  private readonly adaptiveHarness = new AdaptiveHarness();
-  private readonly adaptivePlans = new Map<string, AdaptiveStrategyPlan>();
   private readonly workerBridgeCursors = new Map<string, WorkerBridgeCursor>();
   private readonly autoRetryRecoveries: boolean;
   /** 事件路由层（worker 进程事件 + 交互运行时事件），抽取自原 setup*EventHandlers */
@@ -468,10 +458,23 @@ export class AgentPool {
     });
   }
 
+  /**
+   * Update the default model used for subsequently spawned Worker/Agent LLM requests.
+   * Running workers keep their current request; this is a hot switch for the next dispatch/respawn.
+   */
+  setModel(modelId: string): void {
+    this.model = modelId;
+  }
+
+  getModel(): string {
+    return this.model;
+  }
+
   private buildWorkerFailureDiagnostics(
     handle: AgentHandle,
     runnerDiagnostics?: WorkerProcessDiagnostics,
   ): WorkerRecoveryPayload['diagnostics'] {
+
     const diagnostics = runnerDiagnostics ?? this.workerRunner.getWorkerDiagnostics(handle.name);
     if (!diagnostics && !handle.error) return undefined;
     return {
@@ -668,69 +671,6 @@ export class AgentPool {
     this._getChangeImpactContext = provider;
   }
 
-  private getAdaptiveStrategyPlan(task: BoardTask, refresh = false): AdaptiveStrategyPlan {
-    const existing = this.adaptivePlans.get(task.id);
-    if (existing && !refresh) return existing;
-    let projectModel;
-    if (this.traceMemory) {
-      try {
-        projectModel = this.traceMemory.getProjectModel(task.working_directory || this.workspace);
-      } catch (error) {
-        agentLogger.debug(`[AgentPool] AdaptiveHarness project model skipped (${task.id}): ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    const plan = this.adaptiveHarness.buildPlan({ task, projectModel });
-    this.adaptivePlans.set(task.id, plan);
-    return plan;
-  }
-
-  private applyAdaptiveContext(context: string | undefined, plan: AdaptiveStrategyPlan): string | undefined {
-    const section = renderAdaptiveStrategyPlan(plan);
-    if (!section) return context;
-    return context?.trim()
-      ? `${context}\n\n${section}`
-      : section;
-  }
-
-  private buildAdaptiveOutcomeMetadata(
-    task: BoardTask | undefined,
-    plan: AdaptiveStrategyPlan | undefined,
-    status: 'success' | 'failed',
-  ): Record<string, unknown> | undefined {
-    if (!task || !plan) return undefined;
-    const metadata: Record<string, unknown> = {
-      strategy: plan.strategy,
-      ruleId: plan.ruleId,
-      signals: plan.signals,
-      params: plan.params,
-      outcome: status,
-    };
-    if (status === 'failed') {
-      const repairCount = Math.max(
-        task.orchestration?.nodeKind === 'repair' ? 1 : 0,
-        task.runGeneration ?? 0,
-        task.orchestration?.generation ?? 0,
-      );
-      const trigger: EscalationTrigger | undefined = repairCount > 0
-        ? { type: 'repair_attempts_exceeded', count: repairCount }
-        : undefined;
-      const nextStrategy = trigger ? this.adaptiveHarness.escalate(plan.strategy, trigger) : null;
-      if (trigger && nextStrategy) {
-        metadata.escalation = {
-          trigger,
-          nextStrategy,
-          nextParams: this.adaptiveHarness.getStrategyParams(nextStrategy),
-        };
-        this.adaptivePlans.set(task.id, {
-          ...plan,
-          strategy: nextStrategy,
-          ruleId: `escalated:${trigger.type}`,
-          params: this.adaptiveHarness.getStrategyParams(nextStrategy),
-        });
-      }
-    }
-    return metadata;
-  }
 
   broadcastSystemContext(content: string, excludeAgentName?: string): number {
     const clean = content.trim();
@@ -999,7 +939,7 @@ export class AgentPool {
       handle,
       task,
       role,
-      agentModel: globalConfig.llm.agent_model,
+      agentModel: this.model,
       maxIterations: AGENT_MAX_ITERATIONS,
       maxRuntimeMinutes: AGENT_MAX_RUNTIME_MINUTES,
       getBlackboardSnapshot: this._blackboardGetSnapshot,
@@ -1009,7 +949,6 @@ export class AgentPool {
       options,
     });
     if (payload.adaptiveStrategy) {
-      this.adaptivePlans.set(task.id, payload.adaptiveStrategy);
     }
     return payload;
   }
@@ -1322,17 +1261,7 @@ export class AgentPool {
     if (hardDecision && !hardDecision.accepted) {
       throw new ExternalAgentProtocolError(hardDecision.reason, hardDecision.feedback);
     }
-    const adversarialPolicy = extractAdversarialBreakerPolicy(task.orchestration);
-    const adversarial = await runAdversarialBreaker({
-      workingDir: task.working_directory || this.workspace,
-      policy: adversarialPolicy,
-    });
-    if (adversarial.verdict !== 'PASS') {
-      throw new ExternalAgentProtocolError(
-        `adversarial_${adversarial.verdict.toLowerCase()}`,
-        formatAdversarialBreakerFeedback(adversarial),
-      );
-    }
+    // v1.0.4: AdversarialVerifier removed
     const decision = await evaluateWorkerCompletionCandidate({
       final: completionReport.result,
       task,
@@ -1417,8 +1346,6 @@ export class AgentPool {
     try {
       const task = this.taskBoard.getTask(handle.taskId);
       const projectRoot = task?.working_directory || this.workspace;
-      const adaptivePlan = task ? this.getAdaptiveStrategyPlan(task) : undefined;
-      const adaptiveOutcome = this.buildAdaptiveOutcomeMetadata(task, adaptivePlan, status);
       this.traceMemory.recordTrace({
         projectRoot,
         sessionId: this.sessionId,
@@ -1437,7 +1364,6 @@ export class AgentPool {
           taskRunGeneration: this.getTaskRunGeneration(handle),
           workerBackend: handle.workerBackend ?? 'worker_process',
           commandsRun: this.collectCompletionCommands(input.completion),
-          ...(adaptiveOutcome ? { adaptive: adaptiveOutcome } : {}),
         },
       });
       this.traceMemory.rebuildProjectModel(projectRoot);
@@ -1480,6 +1406,12 @@ export class AgentPool {
   }
 
   protected markAgentFailed(handle: AgentHandle, error: Error, source = 'runtime'): void {
+    // 先 kill 子进程，再设状态——forceStopAgent 只设内存状态不终止进程
+    try {
+      this.workerRunner.killWorker(handle.name, `agent failed: ${error.message}`);
+    } catch (killErr) {
+      agentLogger.warn(`[AgentPool] killWorker during markAgentFailed failed (${handle.name}): ${killErr instanceof Error ? killErr.message : String(killErr)}`);
+    }
     this.forceStopAgent(handle, 'failed', error.message);
     handle.error = error;
     handle.interactiveRuntime?.setStatus('failed');
@@ -1910,6 +1842,7 @@ export class AgentPool {
 
   destroy(): void {
     this.stopAll();
+    this.eventBinder.dispose();
     for (const unsubscribe of this.interactiveStateUnsubscribers) {
       unsubscribe();
     }

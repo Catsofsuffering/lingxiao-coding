@@ -13,6 +13,9 @@ import { getServerToken } from '../../api/headers';
 import type { Node } from '@xyflow/react';
 import type { WorkflowNodeConfig, WorkflowNodeData, NodeType } from './CanvasView';
 import { useTranslation } from 'react-i18next';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('NodeEditPanel');
+
 
 interface ModelOption {
   id: string;
@@ -239,7 +242,7 @@ async function fetchConfiguredModels(): Promise<ModelOption[]> {
     const body: unknown = await res.json().catch(() => ({}));
     return parseConfiguredModelsResponse(body);
   } catch (err) {
-    console.warn('[NodeEditPanel] Failed to fetch configured models:', err);
+    log.warn('[NodeEditPanel] Failed to fetch configured models:', err);
   }
   return [];
 }
@@ -251,7 +254,7 @@ async function fetchToolRegistry(): Promise<ToolSchemaInfo[]> {
     const body: unknown = await res.json().catch(() => ({}));
     return parseToolRegistryResponse(body);
   } catch (err) {
-    console.warn('[NodeEditPanel] Failed to fetch tool registry:', err);
+    log.warn('[NodeEditPanel] Failed to fetch tool registry:', err);
     return [];
   }
 }
@@ -317,7 +320,7 @@ function stringifyParams(value: unknown): string {
   if (value === undefined || value === null) return '';
   try { return JSON.stringify(value, null, 2); }
   catch (err) {
-    if (import.meta.env.DEV) console.warn('[NodeEditPanel] Failed to stringify params:', err);
+    if (import.meta.env.DEV) log.warn('[NodeEditPanel] Failed to stringify params:', err);
     return '';
   }
 }

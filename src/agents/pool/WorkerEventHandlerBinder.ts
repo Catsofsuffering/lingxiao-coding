@@ -155,13 +155,45 @@ export interface WorkerEventHandlerHost {
  * 事件绑定器。构造后调用两个 setup* 方法完成全部事件订阅。
  */
 export class WorkerEventHandlerBinder {
+  private workerRunnerUnsubscribers: Array<() => void> = [];
+
   constructor(private readonly host: WorkerEventHandlerHost) {}
+
+  private subscribeWorkerRunner(eventName: string, handler: (...args: any[]) => void): void {
+    const runner = this.host.workerRunner as unknown as {
+      on: (event: string, listener: (...args: any[]) => void) => unknown;
+      off?: (event: string, listener: (...args: any[]) => void) => unknown;
+      removeListener?: (event: string, listener: (...args: any[]) => void) => unknown;
+    };
+    runner.on(eventName, handler);
+    this.workerRunnerUnsubscribers.push(() => {
+      try {
+        if (typeof runner.off === 'function') {
+          runner.off(eventName, handler);
+        } else if (typeof runner.removeListener === 'function') {
+          runner.removeListener(eventName, handler);
+        }
+      } catch {
+        // runner 可能已 destroy/removeAllListeners，忽略重复解绑
+      }
+    });
+  }
+
+  dispose(): void {
+    for (const unsubscribe of this.workerRunnerUnsubscribers.splice(0)) {
+      unsubscribe();
+    }
+  }
 
   /**
    * 1.3: 设置 Worker 事件处理器，将 Worker 事件转发到 Leader
    */
   setupWorkerEventHandlers(): void {
+    this.dispose();
     const h = this.host;
+    const subscribeRunner = (eventName: string, handler: (...args: any[]) => void): void => {
+      this.subscribeWorkerRunner(eventName, handler);
+    }; 
     const markHandleProgress = (handle: AgentHandle | undefined): void => {
       if (!handle) return;
       handle.lastProgress = Date.now();
@@ -172,7 +204,7 @@ export class WorkerEventHandlerBinder {
       h.workerLifecycle.markHeartbeat(handle.name);
     };
 
-    h.workerRunner.on('worker:started', (workerId: string) => {
+    subscribeRunner('worker:started', (workerId: string) => {
       const handle = h.agents.get(workerId);
       if (handle) {
         h.transitionAgentStatus(handle, 'running');
@@ -208,7 +240,7 @@ export class WorkerEventHandlerBinder {
       }
     });
 
-    h.workerRunner.on('worker:progress', (workerId: string, payload: unknown) => {
+    subscribeRunner('worker:progress', (workerId: string, payload: unknown) => {
       const handle = h.agents.get(workerId);
       if (handle) {
         markHandleProgress(handle);
@@ -216,7 +248,7 @@ export class WorkerEventHandlerBinder {
       }
     });
 
-    h.workerRunner.on('worker:heartbeat', (workerId: string, payload: unknown) => {
+    subscribeRunner('worker:heartbeat', (workerId: string, payload: unknown) => {
       const handle = h.agents.get(workerId);
       if (!handle) return;
       markHandleHeartbeat(handle);
@@ -228,7 +260,7 @@ export class WorkerEventHandlerBinder {
       });
     });
 
-    h.workerRunner.on('worker:complete', (workerId: string, result: unknown) => {
+    subscribeRunner('worker:complete', (workerId: string, result: unknown) => {
       const handle = h.agents.get(workerId);
       if (!handle) return;
       markHandleProgress(handle);
@@ -383,7 +415,7 @@ export class WorkerEventHandlerBinder {
       h.releaseHeavyResources(handle);
     });
 
-    h.workerRunner.on('worker:failed', (workerId: string, error: unknown) => {
+    subscribeRunner('worker:failed', (workerId: string, error: unknown) => {
       const handle = h.agents.get(workerId);
       if (!handle) return;
       markHandleProgress(handle);
@@ -455,7 +487,7 @@ export class WorkerEventHandlerBinder {
       }
     });
 
-    h.workerRunner.on('worker:exit', (workerId: string, code: number | null, signal: string | null, status: string) => {
+    subscribeRunner('worker:exit', (workerId: string, code: number | null, signal: string | null, status: string) => {
       const handle = h.agents.get(workerId);
       if (!handle) return;
       markHandleProgress(handle);
@@ -561,7 +593,7 @@ export class WorkerEventHandlerBinder {
       }
     });
 
-    h.workerRunner.on('worker:timeout', (workerId: string, error: Error) => {
+    subscribeRunner('worker:timeout', (workerId: string, error: Error) => {
       const handle = h.agents.get(workerId);
       if (!handle || handle.completionReceived || handle.exitReason === 'completed') return;
       try {
@@ -595,7 +627,7 @@ export class WorkerEventHandlerBinder {
       }
     });
 
-    h.workerRunner.on('worker:bus_message', (workerId: string, payload: unknown) => {
+    subscribeRunner('worker:bus_message', (workerId: string, payload: unknown) => {
       const message = payload as WorkerBusEnvelope | undefined;
       markHandleProgress(h.agents.get(workerId));
       if (!message?.from || !message.to || !isBusMessageType(message.type)) {
@@ -606,7 +638,7 @@ export class WorkerEventHandlerBinder {
       h.bus.send(message.from, message.to, message.type, message.payload as never);
     });
 
-    h.workerRunner.on('worker:event', (_workerId: string, payload: unknown) => {
+    subscribeRunner('worker:event', (_workerId: string, payload: unknown) => {
       const event = payload as WorkerEventEnvelope | undefined;
       if (!event?.eventName) {
         return;
@@ -617,7 +649,7 @@ export class WorkerEventHandlerBinder {
       h.emitter.emit(event.eventName as EventName, event.data as EventMap[EventName]);
     });
 
-    h.workerRunner.on('worker:usage', (workerId: string, payload: unknown) => {
+    subscribeRunner('worker:usage', (workerId: string, payload: unknown) => {
       const usage = payload as WorkerUsageEnvelope | undefined;
       markHandleProgress(h.agents.get(workerId));
       if (!usage?.usage) {
@@ -672,12 +704,25 @@ export class WorkerEventHandlerBinder {
       h.emitInteractiveRuntimeState(handle);
     });
 
+    subscribe('agent:tool_call', (payload) => {
+      const handle = h.getById(payload.agentId) || (payload.agentName ? h.getByName(payload.agentName) : undefined);
+      if (!handle) return;
+      // Track current tool for Leader runtime state injection + smart watchdog
+      handle.currentToolName = payload.tool || null;
+      handle.lastToolCallAt = Date.now();
+      handle.toolCalls = (handle.toolCalls ?? 0) + 1;
+      h.emitInteractiveRuntimeState(handle);
+    });
+
     subscribe('agent:tool_result', (payload) => {
       const handle = h.getById(payload.agentId) || (payload.agentName ? h.getByName(payload.agentName) : undefined);
       if (!handle) return;
       // Track tool result timestamp for smart watchdog
       handle.lastToolResultAt = Date.now();
       handle.currentToolName = null;
+      // Store brief result preview for Leader runtime state injection
+      const rawResult = typeof payload.result === 'string' ? payload.result : '';
+      handle.lastToolResultPreview = rawResult.replace(/\s+/g, ' ').slice(0, 200) || undefined;
       if (!handle.interactiveRuntime) return;
       handle.interactiveRuntime.clearToolOutput(payload.callId || payload.tool);
       h.emitInteractiveRuntimeState(handle);

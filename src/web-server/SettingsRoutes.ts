@@ -190,7 +190,6 @@ const SETTINGS_MAP: Record<string, string> = {
   'sandboxAutoAllowBashIfSandboxed': 'security.auto_allow_bash_if_sandboxed',
   'dangerousCommandGuard': 'security.dangerous_command_guard',
   'blockPrivateNetwork': 'security.block_private_network',
-  'identityJudgeLlmEnabled': 'security.identity_judge_llm_enabled',
   // Security hardened mode（企业内网加固）
   'hardenedMode': 'security.hardened_mode',
   'envAllowlist': 'security.env_allowlist',
@@ -228,6 +227,7 @@ const MODEL_PROVIDER_CREATE_FIELDS = new Set([
 ]);
 
 const MODEL_PROVIDER_UPDATE_FIELDS = new Set([
+  'name',
   'contextWindowSize',
   'apiKey',
   'envKey',
@@ -268,9 +268,12 @@ export function registerSettingsRoutes(
     data.localLlmGatewayPort = typeof data.localLlmGatewayPort === 'number' && data.localLlmGatewayPort > 0 ? data.localLlmGatewayPort : 62000;
     data.localLlmGatewayInjectEnv = data.localLlmGatewayInjectEnv !== false;
     data.localLlmGatewayOverrideExistingEnv = !!data.localLlmGatewayOverrideExistingEnv;
-    data.fileCheckpointingEnabled = data.fileCheckpointingEnabled !== false;
+    // 默认关闭：与 config schema (CheckpointGroupSchema) 的 default(false) 对齐。
+    // 历史 bug：此处曾用 `!== false`，导致 config 未显式设置时 GET 返回 true，
+    // 前端再把 true 存回 settings.json，使 shadow git 快照被永久打开并撑爆磁盘。
+    data.fileCheckpointingEnabled = data.fileCheckpointingEnabled === true;
     data.checkpointMaxCheckpoints = typeof data.checkpointMaxCheckpoints === 'number' && data.checkpointMaxCheckpoints >= 5 ? data.checkpointMaxCheckpoints : 50;
-    data.checkpointAutoGcEnabled = data.checkpointAutoGcEnabled !== false;
+    data.checkpointAutoGcEnabled = data.checkpointAutoGcEnabled === true;
     data.checkpointMaxWorkspaceFiles = typeof data.checkpointMaxWorkspaceFiles === 'number' && data.checkpointMaxWorkspaceFiles >= 1000 ? data.checkpointMaxWorkspaceFiles : 100000;
     data.autoCompactEnabled = data.autoCompactEnabled !== false;
     data.memoryEnabled = data.memoryEnabled !== false;
@@ -287,9 +290,8 @@ export function registerSettingsRoutes(
     data.mcpToolTimeoutMs = typeof data.mcpToolTimeoutMs === 'number' ? data.mcpToolTimeoutMs : 60000;
     data.toolExecutionTimeoutMs = typeof data.toolExecutionTimeoutMs === 'number' ? data.toolExecutionTimeoutMs : TOOLS.EXECUTION_TIMEOUT_MS;
     data.defaultUserAgent = DEFAULT_LINGXIAO_USER_AGENT;
-    data.permissionMode = typeof data.permissionMode === 'string' ? data.permissionMode : 'yolo';
+    data.permissionMode = typeof data.permissionMode === 'string' ? data.permissionMode : 'dev';
     data.sandboxAutoAllowBashIfSandboxed = data.sandboxAutoAllowBashIfSandboxed !== false;
-    data.identityJudgeLlmEnabled = data.identityJudgeLlmEnabled === true;
     data.deferToolLoading = !!data.deferToolLoading;
     data.ignoreGitIgnore = !!data.ignoreGitIgnore;
     data.hookOutputCollapsed = data.hookOutputCollapsed !== false;
@@ -781,6 +783,155 @@ export function registerSettingsRoutes(
     }
   });
 
+
+  // POST /api/v1/settings/test-llm — 用临时配置测试 LLM 连接（不保存）
+  // Onboarding 专用：用户输入 provider/apiKey/baseUrl/model 后即时验证连通性。
+  // 直接 fetch 调用 LLM API，不依赖 LLMClientManager / ModelManager（onboarding 阶段尚未保存配置）。
+  fastify.post('/api/v1/settings/test-llm', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    const body = (request.body || {}) as {
+      provider?: string;
+      apiKey?: string;
+      baseUrl?: string;
+      model?: string;
+    };
+    const provider = body.provider?.trim();
+    const apiKey = body.apiKey?.trim();
+    const baseUrl = body.baseUrl?.trim();
+    const model = body.model?.trim();
+    if (!provider || !apiKey || !model) {
+      reply.status(400).send({ error: 'provider, apiKey, model are required' });
+      return;
+    }
+    try {
+      // 根据 provider 构建请求 URL 和 headers
+      const isAnthropic = provider === 'anthropic';
+      const defaultBaseUrl = isAnthropic ? 'https://api.anthropic.com' : 'https://api.openai.com/v1';
+      const effectiveBaseUrl = baseUrl || defaultBaseUrl;
+      const url = isAnthropic
+        ? `${effectiveBaseUrl.replace(/\/$/, '')}/v1/messages`
+        : `${effectiveBaseUrl.replace(/\/$/, '')}/chat/completions`;
+      const headers: Record<string, string> = isAnthropic
+        ? {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+          }
+        : {
+            'authorization': `Bearer ${apiKey}`,
+            'content-type': 'application/json',
+          };
+      const payload = isAnthropic
+        ? {
+            model,
+            max_tokens: 16,
+            messages: [{ role: 'user', content: 'Hi' }],
+          }
+        : {
+            model,
+            max_tokens: 16,
+            messages: [{ role: 'user', content: 'Hi' }],
+          };
+      const llmRes = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (llmRes.ok) {
+        const data = await llmRes.json() as { content?: Array<{ text?: string }>; choices?: Array<{ message?: { content?: string } }> };
+        const preview = isAnthropic
+          ? (data.content?.[0]?.text || '').slice(0, 100)
+          : (data.choices?.[0]?.message?.content || '').slice(0, 100);
+        return { success: true, data: { message: 'Connection successful', responsePreview: preview } };
+      }
+      // 非 2xx：解析错误信息
+      const errText = await llmRes.text().catch(() => '');
+      let errMsg = `HTTP ${llmRes.status}`;
+      try {
+        const errJson = JSON.parse(errText);
+        errMsg = errJson?.error?.message || errJson?.error || errJson?.message || errMsg;
+      } catch {
+        if (errText) errMsg = errText.slice(0, 200);
+      }
+      reply.status(502).send({ error: `${errMsg} (status ${llmRes.status})` });
+    } catch (e: unknown) {
+      const msg = toErrorMessage(e);
+      request.log.warn({ err: e }, 'onboarding test-llm failed');
+      reply.status(502).send({ error: msg });
+    }
+  });
+
+
+  // POST /api/v1/settings/test-model-provider/:id — 用已保存的模型配置测试连接
+  fastify.post('/api/v1/settings/test-model-provider/:id', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    const { id } = request.params as { id: string };
+    if (!id) {
+      reply.status(400).send({ error: 'id is required' });
+      return;
+    }
+    const providers = getConfigValue('llm.model_providers') as ModelProvidersConfig | undefined;
+    if (!providers) {
+      reply.status(404).send({ error: 'No model providers configured' });
+      return;
+    }
+    let found: { provider: string; apiKey: string; baseUrl: string; model: string } | null = null;
+    for (const [providerKey, models] of Object.entries(providers)) {
+      const list = Array.isArray(models) ? models : [];
+      const match = list.find((m) => m?.id === id || m?.name === id);
+      if (match) {
+        found = { provider: providerKey, apiKey: String(match.apiKey ?? ''), baseUrl: String(match.baseUrl ?? ''), model: String(match.model ?? match.id ?? '') };
+        break;
+      }
+    }
+    if (!found || !found.apiKey) {
+      reply.status(404).send({ error: `Model '${id}' not found or has no API key` });
+      return;
+    }
+    try {
+      const isAnthropic = found.provider === 'anthropic';
+      const defaultBaseUrl = isAnthropic ? 'https://api.anthropic.com' : 'https://api.openai.com/v1';
+      const effectiveBaseUrl = found.baseUrl || defaultBaseUrl;
+      const url = isAnthropic
+        ? `${effectiveBaseUrl.replace(/\/$/, '')}/v1/messages`
+        : `${effectiveBaseUrl.replace(/\/$/, '')}/chat/completions`;
+      const headers: Record<string, string> = isAnthropic
+        ? { 'x-api-key': found.apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }
+        : { 'authorization': `Bearer ${found.apiKey}`, 'content-type': 'application/json' };
+      const payload = {
+        model: found.model,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'Hi' }],
+      };
+      const llmRes = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (llmRes.ok) {
+        const data = await llmRes.json() as { content?: Array<{ text?: string }>; choices?: Array<{ message?: { content?: string } }> };
+        const preview = isAnthropic
+          ? (data.content?.[0]?.text || '').slice(0, 100)
+          : (data.choices?.[0]?.message?.content || '').slice(0, 100);
+        return { success: true, data: { message: 'Connection successful', responsePreview: preview } };
+      }
+      const errText = await llmRes.text().catch(() => '');
+      let errMsg = `HTTP ${llmRes.status}`;
+      try {
+        const errJson = JSON.parse(errText);
+        errMsg = errJson?.error?.message || errJson?.error || errJson?.message || errMsg;
+      } catch {
+        if (errText) errMsg = errText.slice(0, 200);
+      }
+      reply.status(502).send({ error: `${errMsg} (status ${llmRes.status})` });
+    } catch (e: unknown) {
+      request.log.warn({ err: e }, 'test-model-provider failed');
+      reply.status(502).send({ error: toErrorMessage(e) });
+    }
+  });
+
   // POST /api/v1/settings/model-provider — 添加模型提供者
   fastify.post('/api/v1/settings/model-provider', async (request, reply) => {
     if (!requireServerToken(request, reply)) return;
@@ -902,6 +1053,7 @@ export function registerSettingsRoutes(
     if (!requireServerToken(request, reply)) return;
     const { id } = request.params as { id: string };
     const body = (request.body || {}) as {
+      name?: unknown;
       contextWindowSize?: unknown;
       apiKey?: unknown;
       envKey?: unknown;
@@ -970,6 +1122,12 @@ export function registerSettingsRoutes(
         }
         next[foundProvider][foundIndex].baseUrl = baseUrl;
       }
+    }
+    if (typeof body.name === 'string') {
+      const name = body.name.trim();
+      if (name) next[foundProvider][foundIndex].name = name;
+    } else if (body.name === null) {
+      delete next[foundProvider][foundIndex].name;
     }
     if (typeof body.model === 'string') {
       const model = body.model.trim();
@@ -1110,5 +1268,152 @@ export function registerSettingsRoutes(
       }
     }
     return { data: { settings, sessionId: sessionId || null, snapshot } };
+  });
+
+  // ---------------------------------------------------------------------------
+  // Prompts management — 系统提示词 override 管理
+  // ---------------------------------------------------------------------------
+
+  // GET /api/v1/prompts — 返回所有 prompt 的默认值和当前 override
+  fastify.get('/api/v1/prompts', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    try {
+      // 动态 import 所有 prompt 模块获取默认值
+      const { RESEARCH_SYSTEM_PROMPT_BY_LOCALE, EXPLORE_SYSTEM_PROMPT_BY_LOCALE, CODING_SYSTEM_PROMPT_BY_LOCALE, VERIFY_SYSTEM_PROMPT_BY_LOCALE, REVIEW_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/worker/system_prompts.js');
+      const { FRONTEND_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/frontend_system.js');
+      const { BACKEND_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/backend_system.js');
+      const { FULLSTACK_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/fullstack_system.js');
+      const { QA_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/qa_system.js');
+      const { UX_DESIGNER_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/ux_designer_system.js');
+      const { PLANNER_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/planner_system.js');
+      const { EVALUATOR_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/evaluator_system.js');
+      const { ARCHITECT_SYSTEM_PROMPT_BY_LOCALE } = await import('../agents/prompts/architect_system.js');
+      const { getLeaderSystemPrompt } = await import('../agents/prompts/leader/system_prompt.js');
+
+      // 确定当前 locale
+      const lang = getConfigValue('ui.language') as string | undefined;
+      const locale: 'zh' | 'en' = lang === 'en' ? 'en' : 'zh';
+
+      // 读取当前 overrides
+      const overrides = (getConfigValue('prompts.overrides') as Record<string, string> | undefined) || {};
+
+      // Worker 角色默认 prompt map
+      const workerDefaults: Record<string, Record<string, string>> = {
+        research: RESEARCH_SYSTEM_PROMPT_BY_LOCALE,
+        explore: EXPLORE_SYSTEM_PROMPT_BY_LOCALE,
+        coding: CODING_SYSTEM_PROMPT_BY_LOCALE,
+        verify: VERIFY_SYSTEM_PROMPT_BY_LOCALE,
+        review: REVIEW_SYSTEM_PROMPT_BY_LOCALE,
+        frontend: FRONTEND_SYSTEM_PROMPT_BY_LOCALE,
+        backend: BACKEND_SYSTEM_PROMPT_BY_LOCALE,
+        fullstack: FULLSTACK_SYSTEM_PROMPT_BY_LOCALE,
+        qa: QA_SYSTEM_PROMPT_BY_LOCALE,
+        ux_designer: UX_DESIGNER_SYSTEM_PROMPT_BY_LOCALE,
+        planner: PLANNER_SYSTEM_PROMPT_BY_LOCALE,
+        evaluator: EVALUATOR_SYSTEM_PROMPT_BY_LOCALE,
+        architect: ARCHITECT_SYSTEM_PROMPT_BY_LOCALE,
+      };
+
+      const workerLabels: Record<string, string> = {
+        research: 'Research',
+        explore: 'Explore',
+        coding: 'Coding',
+        verify: 'Verify',
+        review: 'Review',
+        frontend: 'Frontend',
+        backend: 'Backend',
+        fullstack: 'Fullstack',
+        qa: 'QA',
+        ux_designer: 'UX Designer',
+        planner: 'Planner',
+        evaluator: 'Evaluator',
+        architect: 'Architect',
+      };
+
+      const prompts: Array<{ key: string; label: string; default: string; override: string | null }> = [];
+
+      // Leader prompts (3 profiles)
+      for (const profile of ['solo', 'team', 'workflow'] as const) {
+        const key = `leader_${profile}`;
+        const label = `Leader (${profile.charAt(0).toUpperCase() + profile.slice(1)})`;
+        prompts.push({
+          key,
+          label,
+          default: getLeaderSystemPrompt(locale, profile),
+          override: overrides[key] || null,
+        });
+      }
+
+      // Worker prompts (13 roles)
+      for (const [key, promptMap] of Object.entries(workerDefaults)) {
+        prompts.push({
+          key,
+          label: workerLabels[key] || key,
+          default: promptMap[locale] || promptMap['zh'] || '',
+          override: overrides[key] || null,
+        });
+      }
+
+      return { prompts };
+    } catch (err) {
+      reply.status(500).send({ error: toErrorMessage(err) });
+    }
+  });
+
+  // PUT /api/v1/prompts/:key — 设置/更新某个 prompt override
+  fastify.put('/api/v1/prompts/:key', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    const { key } = request.params as { key: string };
+    const body = request.body as { content?: string } | null;
+
+    if (!body || typeof body.content !== 'string') {
+      reply.status(400).send({ error: 'Body must contain "content" string field' });
+      return;
+    }
+
+    // 验证 key 是否合法
+    const validKeys = new Set([
+      'leader_solo', 'leader_team', 'leader_workflow',
+      'research', 'explore', 'coding', 'verify', 'review',
+      'frontend', 'backend', 'fullstack', 'qa', 'ux_designer',
+      'planner', 'evaluator', 'architect',
+    ]);
+    if (!validKeys.has(key)) {
+      reply.status(400).send({ error: `Invalid prompt key: ${key}` });
+      return;
+    }
+
+    try {
+      const overrides = (getConfigValue('prompts.overrides') as Record<string, string> | undefined) || {};
+      overrides[key] = body.content;
+      setConfigValue('prompts.overrides', overrides);
+      ConfigSchema.parse(runtimeConfig);
+      saveSettings(runtimeConfig);
+      fireConfigReload();
+      return { success: true, key, override: body.content };
+    } catch (err) {
+      reply.status(500).send({ error: toErrorMessage(err) });
+    }
+  });
+
+  // DELETE /api/v1/prompts/:key — 删除某个 prompt override（恢复默认）
+  fastify.delete('/api/v1/prompts/:key', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+    const { key } = request.params as { key: string };
+
+    try {
+      const overrides = (getConfigValue('prompts.overrides') as Record<string, string> | undefined) || {};
+      if (!(key in overrides)) {
+        return { success: true, key, override: null };
+      }
+      delete overrides[key];
+      setConfigValue('prompts.overrides', overrides);
+      ConfigSchema.parse(runtimeConfig);
+      saveSettings(runtimeConfig);
+      fireConfigReload();
+      return { success: true, key, override: null };
+    } catch (err) {
+      reply.status(500).send({ error: toErrorMessage(err) });
+    }
   });
 }

@@ -5,6 +5,7 @@
  * 参考 Python 版本的 LeaderAgent 实现
  */
 
+import { createHash } from 'node:crypto';
 import {
   contentToPlainText,
   isEmptyContent,
@@ -38,6 +39,7 @@ import {
   LEADER_PROBE_BACKOFF_MULTIPLIER,
   LEADER_PROBE_MAX_INTERVAL_SECONDS,
   LEADER_PROBE_SILENCE_SECONDS,
+  MAX_CONVERSATION_BYTES,
   MAX_CONVERSATION_MESSAGES,
 } from '../config.js';
 import { join } from 'path';
@@ -128,6 +130,7 @@ import { createEventStreamClient, type LlmRoundHooks } from './runtime/LlmRoundE
 import { ToolScheduler } from './runtime/ToolScheduler.js';
 import type { ToolResultContent } from './runtime/ToolResponseProcessor.js';
 import { startToolProgressHeartbeat } from './runtime/ToolProgressHeartbeat.js';
+import type { CapabilityIntentProfile } from '../contracts/types/Autonomy.js';
 import {
   LEADER_PARALLEL_SAFE_TOOLS,
   canBatchExecuteToolCalls as canBatchExecuteToolCallsFn,
@@ -175,6 +178,14 @@ import { DispatchDecisionCoordinator } from './DispatchDecisionCoordinator.js';
 import { resolveModeRuntimeProjection } from '../core/ModeRuntimeProjection.js';
 import { WorktreeService } from '../core/WorktreeService.js';
 import { DatabaseRepositoryAdapter } from '../core/DatabaseRepositories.js';
+import { SharedLedger } from '../core/SharedLedger.js';
+import { buildExpansion, renderExpansionHint } from '../core/SpecFirstPipeline.js';
+import { ContractHotSync } from '../core/ContractHotSync.js';
+import { IntegrationVerifyInjector } from '../core/IntegrationVerifyInjector.js';
+import { DeterministicAcceptance } from '../core/DeterministicAcceptance.js';
+import { RepairStrategyEngine } from '../core/RepairStrategyEngine.js';
+
+
 
 // 导入预设角色的系统提示
 import { getLeaderSystemPrompt } from './prompts/leader/system_prompt.js';
@@ -189,7 +200,6 @@ import { UX_DESIGNER_SYSTEM_PROMPT_BY_LOCALE } from './prompts/ux_designer_syste
 import { PLANNER_SYSTEM_PROMPT_BY_LOCALE } from './prompts/planner_system.js';
 import { EVALUATOR_SYSTEM_PROMPT_BY_LOCALE } from './prompts/evaluator_system.js';
 import { ARCHITECT_SYSTEM_PROMPT_BY_LOCALE } from './prompts/architect_system.js';
-import { buildOfficeModeProtocol } from './office/OfficeModeProtocol.js';
 import { LLM } from '../config/defaults.js';
 import { getModelManager } from '../config/ModelManager.js';
 import { OrchestrationRuntime } from './OrchestrationRuntime.js';
@@ -431,7 +441,15 @@ export class LeaderAgent {
 
   // ─── 黑板架构（feature flag: LINGXIAO_BLACKBOARD） ───
   /** 黑板集成模块 — 持有 blackboardGraph / graphBridge / dispatcherEngine */
-  protected leaderBlackboard: LeaderBlackboard | null = null;
+  protected leaderBlackboard: LeaderBlackboard | null = null;  /** 共享账本 — 替代 BlackboardGraph 的轻量共享状态 */
+  protected readonly sharedLedger = new SharedLedger();  // ─── 0→1 交付引擎 ───
+  // specPipeline 已经是纯函数（buildExpansion/renderExpansionHint），不再需要实例
+  protected contractHotSync: ContractHotSync | null = null;
+  protected readonly integrationInjector = new IntegrationVerifyInjector();
+  protected readonly deterministicAcceptance = new DeterministicAcceptance();
+  protected readonly repairEngine = new RepairStrategyEngine(this.sharedLedger);
+
+
   /** 统一调度器 — 全局唯一 worker dispatch 入口 */
   protected scheduler: UnifiedScheduler | null = null;
   public getScheduler(): UnifiedScheduler | null { return this.scheduler; }
@@ -459,6 +477,14 @@ export class LeaderAgent {
   private waitedDispatchableSig: string | null = null;
   /** 公开访问器 — SessionRoutes 等外部消费者用来读取黑板分析 */
   public getLeaderBlackboard(): LeaderBlackboard | null { return this.leaderBlackboard; }
+  // ─── 0→1 交付引擎 getter ───
+  public getSpecPipeline() { return { buildExpansion, renderExpansionHint }; }
+  public getContractHotSync() { return this.contractHotSync; }
+  public getIntegrationInjector() { return this.integrationInjector; }
+  public getDeterministicAcceptance() { return this.deterministicAcceptance; }
+  public getRepairEngine() { return this.repairEngine; }
+  public getSharedLedger() { return this.sharedLedger; }
+
 
   /**
    * 获取黑板图分析结果（供 LeaderThinkingEngine 注入上下文）
@@ -483,10 +509,17 @@ export class LeaderAgent {
     const tag = binding.tag || `contract:${binding.surface}`;
 
     if (binding.requireContract) {
+      // 方案 C: 同时查 BlackboardGraph 和 SharedLedger——任一有契约即视为就绪
       const graph = this.leaderBlackboard?.blackboardGraph;
-      const liveContract = graph?.getActiveContract(this.sessionId, binding.surface);
-      if (!liveContract) {
-        reasons.push(`等待黑板契约就绪: ${tag}`);
+      const contractEvidence = graph?.getContractEvidence(this.sessionId, binding.surface)
+        ?? graph?.getActiveContract(this.sessionId, binding.surface);
+      const ledgerContract = this.sharedLedger.query({
+        type: 'contract',
+        surface: binding.surface,
+        latestOnly: true,
+      });
+      if (!contractEvidence && ledgerContract.length === 0) {
+        reasons.push(`等待契约就绪: ${tag}（可用 write_contract 直接写入）`);
       }
     }
 
@@ -738,17 +771,12 @@ export class LeaderAgent {
         await this.db.setSessionState(this.sessionId, SESSION_KEYS.LEADER_WAITING_FOR_USER, waiting ? 'true' : 'false');
       },
       recordTokenUsage: (_usage) => {
-        // Token tracking delegated to EternalLoop
-      },
-      buildHealthInput: () => null,
-      executeRecoveryAction: async (_action) => {
-        // Recovery actions delegated to orchestration runtime
-      },
-      escalateBlocked: async (_decision) => {
-        // Blocked escalation delegated to AlertManager via EternalLoop
+        // Token tracking delegated to EternalLoop — LeaderAgent layer is intentionally a no-op.
+        // EternalLoop has its own recordTokenUsage via its deps, this is just to satisfy the interface.
       },
       dispatchReadyTasks: async () => {
-        // 所有派发决策必须经过 Leader LLM，不再自动 tick scheduler
+        // 所有派发决策必须经过 Leader LLM，不再自动 tick scheduler。
+        // Intentional no-op: auto-dispatch path retired in favor of explicit Leader LLM decisions.
         return 0;
       },
       getReadyTaskCount: () => this.board.getReadyTasks().filter(t => t.status === 'dispatchable').length,
@@ -828,6 +856,9 @@ export class LeaderAgent {
       getOrchestrationRuntime: () => this.orchestrationRuntime,
       getLeaderBlackboard: () => this.leaderBlackboard,
       getDispatchDecisionCoordinator: () => this.dispatchDecisionCoordinator,
+      getRepairEngine: () => this.repairEngine,
+      getDeterministicAcceptance: () => this.deterministicAcceptance,
+      getSharedLedger: () => this.sharedLedger,
       persistImplementationArtifact: (input) => this.persistImplementationArtifact(input),
       addMessage: (msg) => this.addMessage(msg),
       captureBughuntWorkerEvidence: (input) => this.captureBughuntWorkerEvidence(input),
@@ -918,6 +949,7 @@ export class LeaderAgent {
       contextManager: this.contextManager,
       llm: this.createLeaderEventStreamClient('Leader-DirectTools'),
       model: this.model,
+      getModel: () => this.model,
       workflowManager: this.workflowManager,
       workflowEngine: this.workflowEngine,
       scheduledTaskManager: this.scheduledTaskManager,
@@ -1011,6 +1043,7 @@ export class LeaderAgent {
       isWaitingForUser: () => this.waitingForUser,
       setWaitingForUser: (v) => { this.waitingForUser = v; },
       isUserInterruptPending: () => this.userInterruptPending,
+      isToolUseSuppressedForCurrentTurn: () => this.isToolUseSuppressedForCurrentTurn(),
       isPendingReview: () => this.pendingReview,
       setIsBusy: (v) => { this.isBusy = v; },
       getLastProgressAtMs: () => this.progressInvariant.lastProgressAtMs,
@@ -1063,12 +1096,21 @@ export class LeaderAgent {
         } catch { /* non-critical */ }
       },
       getBlackboardAnalysis: () => this.getBlackboardAnalysis(),
+      getSharedLedgerContext: () => {
+        const entries = this.sharedLedger.getCompactionSafeEntries();
+        if (entries.length === 0) return null;
+        return this.sharedLedger.formatForContext(entries);
+      },
       upsertSystemSlot: (matcher, content) => this.upsertRuntimeSystemSlot(matcher, content),
       compactContext: () => this.compactContext(),
     });
 
     // ─── 黑板架构初始化（feature flag + mode policy） ───
     this.ensureFullBlackboardInitialized();
+
+    // ─── 0→1 交付引擎: 契约热同步 ───
+    this.contractHotSync = new ContractHotSync(this.sharedLedger, this.bus, this.sessionId);
+    this.contractHotSync.start();
 
     // ─── 统一调度器 — 唯一 worker dispatch 入口 ───
     this.scheduler = new UnifiedScheduler({
@@ -1156,6 +1198,7 @@ export class LeaderAgent {
       teamSynchronizer: this.teamSynchronizer,
       refreshContractBoundTasks: (event) => this.refreshContractBoundTasks(event),
       unsubscribersSink: this._taskTeamUnsubscribers,
+      ledger: this.sharedLedger,
     });
   }
 
@@ -1327,15 +1370,41 @@ export class LeaderAgent {
   }
 
   protected getActiveToolDefinitions(): ToolDefinition[] {
+    if (this.isToolUseSuppressedForCurrentTurn()) {
+      return [];
+    }
     return this.executionController.getActiveToolDefinitions();
+  }
+
+  public isToolUseSuppressedForCurrentTurn(): boolean {
+    const suppressedRaw = this.db.getSessionState(this.sessionId, SESSION_KEYS.TOOL_USE_SUPPRESSION_TURN_ID);
+    const currentRaw = this.db.getSessionState(this.sessionId, SESSION_KEYS.CURRENT_USER_TURN_ID);
+    const suppressedTurn = typeof suppressedRaw === 'number' ? suppressedRaw : typeof suppressedRaw === 'string' ? Number(suppressedRaw) : NaN;
+    const currentTurn = typeof currentRaw === 'number' ? currentRaw : typeof currentRaw === 'string' ? Number(currentRaw) : NaN;
+    return Number.isFinite(suppressedTurn) && suppressedTurn > 0 && Number.isFinite(currentTurn) && Math.trunc(suppressedTurn) === Math.trunc(currentTurn);
   }
 
   protected setExecutionRoute(decision: RouteDecision): void {
     this.executionController.setExecutionRoute(decision);
   }
 
-  protected chooseExecutionRoute(): RouteDecision {
-    return this.executionController.chooseExecutionRoute();
+  protected chooseExecutionRoute(intentProfile?: CapabilityIntentProfile | null): RouteDecision {
+    return this.executionController.chooseExecutionRoute(intentProfile);
+  }
+
+  private beginUserTurn(): number {
+    this.turnCount++;
+    this.db.setSessionState(this.sessionId, SESSION_KEYS.CURRENT_USER_TURN_ID, this.turnCount);
+    this.db.deleteSessionState(this.sessionId, SESSION_KEYS.CAPABILITY_INTENT_PROFILE);
+    this.db.deleteSessionState(this.sessionId, SESSION_KEYS.CAPABILITY_INTENT_TURN_ID);
+    this.db.deleteSessionState(this.sessionId, SESSION_KEYS.AUTONOMY_DECISION_TRACE);
+    if (this.db.getSessionState(this.sessionId, SESSION_KEYS.TOOL_USE_SUPPRESSION_PENDING) === 'true') {
+      this.db.setSessionState(this.sessionId, SESSION_KEYS.TOOL_USE_SUPPRESSION_TURN_ID, this.turnCount);
+      this.db.deleteSessionState(this.sessionId, SESSION_KEYS.TOOL_USE_SUPPRESSION_PENDING);
+    } else {
+      this.db.deleteSessionState(this.sessionId, SESSION_KEYS.TOOL_USE_SUPPRESSION_TURN_ID);
+    }
+    return this.turnCount;
   }
 
   setDelegateMode(reason: string): void {
@@ -1626,8 +1695,20 @@ export class LeaderAgent {
    * 注册系统预置角色
    */
   protected registerBuiltinRoles(): void {
+    // 读取 prompt overrides 并应用
+    const promptOverrides = (globalConfig as { prompts?: { overrides?: Record<string, string> } }).prompts?.overrides || {};
+    const buildWorkerPromptMap = <T extends Record<string, Record<string, string>>>(defaults: T): T => {
+      const result = { ...defaults } as T;
+      for (const [key, override] of Object.entries(promptOverrides)) {
+        if (key in result && override) {
+          (result as Record<string, Record<string, string>>)[key] = { zh: override, en: override };
+        }
+      }
+      return result;
+    };
+
     const roles = collectBuiltinRoles({
-      prompts: {
+      prompts: buildWorkerPromptMap({
         research: RESEARCH_SYSTEM_PROMPT_BY_LOCALE,
         explore: EXPLORE_SYSTEM_PROMPT_BY_LOCALE,
         coding: CODING_SYSTEM_PROMPT_BY_LOCALE,
@@ -1641,7 +1722,7 @@ export class LeaderAgent {
         planner: PLANNER_SYSTEM_PROMPT_BY_LOCALE,
         evaluator: EVALUATOR_SYSTEM_PROMPT_BY_LOCALE,
         architect: ARCHITECT_SYSTEM_PROMPT_BY_LOCALE,
-      },
+      }),
       externalCodingPrompt: CODING_SYSTEM_PROMPT_BY_LOCALE,
       availability: getExternalAgentAvailability(),
       descriptions: {
@@ -1692,7 +1773,7 @@ export class LeaderAgent {
   public addMessage(msg: ChatMessage): void {
     ensureMessageTimestamp(msg);
     this.conversation.push(msg);
-    this.conversation = trimConversationBuffer(this.conversation, MAX_CONVERSATION_MESSAGES);
+    this.conversation = trimConversationBuffer(this.conversation, MAX_CONVERSATION_MESSAGES, MAX_CONVERSATION_BYTES);
   }
 
   /**
@@ -1711,8 +1792,11 @@ export class LeaderAgent {
       : modes.collaboration.mode === 'team'
         ? 'team'
         : 'solo';
+    const promptKey = `leader_${promptProfile}`;
+    const promptOverrides = (globalConfig as { prompts?: { overrides?: Record<string, string> } }).prompts?.overrides || {};
+    const leaderOverride = promptOverrides[promptKey];
     return buildLeaderSystemPrompt({
-      template: this.customPrompt || getLeaderSystemPrompt(locale, promptProfile),
+      template: leaderOverride || this.customPrompt || getLeaderSystemPrompt(locale, promptProfile),
       availableRoles: this.roleRegistry.toLLMContext(),
       sessionId: this.sessionId,
       workspace: this.workspace,
@@ -1733,15 +1817,32 @@ export class LeaderAgent {
    * the current mode immediately, while the historical conversation table
    * remains append-only.
    */
+  private hashContextContent(content: unknown): string {
+    return createHash('sha1').update(contentToPlainText(content)).digest('hex').slice(0, 16);
+  }
+
   protected syncSystemPromptForCurrentMode(): void {
     const prompt = this.getSystemPrompt();
     const firstSystemIndex = this.conversation.findIndex((message) => message.role === 'system');
     if (firstSystemIndex >= 0) {
       if (this.conversation[firstSystemIndex]?.content !== prompt) {
+        const previous = this.conversation[firstSystemIndex]?.content;
         this.conversation[firstSystemIndex] = {
           ...this.conversation[firstSystemIndex],
           content: prompt,
         };
+        this.emitter.emit('context:mutation', {
+          sessionId: this.sessionId,
+          source: 'leader_system_prompt_sync',
+          operation: 'replace',
+          slot: 'leader_primary_system',
+          oldHash: this.hashContextContent(previous),
+          newHash: this.hashContextContent(prompt),
+          oldLength: contentToPlainText(previous).length,
+          newLength: prompt.length,
+          changed: true,
+          reason: 'primary_system_prompt_changed',
+        });
       }
       return;
     }
@@ -1750,7 +1851,19 @@ export class LeaderAgent {
       content: prompt,
       timestamp: Date.now() / 1000,
     });
-    this.conversation = trimConversationBuffer(this.conversation, MAX_CONVERSATION_MESSAGES);
+    this.emitter.emit('context:mutation', {
+      sessionId: this.sessionId,
+      source: 'leader_system_prompt_sync',
+      operation: 'append',
+      slot: 'leader_primary_system',
+      oldHash: null,
+      newHash: this.hashContextContent(prompt),
+      oldLength: 0,
+      newLength: prompt.length,
+      changed: true,
+      reason: 'primary_system_prompt_inserted',
+    });
+    this.conversation = trimConversationBuffer(this.conversation, MAX_CONVERSATION_MESSAGES, MAX_CONVERSATION_BYTES);
   }
 
   /**
@@ -1771,9 +1884,29 @@ export class LeaderAgent {
    * 只改 this.conversation 内存视图，不落库（同 pruneStaleModeHints / syncSystemPromptForCurrentMode 契约）。
    */
   private upsertRuntimeSystemSlot(matcher: SystemSlotMatcher, content: string): boolean {
+    const slot = matcher.kind === 'manifestSlot' ? matcher.slot : matcher.prefix;
+    const before = this.conversation.find((message) => message.role === 'system' && (
+      matcher.kind === 'manifestSlot'
+        ? contentToPlainText(message.content).includes(`slot=${matcher.slot}`)
+        : contentToPlainText(message.content).trimStart().startsWith(matcher.prefix)
+    ));
     const result = upsertSystemSlot(this.conversation, matcher, content);
     if (result.messages !== this.conversation) {
-      this.conversation = trimConversationBuffer(result.messages, MAX_CONVERSATION_MESSAGES);
+      this.conversation = trimConversationBuffer(result.messages, MAX_CONVERSATION_MESSAGES, MAX_CONVERSATION_BYTES);
+    }
+    if (result.changed) {
+      this.emitter.emit('context:mutation', {
+        sessionId: this.sessionId,
+        source: 'leader_runtime_system_slot',
+        operation: before ? 'replace' : 'append',
+        slot,
+        oldHash: before ? this.hashContextContent(before.content) : null,
+        newHash: this.hashContextContent(content),
+        oldLength: before ? contentToPlainText(before.content).length : 0,
+        newLength: content.length,
+        changed: true,
+        reason: 'system_slot_upsert',
+      });
     }
     return result.changed;
   }
@@ -1907,7 +2040,7 @@ export class LeaderAgent {
   /**
    * 切换当前会话使用的模型（立即生效，下一轮 LLM 调用使用新模型）
    */
-  setModel(modelId: string): { ok: boolean; message: string } {
+  setModel(modelId: string, options?: { persistSessionState?: boolean }): { ok: boolean; message: string } {
     if (!modelId) {
       return { ok: false, message: 'modelId 不能为空' };
     }
@@ -1923,7 +2056,9 @@ export class LeaderAgent {
     }
     const prev = this.model;
     this.model = normalizedModelId;
-    void this.db.setSessionState(this.sessionId, SESSION_KEYS.CURRENT_MODEL, normalizedModelId);
+    if (options?.persistSessionState !== false) {
+      void this.db.setSessionState(this.sessionId, SESSION_KEYS.CURRENT_MODEL, normalizedModelId);
+    }
 
     // 同步更新 contextManager 的 context window 大小
     // 优先级：ModelManager 用户配置 > ModelsDevRegistry > 保持现有值
@@ -2572,9 +2707,10 @@ export class LeaderAgent {
           ? initialPrompt
           : contentToPlainText(initialPrompt);
         this.originalGoal = goalText?.trim() ? goalText.trim().slice(0, 500) : null;
+        this.beginUserTurn();
         // Orchestration 不再在用户消息进来时自动启动；Leader 在 leaderThinkAndAct 中
         // 通过任务图与节点元数据自行决定是否进入统一编排内核。
-        this.setExecutionRoute(this.chooseExecutionRoute());
+        this.setExecutionRoute(this.chooseExecutionRoute(null));
         const teamHint = this.getTeamModeHint();
         if (teamHint) {
           this.addMessage({ role: 'system', content: teamHint });
@@ -2594,7 +2730,6 @@ export class LeaderAgent {
           sessionId: this.sessionId,
           status: 'Thinking...',
         });
-        this.turnCount++;
         try {
           if (!this.fileChangesApi) {
             const { FileChangesApi } = await import('../web-server/FileChangesApi.js');
@@ -2764,14 +2899,20 @@ export class LeaderAgent {
       // Eternal silence lock 必须在处理用户消息前主动解锁，
       // 否则刚收到的用户输入会被 fingerprint 锁挡掉一轮 patrol。
       this.progressInvariant.invalidateEternalSilenceLock?.('user_message');
-      const msg = this.userMessageQueue.shift()!;
-      // 通知 TUI 队列长度更新
-      if (this.userMessageQueue.length > 0) {
-        this.emitter.emit('leader:message_dequeued', {
-          sessionId: this.sessionId,
-          queueLength: this.userMessageQueue.length,
-        });
+
+      // ★ 修复：一次性处理队列中的所有用户消息，避免用户连发N条要分N轮处理
+      const allUserMessages: typeof this.userMessageQueue = [];
+      while (this.userMessageQueue.length > 0) {
+        allUserMessages.push(this.userMessageQueue.shift()!);
       }
+
+      // 通知 TUI 队列已清空
+      this.emitter.emit('leader:message_dequeued', {
+        sessionId: this.sessionId,
+        queueLength: 0,
+      });
+
+      const msg = allUserMessages[0];
       const content = contentToPlainText(msg.payload as MessageContent);
 
       if (this.waitingForUser) {
@@ -2780,8 +2921,9 @@ export class LeaderAgent {
         await this.db.setSessionState(this.sessionId, SESSION_KEYS.LEADER_WAITING_FOR_USER, 'false');
         await this.clearConsumedUserInputState();
         const msgContentInner = (msg.payload as MessageContent) ?? '';
+        this.beginUserTurn();
         // Orchestration 触发改由 Leader 在编排内核里通过任务图节点决定
-        this.setExecutionRoute(this.chooseExecutionRoute());
+        this.setExecutionRoute(this.chooseExecutionRoute(null));
         const teamHintInner = this.getTeamModeHint();
         if (teamHintInner) {
           this.addMessage({ role: 'system', content: teamHintInner });
@@ -2791,7 +2933,16 @@ export class LeaderAgent {
           role: 'user',
           content: msgContentInner,
         });
-        this.turnCount++;
+
+        // ★ 修复：追加队列中剩余的所有用户消息（索引1到末尾），让 LLM 一次性看到全部输入
+        for (let i = 1; i < allUserMessages.length; i++) {
+          const extraMsg = allUserMessages[i];
+          const extraContent = (extraMsg.payload as MessageContent) ?? '';
+          if (isEmptyContent(extraContent)) continue;
+          this.addMessage({ role: 'user', content: extraContent });
+          await this.db.saveConversationMessage(this.sessionId, { role: 'user', content: extraContent });
+          leaderLogger.info(`追加用户消息 ${i + 1}/${allUserMessages.length}: ${contentToPlainText(extraContent).substring(0, 50)}...`);
+        }
         try {
           if (!this.fileChangesApi) {
             const { FileChangesApi } = await import('../web-server/FileChangesApi.js');
@@ -2837,15 +2988,25 @@ export class LeaderAgent {
       await this.db.setSessionState(this.sessionId, SESSION_KEYS.LEADER_WAITING_FOR_USER, 'false');
       await this.clearConsumedUserInputState();
       const msgContent = (msg.payload as MessageContent) ?? '';
+      this.beginUserTurn();
       // Orchestration 触发改由 Leader 在编排内核里通过任务图节点决定
-      this.setExecutionRoute(this.chooseExecutionRoute());
+      this.setExecutionRoute(this.chooseExecutionRoute(null));
       const teamHint = this.getTeamModeHint();
       if (teamHint) {
         this.addMessage({ role: 'system', content: teamHint });
       }
       this.addMessage({ role: 'user', content: msgContent });
       await this.db.saveConversationMessage(this.sessionId, { role: 'user', content: msgContent });
-      this.turnCount++;
+
+      // ★ 修复：追加队列中剩余的所有用户消息（索引1到末尾），让 LLM 一次性看到全部输入
+      for (let i = 1; i < allUserMessages.length; i++) {
+        const extraMsg = allUserMessages[i];
+        const extraContent = (extraMsg.payload as MessageContent) ?? '';
+        if (isEmptyContent(extraContent)) continue;
+        this.addMessage({ role: 'user', content: extraContent });
+        await this.db.saveConversationMessage(this.sessionId, { role: 'user', content: extraContent });
+        leaderLogger.info(`追加用户消息 ${i + 1}/${allUserMessages.length}: ${contentToPlainText(extraContent).substring(0, 50)}...`);
+      }
       try {
         if (!this.fileChangesApi) {
           const { FileChangesApi } = await import('../web-server/FileChangesApi.js');
@@ -2878,19 +3039,23 @@ export class LeaderAgent {
 
     // 2. 检查评审状态
     if (this.pendingReview && !hasCompletionToProcess) {
-      // 从队列取一条评审消息
-      const reviewMsg = this.userMessageQueue.shift();
-      if (!reviewMsg) {
+      // ★ 修复：一次性处理队列中的所有评审消息
+      const allReviewMessages: typeof this.userMessageQueue = [];
+      while (this.userMessageQueue.length > 0) {
+        allReviewMessages.push(this.userMessageQueue.shift()!);
+      }
+
+      if (allReviewMessages.length === 0) {
         return 'continue';
       }
-      // 通知 TUI 队列长度更新
-      if (this.userMessageQueue.length > 0) {
-        this.emitter.emit('leader:message_dequeued', {
-          sessionId: this.sessionId,
-          queueLength: this.userMessageQueue.length,
-        });
-      }
-      const reviewMsgsForLoop = [reviewMsg];
+
+      // 通知 TUI 队列已清空
+      this.emitter.emit('leader:message_dequeued', {
+        sessionId: this.sessionId,
+        queueLength: 0,
+      });
+
+      const reviewMsgsForLoop = allReviewMessages;
       for (const msg of reviewMsgsForLoop) {
         const content = contentToPlainText(msg.payload as MessageContent);
         const normalized = content.trim().toLowerCase();
@@ -3272,7 +3437,7 @@ export class LeaderAgent {
           ...(combinedRecoveryReport ? [{ title: 'Worker Recovery Required', content: combinedRecoveryReport }] : []),
           {
             title: 'Leader Verification Directive',
-            content: `评估恢复事件并决定下一步。【硬性前提】对涉及 worker_recovery 的任务，决定重派/接管/终止前，必须先对目标 agent 调用 check_agent_progress 确认其实际运行态（running / 恢复中 / 已退出 / 恢复代数与 respawn 失败计数），禁止仅凭文件产物或本恢复报告文本猜测状态。worker_recovery 表示任务未完成，不得当作 completed；若 auto_retry_scheduled=true 且新 worker 仍在运行，等待并验收，不要重复 dispatch；若 llm_error_kind 为 request_timeout/network_error 等瞬时类，属 provider 抖动，倾向等待而非重派；仅当 check_agent_progress 显示确无进展/卡死/或自动重派失败，才显式重派、接管、阻塞或升级给用户。如本次任务产出了重要的架构决策、技术选型、用户偏好或关键发现，请调用 learn_soul 写入对应的项目级/用户级长期记忆。${dispatchDirective}`,
+            content: `评估恢复事件并决定下一步。【硬性前提】对涉及 worker_recovery 的任务，先用 list_runtime_agents 或当前 Leader Runtime State 确认目标 agent 是否仍存在、是否 active，以及 recoveryLineage / consecutiveRespawnFailures；只有目标 agent 在当前 runtime agents 中存在且仍 active 时，才调用 check_agent_progress 做深查。若恢复报告里的 agent 名已不在当前 runtime agents 中，禁止拿旧名反复调用 check_agent_progress；应改用 list_runtime_agents 返回的真实 agent 名、任务板状态和 auto_retry_scheduled 结果判断等待/接管/重派。worker_recovery 表示任务未完成，不得当作 completed；若 auto_retry_scheduled=true 且新 worker 仍在运行，等待并验收，不要重复 dispatch；若 llm_error_kind 为 request_timeout/network_error 等瞬时类，属 provider 抖动，倾向等待而非重派；仅当当前 active agent 的 check_agent_progress 显示确无进展/卡死，或 list_runtime_agents 显示自动重派失败/无 active worker，才显式重派、接管、阻塞或升级给用户。如本次任务产出了重要的架构决策、技术选型、用户偏好或关键发现，请调用 learn_soul 写入对应的项目级/用户级长期记忆。${dispatchDirective}`,
           },
         ],
       });
@@ -3555,6 +3720,8 @@ export class LeaderAgent {
     for (const msg of pendingUser) {
       const content = (msg.payload as MessageContent) ?? '';
       if (isEmptyContent(content)) continue;
+      this.beginUserTurn();
+      this.setExecutionRoute(this.chooseExecutionRoute(null));
       this.addMessage({ role: 'user', content });
       try {
         await this.db.saveConversationMessage(this.sessionId, { role: 'user', content });
@@ -3717,9 +3884,23 @@ export class LeaderAgent {
     inProgress?: boolean;
     threshold?: number;
   }> {
+    const oldLength = this.conversation.length;
+    const oldHash = this.hashContextContent(this.conversation.map((message) => contentToPlainText(message.content)).join('\n'));
     this.contextManager.setMessages(this.conversation);
     const result = await this.contextManager.forceCompact();
     this.conversation = this.contextManager.getMessages();
+    const newHash = this.hashContextContent(this.conversation.map((message) => contentToPlainText(message.content)).join('\n'));
+    this.emitter.emit('context:mutation', {
+      sessionId: this.sessionId,
+      source: 'leader_compact_context',
+      operation: 'compact',
+      oldHash,
+      newHash,
+      oldLength,
+      newLength: this.conversation.length,
+      changed: oldHash !== newHash || oldLength !== this.conversation.length,
+      reason: result.compacted ? 'context_compacted' : 'compact_noop',
+    });
     return result;
   }
 
@@ -3769,6 +3950,8 @@ export class LeaderAgent {
       executionReason: this.executionReason,
       permissionSummary: summarizePermissionContextForDisplay(this.permManager.permissionContext),
       pendingPermissionRequest: this.permManager.pendingPermissionRequest,
+      leaderModel: this.model,
+      agentModel: this.pool?.getModel?.() ?? undefined,
     };
   }
 

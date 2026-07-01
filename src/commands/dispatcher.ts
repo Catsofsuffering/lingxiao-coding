@@ -45,6 +45,16 @@ import {
   OFFICE_TOOL_NAMES,
   WORKFLOW_TOOL_NAMES,
 } from '../contracts/constants/leaderToolDefinitions.js';
+import {
+  AUTONOMY_LIFECYCLE_PHASES,
+  AUTONOMY_MODES,
+  coerceAutonomyModeAlias,
+  isAutonomyLifecyclePhase,
+  isAutonomyMode,
+  normalizeAutonomyLifecyclePhase,
+  normalizeAutonomyMode,
+} from '../contracts/types/Autonomy.js';
+
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -539,6 +549,50 @@ function handleRouteCommand(ctx: CommandHandlerContext): CommandResult {
   return systemMessage(result.message);
 }
 
+function handleAutonomyCommand(ctx: CommandHandlerContext): CommandResult {
+  const { currentSessionId, sessionManager, db, args } = ctx;
+  if (!currentSessionId) return systemMessage('当前没有活动会话');
+
+  const sub = (args[0] || 'status').toLowerCase();
+  if (sub === 'status') {
+    const mode = normalizeAutonomyMode(db.getSessionState(currentSessionId, SESSION_KEYS.AUTONOMY_MODE));
+    const lifecyclePhase = normalizeAutonomyLifecyclePhase(db.getSessionState(currentSessionId, SESSION_KEYS.AUTONOMY_LIFECYCLE_PHASE));
+    const rawGeneration = db.getSessionState(currentSessionId, SESSION_KEYS.AUTONOMY_MODE_GENERATION);
+    const numericGeneration = typeof rawGeneration === 'number'
+      ? rawGeneration
+      : typeof rawGeneration === 'string'
+        ? Number(rawGeneration)
+        : NaN;
+    const generation = Number.isFinite(numericGeneration) && numericGeneration >= 1 ? Math.trunc(numericGeneration) : 1;
+    const policyId = db.getSessionState(currentSessionId, SESSION_KEYS.AUTONOMY_POLICY_ID);
+    const policyHash = db.getSessionState(currentSessionId, SESSION_KEYS.AUTONOMY_POLICY_HASH);
+    return systemMessage([
+      `Autonomy: ${mode}`,
+      `Lifecycle: ${lifecyclePhase}`,
+      `Generation: ${generation}`,
+      `Policy: ${typeof policyId === 'string' && policyId.trim() ? policyId : '(none)'}`,
+      `Hash: ${typeof policyHash === 'string' && policyHash.trim() ? policyHash : '(none)'}`,
+    ].join('\n'));
+  }
+
+  const canonical = coerceAutonomyModeAlias(sub);
+  if (!isAutonomyMode(canonical)) {
+    return systemMessage(`用法: /autonomy <status|${AUTONOMY_MODES.join('|')}|full_auto> [${AUTONOMY_LIFECYCLE_PHASES.join('|')}]`);
+  }
+
+  const phaseArg = args[1]?.toLowerCase();
+  if (phaseArg && !isAutonomyLifecyclePhase(phaseArg)) {
+    return systemMessage(`Lifecycle phase 必须是: ${AUTONOMY_LIFECYCLE_PHASES.join('|')}`);
+  }
+
+  const result = sessionManager.setAutonomyMode(currentSessionId, canonical, {
+    lifecyclePhase: phaseArg,
+    updatedBy: 'tui',
+    reason: 'slash_command_autonomy',
+  });
+  return systemMessage(result.message);
+}
+
 async function handleEternalCommand(ctx: CommandHandlerContext): Promise<CommandResult> {
   const { currentSessionId, sessionManager, args, commandLine, command } = ctx;
   if (!currentSessionId) return systemMessage('当前没有活动会话');
@@ -895,6 +949,85 @@ async function handleChangesCommand(ctx: CommandHandlerContext): Promise<Command
   const { currentSessionId, db } = ctx;
   const { buildChangesReport } = await import('./changesReport.js');
   return { action: 'report_modal' as const, title: '文件变更', report: await buildChangesReport(db, currentSessionId), content: '' };
+}
+
+// ─── /bug ─────────────────────────────────────────────────────────────────────
+
+/**
+ * /bug —— 生成可提交的诊断包，并展示文件路径 + 可复制的 GitHub issue 预填正文。
+ * 调用 buildDiagnosticsBundle 聚合 lingxiao.log 尾部 / 最新 crash / agent_logs / 环境信息，
+ * 内容已由 Diagnostics 模块脱敏（无明文 apiKey/token/password）。
+ */
+async function handleBugCommand(ctx: CommandHandlerContext): Promise<CommandResult> {
+  const { currentSessionId } = ctx;
+  const { buildDiagnosticsBundle } = await import('../core/Diagnostics.js');
+  const { redactSensitiveString } = await import('../core/CrashReporter.js');
+  const { VERSION } = await import('../version.js');
+
+  let bundle: { markdown: string; files: string[]; bundlePath?: string };
+  try {
+    bundle = await buildDiagnosticsBundle({ sessionId: currentSessionId, zip: true });
+  } catch (err) {
+    return systemMessage(`生成诊断包失败：${getErrorMessage(err)}`);
+  }
+
+  // 从诊断 markdown 中截取「最近错误摘要」供 issue 预填，限制长度并再脱敏一次。
+  const issueBody = buildIssueBody(VERSION, bundle.markdown);
+
+  const lines: string[] = [];
+  lines.push('已生成诊断包（内容已脱敏，可直接附到 GitHub issue）：');
+  lines.push('');
+  if (bundle.files.length > 0) {
+    lines.push('生成的文件：');
+    for (const f of bundle.files) lines.push(`  • ${f}`);
+  } else {
+    lines.push('注意：诊断文件落盘失败，以下正文仍可手动复制。');
+  }
+  lines.push('');
+  lines.push('─── 可复制的 GitHub issue 预填正文 ───');
+  lines.push('');
+  lines.push(redactSensitiveString(issueBody));
+
+  return {
+    action: 'report_modal' as const,
+    title: 'Bug 诊断包',
+    report: lines.join('\n'),
+    content: bundle.files.length > 0
+      ? `已生成诊断包：${bundle.files[bundle.files.length - 1]}`
+      : '诊断包已生成（落盘失败，正文见面板）。',
+  };
+}
+
+/**
+ * 从诊断 markdown 抽取环境 / 最近错误摘要，组装 issue 预填正文。
+ * 仅截取前若干行作为摘要，避免 issue 正文过长。
+ */
+function buildIssueBody(version: string, markdown: string): string {
+  const platform = `${process.platform}/${process.arch}`;
+  const node = process.version;
+  // 取诊断 markdown 的前 60 行作为「最近错误/日志摘要」，控制 issue 正文长度。
+  const summaryLines = markdown.split('\n').slice(0, 60).join('\n');
+  return [
+    '## 环境',
+    `- 凌霄版本：${version}`,
+    `- 平台：${platform}`,
+    `- Node：${node}`,
+    '',
+    '## 问题描述',
+    '<!-- 请描述你遇到的问题、期望行为与实际行为 -->',
+    '',
+    '## 复现步骤',
+    '1. ',
+    '2. ',
+    '3. ',
+    '',
+    '## 最近诊断摘要（已脱敏，截断）',
+    '```',
+    summaryLines,
+    '```',
+    '',
+    '> 完整诊断包文件路径见 CLI 输出；如可附加，请上传 diagnostics-*.zip。',
+  ].join('\n');
 }
 
 // ─── /rewind helpers ─────────────────────────────────────────────────────────
@@ -1526,6 +1659,7 @@ const commandRegistry = new Map<string, CommandHandler>([
   ['/workflow', handleWorkflowCommand],
   ['/team', handleTeamCommand],
   ['/route', handleRouteCommand],
+  ['/autonomy', handleAutonomyCommand],
   ['/eternal', handleEternalCommand],
   ['/mode', handleModeCommand],
   ['/allow-tool', handleToolPermissionCommand],
@@ -1548,6 +1682,7 @@ const commandRegistry = new Map<string, CommandHandler>([
   ['/logs', handleLogsCommand],
   ['/traces', handleTracesCommand],
   ['/changes', handleChangesCommand],
+  ['/bug', handleBugCommand],
   ['/rewind', handleRewindCommand],
   ['/wiki', handleWikiCommand],
   ['/contract', handleContractCommand],

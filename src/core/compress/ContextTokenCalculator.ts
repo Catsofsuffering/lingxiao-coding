@@ -7,6 +7,7 @@ import { getEncoding } from 'js-tiktoken';
 import { thinkingBlocksToText, type ChatMessage } from '../../llm/types.js';
 import { config as runtimeConfig } from '../../config.js';
 import { getEncodingForModel } from '../TiktokenCache.js';
+import { coreLogger } from '../Log.js';
 
 export type TiktokenEncoder = {
   encode: (text: string) => { length: number };
@@ -43,7 +44,7 @@ export async function getEncoder(model: string): Promise<TiktokenEncoder> {
       const encoder = getEncoding(encodingName) as unknown as TiktokenEncoder;
       _globalEncoderCache.set(model, encoder);
     } catch (error) {
-      console.warn(`[ContextTokenCalculator] 获取编码器失败：${error}，回退 cl100k_base`);
+      coreLogger.warn(`[ContextTokenCalculator] 获取编码器失败：${error}，回退 cl100k_base`);
       const encoder = getEncoding('cl100k_base') as unknown as TiktokenEncoder;
       _globalEncoderCache.set(model, encoder);
     }

@@ -5,8 +5,10 @@
  * **结构化**入口——LLM 给 {mode, theme, slides|blocks, exports}，引擎装配
  * 凌霄中式主题 HTML，并按需导出到 PDF / PNG / DOCX / XLSX / PPTX。
  *
- * 这是"单一 HTML 底座代替 PPT/DOC/XLS/PDF"的产品落点：HTML 是唯一渲染源，
- * 用户要什么格式就导什么——PDF/PPTX 走 Chromium 高保真，DOCX/XLSX 走可编辑映射。
+ * HTML 底座用于 HTML-first 产物和多格式高保真导出；不替代明确要求的
+ * 原生可编辑 Office。明确需要可编辑 PPTX/DOCX 时优先使用 generate_pptx/generate_docx。
+ * 本工具导出的 PPTX 是 Chromium 渲染后的逐页图片拼装，视觉 1:1 但文字不可编辑；
+ * DOCX/XLSX 走结构化可编辑映射，PDF 走 Chromium 高保真。
  */
 
 import { z } from 'zod';
@@ -61,7 +63,7 @@ const GenerateHtmlDocumentSchema = z.object({
 
 export class GenerateHtmlDocumentTool extends Tool {
   name = 'generate_html_document';
-  description = `凌霄 HTML 办公底座（世界级）：用结构化数据生成带中式审美的 HTML 演示/文档，并可一键导出 PDF/PNG/DOCX/XLSX/PPTX。HTML 是唯一渲染源——要 PPT 走 pptx、要 Word 走 docx、要表格走 xlsx、要分发走 pdf，全部从同一份 HTML 导出。
+  description = `凌霄 HTML 办公底座（世界级）：用结构化数据生成带中式审美的 HTML 演示/文档，并可一键导出 PDF/PNG/DOCX/XLSX/PPTX。本工具用于 HTML-first 产物和多格式高保真导出；明确需要原生可编辑 PPTX/DOCX 时优先使用 generate_pptx/generate_docx。
 
 何时用本工具（而非 generate_html_presentation）：
 - 需要凌霄办公主题（墨韵/朱砂/青锋/金箔/宣纸/编辑/暗夜）的演示或文档。

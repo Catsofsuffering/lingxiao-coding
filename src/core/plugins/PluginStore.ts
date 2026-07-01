@@ -67,6 +67,24 @@ export interface PluginDescriptor {
 }
 
 const PLUGINS_DIR_NAME = 'plugins';
+const PLUGIN_DISCOVERY_CACHE_TTL_MS = 5_000;
+
+type PluginSourceRoot = { dir: string; scope: PluginScope };
+
+interface PluginDiscoveryCacheEntry {
+  signature: string;
+  expiresAt: number;
+  plugins: PluginDescriptor[];
+}
+
+const pluginDiscoveryCache = new Map<string, PluginDiscoveryCacheEntry>();
+let pluginDiscoveryGeneration = 0;
+
+export function invalidatePluginDiscoveryCache(): void {
+  pluginDiscoveryGeneration += 1;
+  pluginDiscoveryCache.clear();
+}
+
 
 function unique<T>(items: T[]): T[] {
   return Array.from(new Set(items));
@@ -117,13 +135,14 @@ function persistPluginDisabledIds(ids: string[]): void {
   };
   ConfigSchema.parse(runtimeConfig);
   saveSettings(runtimeConfig);
+  invalidatePluginDiscoveryCache();
 }
 
 export function getGlobalPluginsDir(): string {
   return join(CONFIG_DIR, PLUGINS_DIR_NAME);
 }
 
-export function getPluginSourceRoots(workspace?: string): Array<{ dir: string; scope: PluginScope }> {
+export function getPluginSourceRoots(workspace?: string): PluginSourceRoot[] {
   const roots: Array<{ dir: string; scope: PluginScope }> = [];
   if (workspace) {
     roots.push({ dir: join(workspace, '.lingxiao', PLUGINS_DIR_NAME), scope: 'project' });
@@ -146,6 +165,88 @@ export function getPluginSourceRoots(workspace?: string): Array<{ dir: string; s
 
 function readDisabledPluginIds(): Set<string> {
   return new Set((getPluginConfig().disabled_ids || []).filter((id) => typeof id === 'string' && id.length > 0));
+}
+
+function safeStatMtimeMs(path: string): number {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function pluginWorkspaceCacheKey(workspace?: string): string {
+  return workspace ? resolve(workspace) : '<global>';
+}
+
+function pluginConfigSignature(): string {
+  const cfg = getPluginConfig();
+  const disabled = (cfg.disabled_ids || [])
+    .filter((id) => typeof id === 'string' && id.length > 0)
+    .slice()
+    .sort()
+    .join(',');
+  const dirs = (cfg.dirs || [])
+    .filter((dir) => typeof dir === 'string' && dir.trim().length > 0)
+    .map((dir) => resolve(dir))
+    .sort()
+    .join('|');
+  return `gen=${pluginDiscoveryGeneration};disabled=${disabled};dirs=${dirs}`;
+}
+
+function pluginManifestSignature(root: string): string {
+  return [
+    safeStatMtimeMs(join(root, '.lingxiao-plugin', 'plugin.json')),
+    safeStatMtimeMs(join(root, '.codex-plugin', 'plugin.json')),
+  ].join(':');
+}
+
+function computePluginDiscoverySignature(workspace?: string): string {
+  const parts: string[] = [pluginConfigSignature()];
+  for (const root of getPluginSourceRoots(workspace)) {
+    parts.push(`${root.scope}:${root.dir}:${safeStatMtimeMs(root.dir)}`);
+    if (!existsSync(root.dir)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(root.dir).slice().sort();
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = join(root.dir, entry);
+      let stat;
+      try {
+        stat = statSync(full);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+      parts.push(`${entry}:${stat.mtimeMs}:${pluginManifestSignature(full)}`);
+    }
+  }
+  return parts.join('\n');
+}
+
+function clonePluginDescriptor(plugin: PluginDescriptor): PluginDescriptor {
+  return {
+    ...plugin,
+    keywords: [...plugin.keywords],
+    interface: { ...plugin.interface },
+    contributions: {
+      skills: plugin.contributions.skills.map((skill) => ({ ...skill })),
+      mcp: plugin.contributions.mcp.map((mcp) => ({ ...mcp, server: { ...mcp.server } as McpServerConfig })),
+      apps: [...plugin.contributions.apps],
+      assets: [...plugin.contributions.assets],
+      tools: [...plugin.contributions.tools],
+      hooks: [...plugin.contributions.hooks],
+      scripts: [...plugin.contributions.scripts],
+    },
+    origin: { ...plugin.origin },
+  };
+}
+
+function clonePluginDescriptors(plugins: PluginDescriptor[]): PluginDescriptor[] {
+  return plugins.map(clonePluginDescriptor);
 }
 
 function manifestToMcpServer(
@@ -270,6 +371,14 @@ function descriptorFromLoaded(loaded: LoadedPluginManifest, scope: PluginScope, 
 }
 
 export function discoverPlugins(workspace?: string): PluginDescriptor[] {
+  const cacheKey = pluginWorkspaceCacheKey(workspace);
+  const now = Date.now();
+  const signature = computePluginDiscoverySignature(workspace);
+  const cached = pluginDiscoveryCache.get(cacheKey);
+  if (cached && cached.signature === signature && cached.expiresAt > now) {
+    return clonePluginDescriptors(cached.plugins);
+  }
+
   const disabled = readDisabledPluginIds();
   const byId = new Map<string, PluginDescriptor>();
   for (const root of getPluginSourceRoots(workspace)) {
@@ -285,7 +394,13 @@ export function discoverPlugins(workspace?: string): PluginDescriptor[] {
       }
     }
   }
-  return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const plugins = Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+  pluginDiscoveryCache.set(cacheKey, {
+    signature,
+    expiresAt: now + PLUGIN_DISCOVERY_CACHE_TTL_MS,
+    plugins,
+  });
+  return clonePluginDescriptors(plugins);
 }
 
 export function getPluginById(pluginId: string, workspace?: string): PluginDescriptor | null {
@@ -464,6 +579,7 @@ export function installLocalPlugin(sourcePath: string, workspace?: string): Plug
   }
   const installed = loadPluginManifest(targetRoot);
   if (!installed) throw new Error(`Installed plugin manifest not found: ${targetRoot}`);
+  invalidatePluginDiscoveryCache();
   const descriptor = descriptorFromLoaded(installed, 'global', readDisabledPluginIds());
   syncPluginMcpContributions(workspace);
   return descriptor;
@@ -473,6 +589,7 @@ export function uninstallPlugin(pluginId: string): boolean {
   const targetRoot = join(getGlobalPluginsDir(), pluginId);
   if (!existsSync(targetRoot)) return false;
   rmSync(targetRoot, { recursive: true, force: true });
+  invalidatePluginDiscoveryCache();
   const disabled = readDisabledPluginIds();
   disabled.delete(pluginId);
   persistPluginDisabledIds(Array.from(disabled));

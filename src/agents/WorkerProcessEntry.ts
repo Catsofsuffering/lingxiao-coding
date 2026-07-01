@@ -16,9 +16,11 @@ import type {
   WorkerParentMessage,
 } from '../core/WorkerProcessRunner.js';
 import type { ChatMessage } from '../llm/types.js';
+import type { TokenUsageView } from '../types/canonical.js';
 import type { BusMessageType } from '../core/BusMessageTypes.js';
 import type { AgentExecutionResult } from './AgentExecutionResult.js';
 import { agentLogger } from '../core/Log.js';
+import { writeCrashReport } from '../core/CrashReporter.js';
 import { classifyDbClosedWorkerFailure } from './WorkerDbClosedClassification.js';
 
 // 检查是否在子进程中运行
@@ -145,14 +147,23 @@ const heartbeatInterval = setInterval(() => {
   sendMessage({
     type: 'heartbeat',
     timestamp: Date.now(),
-    payload: { phase: currentPhase },
+    payload: { phase: currentPhase, rss: process.memoryUsage().rss },
   });
 }, 30000);
 
 function clearRuntime(): void {
+  // 幂等：可被 gracefulShutdown / exit handler / uncaughtException 重复调用。
+  // cleanupRuntime 首次执行后置 null，后续调用为 no-op。
   clearInterval(heartbeatInterval);
-  cleanupRuntime?.();
+  const cleanup = cleanupRuntime;
   cleanupRuntime = null;
+  try {
+    cleanup?.();
+  } catch (error) {
+    // 退出路径上的清理失败不应阻塞退出；robustDatabaseClose 内部已吞错，
+    // 这里兜底防止其它 cleanup 抛出导致 exit 异常。
+    agentLogger?.warn?.(`[Worker] cleanup error during shutdown: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function gracefulShutdown(signal: string): void {
@@ -181,6 +192,16 @@ function registerSignalHandlers() {
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGHUP', () => gracefulShutdown('SIGHUP'));
 
+  // 进程退出兜底：无论通过哪条路径退出（gracefulShutdown 已跑过则 cleanupRuntime=null 幂等），
+  // 都确保 db.close()→wal_checkpoint(TRUNCATE) 被执行，彻底释放写锁。
+  // 这是防止"终端被关 / Ctrl+\ / OOM / supervisor 直接 kill"后锁残留的最后一道防线。
+  process.on('exit', () => {
+    if (cleanupRuntime) {
+      try { cleanupRuntime(); } catch { /* tolerate — exit path must not throw */ }
+      cleanupRuntime = null;
+    }
+  });
+
   // Worker 进程 uncaughtException 保护：
   // 已知可恢复的 DB 错误（SQLITE_BUSY、连接关闭）不应杀死 worker。
   // 非恢复性错误仍正常退出（发送 failed IPC 后 exit(1)）。
@@ -195,6 +216,21 @@ function registerSignalHandlers() {
     }
     // 不可恢复：发送 failed 通知后退出
     console.error(`[Worker ${payload.agentName}] Fatal uncaughtException:`, error);
+    // 结构化崩溃落盘（best-effort，永不抛）。source 用 CrashReporter 枚举中的 'worker'，
+    // 具体来源/上下文（agentName/taskId/sessionId）进 extra 便于排查。
+    try {
+      const crashPath = writeCrashReport({
+        error,
+        source: 'worker',
+        sessionId: payload.sessionId,
+        extra: {
+          agentName: payload.agentName,
+          taskId: payload.taskId,
+          phase: 'worker-uncaughtException',
+        },
+      });
+      if (crashPath) console.error(`[Worker ${payload.agentName}] 崩溃报告已保存: ${crashPath}`);
+    } catch { /* crash report best-effort */ }
     sendMessage({
       type: 'failed',
       timestamp: Date.now(),
@@ -279,6 +315,11 @@ async function main(): Promise<void> {
       agentLogger.warn(`[Worker ${payload.agentName}] 黑板图初始化失败，跳过`);
     }
     cleanupRuntime = () => {
+      for (const unsubscribe of bridgeUnsubscribers) {
+        try { unsubscribe(); } catch { /* tolerate */ }
+      }
+      // robustDatabaseClose 由 DatabaseManager.close() 内部调用，
+      // 确保 WAL 锁文件句柄完全释放，避免异常退出时锁残留。
       db.close();
     };
     reportPhase('runtime:init:done');
@@ -325,21 +366,25 @@ async function main(): Promise<void> {
 
     cleanupRuntime = () => {
       for (const unsubscribe of bridgeUnsubscribers) {
-        unsubscribe();
+        try { unsubscribe(); } catch { /* tolerate */ }
       }
+      // robustDatabaseClose 由 DatabaseManager.close() 内部调用，
+      // 确保 WAL 锁文件句柄完全释放，避免异常退出时锁残留。
       db.close();
     };
 
-    const usageMap = new Map<string, { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }>();
+    const usageMap = new Map<string, TokenUsageView>();
     const tokenTracker = {
-      addUsage: (agentId: string, usage: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number }, modelName?: string) => {
-        const current = usageMap.get(agentId) || { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 };
+      addUsage: (agentId: string, usage: TokenUsageView, modelName?: string) => {
+        const current = usageMap.get(agentId) || { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 };
         const next = {
           prompt: current.prompt + usage.prompt,
           completion: current.completion + usage.completion,
           total: current.total + usage.total,
           cache_read: (current.cache_read ?? 0) + (usage.cache_read ?? 0),
           cache_creation: (current.cache_creation ?? 0) + (usage.cache_creation ?? 0),
+          reasoning: (current.reasoning ?? 0) + (usage.reasoning ?? 0),
+          credit: (current.credit ?? 0) + (usage.credit ?? 0),
         };
         usageMap.set(agentId, next);
         sendMessage({

@@ -248,7 +248,7 @@ export function summarizeToolCall(toolName: string, input: unknown): {
 
   // ── Agent 操作（通用模式：agent_name 是关键参数） ──
   const agentOpTools = new Set([
-    'check_agent_progress', 'nudge_agent', 'pause_agent', 'resume_agent',
+    'list_runtime_agents', 'check_agent_progress', 'nudge_agent', 'pause_agent', 'resume_agent',
     'terminate_agent', 'compact_agent_context', 'retry_agent_llm',
     'intervene_agent', 'confirm_intervention',
     'send_message_to_agent', 'request_work_note',

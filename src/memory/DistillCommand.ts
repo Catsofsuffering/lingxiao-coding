@@ -12,6 +12,8 @@ import { coreLogger } from '../core/Log.js';
 import { contentToPlainText } from '../contracts/types/Message.js';
 import { MemoryService } from './MemoryService.js';
 import { createLLMClient } from '../llm/Client.js';
+import { createLlmGuard } from '../agents/LlmGuard.js';
+import { classifyLLMError } from '../llm/errors.js';
 import { readRecentTrajectory, renderTrajectory, resolveSessionDbPath } from './TrajectoryReader.js';
 import { AssetUsageStore, type AssetUsageStats } from './AssetUsageStore.js';
 import type { DistillOptions, DistillResult, DistillAsset, AssetForm, TrajectoryTurn } from './types.js';
@@ -268,15 +270,21 @@ export class DistillCommand {
     let llmOutput: string;
     try {
       const llm = createLLMClient();
-      const response = await llm.generateContent({
-        messages: [
+      const guard = createLlmGuard({ actorLabel: 'Distill', classifyError: classifyLLMError });
+      const response = await guard.call(
+        llm,
+        [
           { role: 'system', content: DISTILL_SYSTEM_PROMPT },
           { role: 'user', content: userMessage },
         ],
-        model: '',
-        maxTokens: 4000,
-        sampling: { temperature: 0.2 },
-      });
+        '',
+        undefined,
+        false,
+        undefined,
+        undefined,
+        { actorType: 'system', actorLabel: 'Distill', purpose: 'generic', requestedModel: '' },
+        { maxTokens: 4000, sampling: { temperature: 0.2 } },
+      );
       llmOutput = contentToPlainText(response.content);
     } catch (err) {
       coreLogger.warn(`[DistillCommand] LLM call failed: ${err instanceof Error ? err.message : err}`);

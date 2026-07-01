@@ -10,6 +10,9 @@ import type { WorkflowManager } from '../core/workflow/WorkflowManager.js';
 import type { WorkflowEngine } from '../core/workflow/WorkflowEngine.js';
 import type { BlackboardGraph } from '../core/blackboard/BlackboardGraph.js';
 import type { ScheduledTaskManager } from '../core/ScheduledTaskManager.js';
+import { resolveModeRuntimeProjection } from '../core/ModeRuntimeProjection.js';
+import { SESSION_KEYS } from '../core/SessionStateKeys.js';
+import { evaluateLeaderAutonomyToolGate, type LeaderAutonomyToolGateResult } from './leader/LeaderToolGates.js';
 
 export interface LeaderDirectToolsConfig {
   toolRegistry: ToolRegistry;
@@ -21,6 +24,11 @@ export interface LeaderDirectToolsConfig {
   contextManager: ContextManager;
   llm: ContentGenerator;
   model: string;
+  /**
+   * Current Leader model resolver. Direct tools may invoke LLM after a session-level
+   * model switch, so do not rely on the constructor-time model snapshot.
+   */
+  getModel?: () => string;
   workflowManager?: WorkflowManager;
   workflowEngine?: WorkflowEngine;
   scheduledTaskManager?: ScheduledTaskManager;
@@ -41,7 +49,7 @@ export class LeaderDirectToolsExecutor {
   private bus: MessageBus;
   private contextManager: ContextManager;
   private llm: ContentGenerator;
-  private model: string;
+  private getModel: () => string;
   private workflowManager?: WorkflowManager;
   private workflowEngine?: WorkflowEngine;
   private scheduledTaskManager?: ScheduledTaskManager;
@@ -56,7 +64,7 @@ export class LeaderDirectToolsExecutor {
     this.bus = config.bus;
     this.contextManager = config.contextManager;
     this.llm = config.llm;
-    this.model = config.model;
+    this.getModel = config.getModel ?? (() => config.model);
     this.workflowManager = config.workflowManager;
     this.workflowEngine = config.workflowEngine;
     this.scheduledTaskManager = config.scheduledTaskManager;
@@ -65,6 +73,27 @@ export class LeaderDirectToolsExecutor {
 
   getDefinitions(toolNames?: string[]): ToolDefinition[] {
     return this.toolRegistry.getDefinitions(toolNames);
+  }
+
+  private recordAutonomyDecision(toolName: string, gate: LeaderAutonomyToolGateResult): void {
+    const gateResult = gate.ok
+      ? 'allow'
+      : gate.gateKind === 'confirmation_required'
+        ? 'confirmation_required'
+        : 'blocked';
+    const trace = {
+      toolName,
+      decision: gate.decision,
+      gateResult,
+      gateKind: gate.ok ? null : gate.gateKind,
+      recordedAt: Date.now(),
+      source: 'leader_tool_gate',
+    };
+    this.db.setSessionState(this.sessionId, SESSION_KEYS.AUTONOMY_DECISION_TRACE, JSON.stringify(trace));
+    this.emitter.emit('leader:autonomy_decision', {
+      sessionId: this.sessionId,
+      ...trace,
+    });
   }
 
   async execute(
@@ -86,6 +115,22 @@ export class LeaderDirectToolsExecutor {
     permissionContext: ToolPermissionContext,
     toolCallId?: string
   ): Promise<{ ok: boolean; content: string }> {
+    const autonomyGate = evaluateLeaderAutonomyToolGate({
+      toolName: name,
+      args,
+      modes: resolveModeRuntimeProjection({
+        sessionId: this.sessionId,
+        db: this.db,
+        blackboardAvailable: Boolean(this.getBlackboardGraph?.()),
+        permissionContext,
+      }),
+      permissionContext,
+    });
+    this.recordAutonomyDecision(name, autonomyGate);
+    if (!autonomyGate.ok) {
+      return { ok: false, content: autonomyGate.message };
+    }
+
     const result = await this.toolRegistry.execute(name, args, {
       db: this.db,
       sessionId: this.sessionId,
@@ -96,7 +141,7 @@ export class LeaderDirectToolsExecutor {
       bus: this.bus,
       permissionContext,
       llm: this.llm,
-      model: this.model,
+      model: this.getModel(),
       workflowManager: this.workflowManager,
       workflowEngine: this.workflowEngine,
       scheduledTaskManager: this.scheduledTaskManager,

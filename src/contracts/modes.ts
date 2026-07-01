@@ -24,6 +24,7 @@ import {
   OFFICE_TOOL_NAMES,
   WORKFLOW_TOOL_NAMES,
 } from './constants/toolNames.js';
+import { buildOfficeModeProtocol } from '../agents/office/OfficeModeProtocol.js';
 
 /** 会话级模式标识符。三个并列的模式/插件 toggle。 */
 export type ModeId = 'bughunt' | 'office' | 'workflow';
@@ -57,6 +58,19 @@ export interface ModeDescriptor {
   readonly exclusiveWith?: readonly ModeId[];
   /** 执行卫生配置；缺省 = 不启用 worktree 隔离。 */
   readonly executionHygiene?: ModeExecutionHygiene;
+  /**
+   * 声明式 prompt 注入器（模式激活时才注入）。
+   *
+   * - leader：注入 Leader 动态上下文（LeaderContextBuilder.getDynamicContext）。
+   * - worker：注入 Worker 任务提示词（BaseAgentRuntime.buildTaskPrompt）。
+   *
+   * 缺省 = 该模式不注入任何 prompt 文本。这是全模式隔离的地基：
+   * 模式关闭时其 prompt 文本完全不进任何 Agent 上下文。
+   */
+  readonly promptBuilder?: {
+    readonly leader?: () => string;
+    readonly worker?: () => string;
+  };
 }
 
 /**
@@ -78,6 +92,11 @@ export const MODE_REGISTRY: Readonly<Record<ModeId, ModeDescriptor>> = Object.fr
     toolNames: OFFICE_TOOL_NAMES,
     requiresExecuteGate: true,
     // office 工具产出文档到用户可见工作区，不启用 worktree 隔离。
+    // office 激活时同时给 Leader 与 Worker 注入办公审美协议（JS 路线）。
+    promptBuilder: {
+      leader: buildOfficeModeProtocol,
+      worker: buildOfficeModeProtocol,
+    },
   },
   workflow: {
     id: 'workflow',

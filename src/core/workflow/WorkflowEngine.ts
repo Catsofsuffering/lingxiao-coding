@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'crypto';
 import { ExecutionGraph } from './ExecutionGraph.js';
+import { coreLogger } from '../Log.js';
 import { VariableResolver } from './VariableResolver.js';
 import { buildVariableScope } from './variableScope.js';
 import { evaluateExpression } from './expressionEvaluator.js';
@@ -412,7 +413,7 @@ export class WorkflowEngine {
           this.workflowCache.delete(workflowId);
         }
         this.saveExecution(context).catch(err => {
-          console.error('Failed to save execution:', err);
+          coreLogger.error('Failed to save execution:', err);
         });
       });
 
@@ -1312,7 +1313,7 @@ export class WorkflowEngine {
           this.workflowCache.delete(context.workflowId);
         }
         this.saveExecution(context).catch(err => {
-          console.error('Failed to save execution after resume:', err);
+          coreLogger.error('Failed to save execution after resume:', err);
         });
       });
   }
@@ -1376,7 +1377,7 @@ export class WorkflowEngine {
         });
       }
     } catch (err) {
-      console.error('[WorkflowEngine] Failed to save execution:', err);
+      coreLogger.error('[WorkflowEngine] Failed to save execution:', err);
     }
   }
 

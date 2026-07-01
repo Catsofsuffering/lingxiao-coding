@@ -546,6 +546,7 @@ export class QQBot extends EventEmitter {
     this.heartbeatTimer = setInterval(() => {
       this.wsSend({ op: GatewayOp.HEARTBEAT, d: null });
     }, intervalMs);
+    this.heartbeatTimer.unref?.();
   }
 
   private wsSend(data: QQWsPayload): void {

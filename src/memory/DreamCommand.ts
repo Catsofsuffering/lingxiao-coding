@@ -14,6 +14,8 @@ import { coreLogger } from '../core/Log.js';
 import { contentToPlainText } from '../contracts/types/Message.js';
 import { MemoryService } from './MemoryService.js';
 import { createLLMClient } from '../llm/Client.js';
+import { createLlmGuard } from '../agents/LlmGuard.js';
+import { classifyLLMError } from '../llm/errors.js';
 import { deduplicateMemory } from './MemoryDeduplicator.js';
 import { readRecentTrajectory, renderTrajectory } from './TrajectoryReader.js';
 import type { DreamOptions, DreamResult, TrajectoryTurn } from './types.js';
@@ -231,15 +233,21 @@ export class DreamCommand {
     let consolidated: string;
     try {
       const llm = createLLMClient();
-      const response = await llm.generateContent({
-        messages: [
+      const guard = createLlmGuard({ actorLabel: 'Dream', classifyError: classifyLLMError });
+      const response = await guard.call(
+        llm,
+        [
           { role: 'system', content: DREAM_SYSTEM_PROMPT },
           { role: 'user', content: userMessage },
         ],
-        model: '',
-        maxTokens: 2000,
-        sampling: { temperature: 0.3 },
-      });
+        '',
+        undefined,
+        false,
+        undefined,
+        undefined,
+        { actorType: 'system', actorLabel: 'Dream', purpose: 'generic', requestedModel: '' },
+        { maxTokens: 2000, sampling: { temperature: 0.3 } },
+      );
 
       consolidated = contentToPlainText(response.content);
     } catch (err) {

@@ -18,6 +18,7 @@ import { getEventEmitter } from '../core/EventEmitter.js';
 import { DaemonManager } from '../core/DaemonManager.js';
 import { gracefulShutdown } from '../core/RuntimeGuards.js';
 import { isDaemonActiveStatus } from '../core/StateSemantics.js';
+import { serverLogger } from '../core/Log.js';
 import type { QQBotConfig, QQBotRuntimeStatus } from '../bot/types.js';
 
 type JsonRecord = Record<string, unknown>;
@@ -82,7 +83,7 @@ function stringArrayField(body: JsonRecord, key: string): string[] | undefined {
 function getDaemonStartPayload(body: unknown): DaemonStartPayload {
   const record = safeBody(body);
   return {
-    port: numberField(record, 'port') ?? 8080,
+    port: numberField(record, 'port') ?? 0,
     host: stringField(record, 'host') ?? '127.0.0.1',
   };
 }
@@ -483,6 +484,6 @@ export async function initQQBotInDaemon(
   } catch (err) {
     // QQBot 构造/启动失败（配置错、网络、websocket）必须在此记录 ——
     // 不能依赖 QQBot 内部 logger：构造抛出时它可能尚未接线，错误将彻底无声。
-    console.warn(`[DaemonRoutes] QQBot 启动失败 (session=${sessionId}):`, err instanceof Error ? err.message : String(err));
+    serverLogger.warn(`[DaemonRoutes] QQBot 启动失败 (session=${sessionId}):`, { error: err instanceof Error ? err.message : String(err) });
   }
 }

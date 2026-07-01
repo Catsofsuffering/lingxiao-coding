@@ -29,11 +29,12 @@ const CATEGORY_MAP: Record<string, string[]> = {
   'Agent': [
     'agents.max_concurrent', 'agents.max_iterations', 'agents.max_runtime_minutes',
     'agents.permission_timeout_ms', 'agents.tool_result_max_chars',
-    'agents.max_conversation_messages', 'agents.max_agent_messages',
+    'agents.max_conversation_messages', 'agents.max_conversation_bytes',
+    'agents.max_agent_messages', 'agents.max_agent_messages_bytes',
     'agents.max_continuation_depth',
   ],
   'Leader': [
-    'leader.max_tool_rounds', 'leader.max_runtime_minutes',
+    'leader.max_tool_rounds', 'leader.max_runtime_minutes', 'leader.round_timeout_ms',
     'leader.probe_silence_seconds', 'leader.probe_max_interval_seconds',
     'leader.probe_backoff_multiplier', 'leader.idle_warning_seconds',
     'leader.idle_probe_max_wait_ms', 'leader.idle_probe_backoff_base_ms',
@@ -69,7 +70,8 @@ const CATEGORY_MAP: Record<string, string[]> = {
   ],
   '服务器': ['server.host', 'server.port'],
   'UI': ['ui.language'],
-  '消息总线': ['message_bus.warning_threshold', 'message_bus.critical_threshold'],
+  '消息总线': ['message_bus.warning_threshold', 'message_bus.critical_threshold', 'message_bus.max_history_bytes'],
+  '黑板': ['blackboard.enabled', 'blackboard.max_nodes', 'blackboard.max_edges', 'blackboard.max_node_content_chars'],
 };
 
 /**

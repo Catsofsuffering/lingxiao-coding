@@ -221,12 +221,16 @@ export function buildTuiMetaLine(input: {
       modes.collaboration.mode === 'team' && modes.collaboration.teamEnabled ? modes.collaboration.activeTeamName || '' : '',
     )
     : '';
+  const autonomyMeta = modes
+    ? t('tui.meta.autonomy', formatTuiAutonomyMode(modes.autonomy), modes.lifecyclePhase, modes.modeGeneration)
+    : '';
   const metaSegments = [
     input.sessionStatus.workspace ? t('tui.meta.cwd', input.sessionStatus.workspace) : '',
     t('tui.meta.permission', input.sessionStatus.permissionSummary || t('tui.meta.unconfigured')),
     input.sessionStatus.controlMode ? t('tui.meta.control', input.sessionStatus.controlMode === 'eternal' ? t('tui.meta.control_eternal') : t('tui.meta.control_manual')) : '',
     routeMeta,
     collabMeta,
+    autonomyMeta,
     buildTuiEternalRuntimeMeta(input.sessionStatus, input.now),
     input.mainQueuedCount > 0 ? t('tui.meta.queue', input.mainQueuedCount) : '',
     tabStrip.items.length > 0
@@ -259,6 +263,12 @@ function nextRoutePreference(mode?: string): string {
   return modes[(index >= 0 ? index + 1 : 1) % modes.length];
 }
 
+function nextAutonomyMode(mode?: string): string {
+  const modes = ['review_first', 'balanced', 'autonomous'];
+  const index = modes.indexOf(mode || 'balanced');
+  return modes[(index >= 0 ? index + 1 : 1) % modes.length];
+}
+
 export function formatTuiCollaborationMode(mode?: string): string {
   return mode === 'team' ? t('tui.mode.collaboration.team') : t('tui.mode.collaboration.solo');
 }
@@ -274,6 +284,12 @@ export function formatTuiRoutePreference(mode?: string): string {
   if (mode === 'direct') return t('tui.mode.route.direct');
   if (mode === 'delegate') return t('tui.mode.route.delegate');
   return t('tui.mode.route.auto');
+}
+
+export function formatTuiAutonomyMode(mode?: string): string {
+  if (mode === 'review_first') return t('tui.mode.autonomy.review_first');
+  if (mode === 'autonomous') return t('tui.mode.autonomy.autonomous');
+  return t('tui.mode.autonomy.balanced');
 }
 
 // hybrid 不再作为用户偏好暴露（auto 运行时默认即解析为 hybrid）；此处仅给 auto/direct/delegate 配说明，供 cycle flash 展示
@@ -300,6 +316,8 @@ export function buildTuiModeActionText(
   const nextCollabMode = collabMode === 'team' ? 'solo' : 'team';
   const routePreference = modes?.route.preference || 'auto';
   const nextRoute = nextRoutePreference(routePreference);
+  const autonomyMode = modes?.autonomy || 'balanced';
+  const nextAutonomy = nextAutonomyMode(autonomyMode);
   const permissionMode = modes?.permission.mode || sessionStatus.permissionMode || 'yolo';
   const width = Math.max(24, maxWidth);
   const header = options.feedback
@@ -311,6 +329,7 @@ export function buildTuiModeActionText(
     header,
     t('tui.mode.collaboration', formatTuiCollaborationMode(collabMode), formatTuiCollaborationMode(nextCollabMode)),
     t('tui.mode.route', formatTuiRoutePreference(routePreference), formatTuiRoutePreference(nextRoute)),
+    t('tui.mode.autonomy', formatTuiAutonomyMode(autonomyMode), formatTuiAutonomyMode(nextAutonomy)),
     t('tui.mode.permission', formatTuiPermissionMode(permissionMode), formatTuiPermissionMode(nextPermissionMode(permissionMode))),
   ].filter(Boolean).join(' · ');
   if (text.length <= width) return text;
@@ -319,17 +338,18 @@ export function buildTuiModeActionText(
     header,
     t('tui.mode.compact.collaboration', formatTuiCollaborationMode(collabMode)),
     t('tui.mode.compact.route', formatTuiRoutePreference(routePreference)),
+    t('tui.mode.compact.autonomy', formatTuiAutonomyMode(autonomyMode)),
     t('tui.mode.compact.permission', formatTuiPermissionMode(permissionMode)),
   ].filter(Boolean).join(' · ');
   if (compact.length <= width) return compact;
 
   const minimum = [
     header,
-    'Alt+C Alt+R Alt+P',
+    'Alt+C Alt+R Alt+A Alt+P',
   ].filter(Boolean).join(' · ');
   if (minimum.length <= width) return minimum;
 
-  return truncateDisplayText('Alt+C Alt+R Alt+P', width);
+  return truncateDisplayText('Alt+C Alt+R Alt+A Alt+P', width);
 }
 
 export function buildTuiStatusView(input: {

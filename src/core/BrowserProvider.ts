@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { config } from '../config.js';
 import { IS_WINDOWS, IS_MACOS, IS_LINUX, resolveCommandPath } from '../utils/platform.js';
 import { getScopedProxyFetch, resolveToolBrowserProxy, withToolProxyEnv } from './ProxyConfig.js';
+import { coreLogger } from './Log.js';
 
 export interface BrowserProxyConfig {
   server: string;
@@ -76,6 +77,7 @@ const DEFAULT_BROWSER_ARGS = [
   '--disable-translate',
   '--mute-audio',
   '--no-first-run',
+  '--remote-debugging-port=0',
 ];
 
 let cachedChromePath: string | undefined | null = null;
@@ -414,12 +416,12 @@ async function downloadBrowser(): Promise<void> {
   const allSystem = [...new Set([...enumeratedSystem, ...sysPathHits])];
 
   if (allSystem.length > 0) {
-    console.error(`[Browser] Detected installed Chromium-family browser, skipping download: ${allSystem.join(', ')}`);
+    coreLogger.info(`[Browser] Detected installed Chromium-family browser, skipping download: ${allSystem.join(', ')}`);
     _resetChromePathCacheForTesting();
     return;
   }
 
-  console.error('[Browser] Chromium browser not found. Downloading with local Playwright runtime...');
+  coreLogger.info('[Browser] Chromium browser not found. Downloading with local Playwright runtime...');
 
   if (!existsSync(PLAYWRIGHT_CLI)) {
     throw await buildDownloadFailureError(new Error(`Local Playwright CLI not found: ${PLAYWRIGHT_CLI}`), false);
@@ -429,7 +431,7 @@ async function downloadBrowser(): Promise<void> {
   let lastErr: unknown;
 
   for (const mirror of mirrors) {
-    console.error(`[Browser] Using download source: ${mirror.label} (${mirror.host})`);
+    coreLogger.info(`[Browser] Using download source: ${mirror.label} (${mirror.host})`);
     const env: NodeJS.ProcessEnv = withToolProxyEnv({ ...process.env });
     if (mirror.host) env.PLAYWRIGHT_DOWNLOAD_HOST = mirror.host;
     else delete env.PLAYWRIGHT_DOWNLOAD_HOST;
@@ -442,7 +444,7 @@ async function downloadBrowser(): Promise<void> {
           env,
           windowsHide: IS_WINDOWS,
         });
-        console.error('[Browser] Download complete.');
+        coreLogger.info('[Browser] Download complete.');
         _resetChromePathCacheForTesting();
         return;
       } catch (e) {
@@ -450,14 +452,14 @@ async function downloadBrowser(): Promise<void> {
         const network = isNetworkError(e);
         if (attempt < mirror.maxAttempts && network) {
           const wait = Math.min(2000 * 2 ** (attempt - 1), 10000);
-          console.error(`[Browser] ${mirror.label} attempt ${attempt}/${mirror.maxAttempts} failed; retrying in ${wait}ms...`);
+          coreLogger.warn(`[Browser] ${mirror.label} attempt ${attempt}/${mirror.maxAttempts} failed; retrying in ${wait}ms...`);
           await new Promise((r) => setTimeout(r, wait));
           continue;
         }
         break;
       }
     }
-    console.error(`[Browser] ${mirror.label} failed; trying next source...`);
+    coreLogger.warn(`[Browser] ${mirror.label} failed; trying next source...`);
   }
 
   throw await buildDownloadFailureError(lastErr, true);
@@ -548,9 +550,9 @@ export async function launchManagedChromium(options?: {
   const log = options?.log !== false;
 
   if (log) {
-    if (executablePath) console.error(`[Browser] Using Chromium executable: ${executablePath}`);
-    else console.error('[Browser] No executablePath resolved; letting Playwright use its default browser resolution.');
-    if (proxy) console.error(`[Browser] Proxy enabled: ${proxy.server}${proxy.username ? ' (with auth)' : ''}`);
+    if (executablePath) coreLogger.info(`[Browser] Using Chromium executable: ${executablePath}`);
+    else coreLogger.info('[Browser] No executablePath resolved; letting Playwright use its default browser resolution.');
+    if (proxy) coreLogger.info(`[Browser] Proxy enabled: ${proxy.server}${proxy.username ? ' (with auth)' : ''}`);
   }
 
   try {

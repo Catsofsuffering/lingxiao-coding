@@ -12,6 +12,7 @@ import { promises as fsp } from 'fs';
 import path from 'path';
 import { getAllowedFsRoots, isPathInside } from './FileSystemRoutes.js';
 import { shouldEnforceArtifactRoot, isHardenedMode } from '../core/HardeningPolicy.js';
+import { renderOfficeToPdf, isOfficeRenderable } from '../tools/implementations/office/OfficePdfRenderer.js';
 
 const RAW_PREVIEW_MAX_BYTES = 80 * 1024 * 1024;
 const TEXT_EDIT_MAX_BYTES = 10 * 1024 * 1024;
@@ -268,6 +269,51 @@ export function registerArtifactPreviewRoutes(
     }
     reply.header('Content-Length', buffer.length);
     return reply.send(buffer);
+  });
+
+  // ─── Office 真实版式渲染：PPTX/DOCX/XLSX → LibreOffice → PDF → 内联 ───
+  // 复用现有 PDF iframe 渲染路径，把 Office 文档转成 PDF 后以 inline 返回。
+  // LibreOffice 不可用或转换失败时返回非 200 + 结构化原因，前端据此回退到结构预览。
+  fastify.get('/api/v1/artifacts/render', async (request, reply) => {
+    if (!requireServerToken(request, reply)) return;
+
+    const query = request.query as { path?: string; sessionId?: string };
+    if (!query.path) {
+      reply.status(400);
+      return { error: 'path is required' };
+    }
+
+    const requestPath = resolveArtifactRequestPath({ filePath: query.path, sessionId: query.sessionId, repos });
+    const resolved = validateArtifactPath(requestPath, allowedArtifactRoots(query.sessionId));
+    if (!resolved) {
+      reply.status(403);
+      return { error: 'artifact path is not readable' };
+    }
+
+    if (!isOfficeRenderable(resolved)) {
+      reply.status(415);
+      return { error: 'format is not office-renderable', code: 'unsupported' };
+    }
+
+    const stat = statSync(resolved);
+    if (stat.size > RAW_PREVIEW_MAX_BYTES) {
+      reply.status(413);
+      return { error: 'artifact is too large for inline render' };
+    }
+
+    const rendered = await renderOfficeToPdf(resolved);
+    if (!rendered.ok) {
+      // 503: LibreOffice 不可用；422: 转换失败/超时。前端统一回退到结构预览。
+      reply.status(rendered.code === 'unavailable' ? 503 : 422);
+      return { error: rendered.reason, code: rendered.code };
+    }
+
+    const pdfBuffer = await fsp.readFile(rendered.pdfPath);
+    reply.header('Content-Type', 'application/pdf');
+    reply.header('Content-Disposition', `inline; filename="${encodeURIComponent(path.basename(resolved, path.extname(resolved)))}.pdf"`);
+    reply.header('Content-Length', pdfBuffer.length);
+    reply.header('X-Lingxiao-Render', rendered.fromCache ? 'cache' : 'fresh');
+    return reply.send(pdfBuffer);
   });
 
   fastify.put('/api/v1/artifacts/save', async (request, reply) => {

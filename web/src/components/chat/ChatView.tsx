@@ -1,5 +1,8 @@
 import { useTranslation } from 'react-i18next';
+import { createLogger } from '../../utils/logger';
 import { useSessionStore, type AgentActivity, type AgentRuntime, type SessionPhase } from '../../stores/sessionStore';
+
+const log = createLogger('ChatView');
 // 性能优化 (T-8)：useShallow 让返回新对象/数组的选择器用浅比较，避免 zustand
 // 默认引用相等检查在不相关 store 更新时触发不必要的 re-render。
 import { useShallow } from 'zustand/react/shallow';
@@ -9,8 +12,8 @@ import { useToast } from '../ui/Toast';
 import { acpClient } from '../../api/AcpClient';
 import { getServerToken } from '../../api/headers';
 import { notifySettingChanged, SETTINGS_CHANGED_EVENT, settingsApiFetch, type SettingsChangedDetail } from '../settings/settingsApi';
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { Send, Square, Paperclip, Sparkles, Shield, Check, X, Clock, Plus, MessageCircle, RefreshCw, Image as ImageIcon, Eye, AlertTriangle, Zap, Minimize2, Cpu, Loader2, CheckCircle2, XCircle, ChevronUp, ChevronDown, Wand2, Trash2, Bot, FileText, Table, Archive, ListOrdered, Search, ArrowUp, ArrowDown, Pencil, Workflow, PanelRightOpen } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback, useMemo, memo } from 'react';
+import { Send, Square, Paperclip, Sparkles, Shield, Check, X, Clock, Plus, MessageCircle, RefreshCw, Image as ImageIcon, Eye, AlertTriangle, Zap, Minimize2, Cpu, Loader2, CheckCircle2, XCircle, ChevronUp, ChevronDown, Wand2, Trash2, Bot, FileText, Table, Archive, ListOrdered, Search, ArrowUp, ArrowDown, Pencil, Workflow, PanelRightOpen, FileJson, Upload } from 'lucide-react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import MessageBubble from './MessageBubble';
 import { usePopoverMaxHeight } from '../../hooks/usePopoverMaxHeight';
@@ -24,13 +27,22 @@ import { PermissionModeToggle } from './PermissionModeToggle';
 import ChatGitBranchPicker from './ChatGitBranchPicker';
 import WorkspacePicker from './WorkspacePicker';
 import WorkbenchChangeStrip from './WorkbenchChangeStrip';
-import WorkbenchSidePanel, { type WorkbenchToolRequest } from './WorkbenchSidePanel';
+import JiangeCanvas from './JiangeCanvas';
 import WorkbenchTerminalDock from './WorkbenchTerminalDock';
 import RunStatusStrip from './RunStatusStrip';
 import { useWorkbenchContext } from './useWorkbenchContext';
 import ConfirmationDialog from '../ui/ConfirmationDialog';
-import { messagesToMarkdown, downloadAsFile, copyToClipboard, getExportFilename } from '../../utils/exportConversation';
-import { calculateCost, formatCost } from '../../utils/costCalculator';
+import {
+  messagesToMarkdown,
+  messagesToJSON,
+  downloadAsFile,
+  downloadJSON,
+  copyToClipboard,
+  getExportFilename,
+  parseLingxiaoJSON,
+  readFileAsText,
+} from '../../utils/exportConversation';
+import { calculateCostDetailed, formatCost } from '../../utils/costCalculator';
 import { estimateTokens, formatTokenCount } from '../../utils/estimateTokens';
 import {
   deriveRuntimeWaitGate,
@@ -215,13 +227,13 @@ function formatModelLabel(entry: ModelEntry): string {
   return `${displayPart}（via ${entry.providerName}）`;
 }
 
-function getWorkspaceModelPreferenceKey(workspace: string): string {
-  return `lingxiao:model-preference:${workspace || 'default'}`;
+function getSessionModelPreferenceKey(sessionId: string): string {
+  return `lingxiao:model-preference:session:${sessionId || 'default'}`;
 }
 
-function readWorkspaceModelPreference(workspace: string): { leaderModel?: string; agentModel?: string } {
+function readSessionModelPreference(sessionId: string): { leaderModel?: string; agentModel?: string } {
   try {
-    const raw = localStorage.getItem(getWorkspaceModelPreferenceKey(workspace));
+    const raw = localStorage.getItem(getSessionModelPreferenceKey(sessionId));
     const parsed = raw ? JSON.parse(raw) : null;
     return {
       leaderModel: typeof parsed?.leaderModel === 'string' ? parsed.leaderModel : undefined,
@@ -304,12 +316,12 @@ function ChatTimelineRail({
   );
 }
 
-function writeWorkspaceModelPreference(workspace: string, patch: { leaderModel?: string; agentModel?: string }): void {
+function writeSessionModelPreference(sessionId: string, patch: { leaderModel?: string; agentModel?: string }): void {
   try {
-    const prev = readWorkspaceModelPreference(workspace);
-    localStorage.setItem(getWorkspaceModelPreferenceKey(workspace), JSON.stringify({ ...prev, ...patch }));
+    const prev = readSessionModelPreference(sessionId);
+    localStorage.setItem(getSessionModelPreferenceKey(sessionId), JSON.stringify({ ...prev, ...patch }));
   } catch (error) {
-    console.warn('[ChatView] Failed to persist workspace model preference:', error);
+    log.warn('[ChatView] Failed to persist workspace model preference:', error);
   }
 }
 
@@ -452,281 +464,33 @@ function getInlineStatusText(
   return null;
 }
 
-export default function ChatView() {
+interface LeaderStatusLineProps {
+  leaderModelLabel: string;
+  runActive: boolean;
+  displayPhase: SessionPhase;
+  displayAgents: AgentRuntime[];
+}
+
+/**
+ * 性能优化 (T-3 P0)：状态行抽成 memo 叶子组件，自订阅 store。
+ * 此前 streamingTick 的 600ms/1000ms setInterval 挂在 ChatView 顶层，每个 tick
+ * 强制整棵 ChatView 子树重渲染，但 tick 唯一用途只是刷新这一行 Leader 状态文字
+ * （streamingProgress 速率 + inlineStatusText）。迁入叶子后，tick 只重渲染本组件，
+ * ChatView 主体不再受流式 tick 影响。
+ */
+const LeaderStatusLine = memo(function LeaderStatusLine({
+  leaderModelLabel,
+  runActive,
+  displayPhase,
+  displayAgents,
+}: LeaderStatusLineProps) {
   const { t } = useTranslation();
-  // 窄选择器 (2026-05-29)：此前用裸 useSessionStore() 订阅整个 store，任何一次 set()
-  // （包括每个流式 chunk）都会 re-render 整个 ChatView 子树。改为按字段订阅，让流式
-  // 文本更新只触发依赖 messages 的部分，其余字段不变则不重渲。
-  // 性能优化 (T-8)：对象/数组类型选择器用 useShallow 包裹，避免引用变化导致不必要的
-  // re-render；标量类型保持原样（引用相等即值相等）。
-  const sessionId = useSessionStore((s) => s.sessionId);
-  const sessions = useSessionStore(useShallow((s) => s.sessions));
-  const activeWorkspace = sessions.find((s) => s.id === sessionId)?.workspace || '';
   const messages = useSessionStore((s) => s.messages);
-  const phase = useSessionStore((s) => s.phase);
-  const isConnected = useSessionStore((s) => s.isConnected);
-  const isLoadingHistory = useSessionStore((s) => s.isLoadingHistory);
-  const tokenUsage = useSessionStore(useShallow((s) => s.tokenUsage));
-  // token 消耗轨迹(火花图样本):事件驱动采样——tokenUsage.total 仅在 LLM 调用粒度变化,
-  // 无需 setInterval。处理增长/去重/会话切换重置,封顶 24 样本。
-  const [tokenHistory, setTokenHistory] = useState<number[]>([]);
-  const lastTokenTotalRef = useRef<number>(0);
-  useEffect(() => {
-    const total = tokenUsage.total;
-    if (total <= 0) {
-      lastTokenTotalRef.current = 0;
-      setTokenHistory([]);
-      return;
-    }
-    if (total < lastTokenTotalRef.current) {
-      // 会话切换/重置:total 回落,轨迹从头计
-      lastTokenTotalRef.current = total;
-      setTokenHistory([total]);
-      return;
-    }
-    if (total === lastTokenTotalRef.current) return;
-    lastTokenTotalRef.current = total;
-    setTokenHistory((h) => {
-      const next = h[h.length - 1] === total ? h : [...h, total];
-      return next.length > 24 ? next.slice(next.length - 24) : next;
-    });
-  }, [tokenUsage.total]);
-  const agents = useSessionStore((s) => s.agents);
-  const contextRuntimeState = useSessionStore((s) => s.contextRuntimeState);
+  const agentConversations = useSessionStore((s) => s.agentConversations);
   const compactingProgress = useSessionStore(useShallow((s) => s.compactingProgress));
-  const orchestrationStatus = useSessionStore(useShallow((s) => s.orchestrationStatus));
-  const runExplanation = useSessionStore(useShallow((s) => s.runExplanation));
   const runtimeSnapshot = useSessionStore(useShallow((s) => s.runtimeSnapshot));
   const leaderStatusText = useSessionStore((s) => s.leaderStatusText);
-  // 性能优化 (T-8)：合并多个函数引用为单次 useShallow 订阅，减少订阅数量和比较开销。
-  const { fetchSessions, connectToSession, createAndConnect, deleteSession,
-    addMessage, setPhase, fetchTokenUsage, compressContext } =
-    useSessionStore(useShallow((s) => ({
-      fetchSessions: s.fetchSessions, connectToSession: s.connectToSession,
-      createAndConnect: s.createAndConnect, deleteSession: s.deleteSession,
-      addMessage: s.addMessage, setPhase: s.setPhase,
-      fetchTokenUsage: s.fetchTokenUsage, compressContext: s.compressContext,
-    })));
-  const pendingPermissionRequests = usePermissionStore((s) => s.pendingRequests);
-  const permissionHistory = usePermissionStore((s) => s.history);
-  const { addToast } = useToast();
-  const workbench = useWorkbenchContext(sessionId, activeWorkspace);
-  // Eternal 自动放行 toast：监听 history 末项，autoApproved 才弹一条提示。
-  // 不写 store 全量轮询，依赖 history 增量＋ ref 记录上次最大 index 即可。
-  const lastAutoApprovedIndexRef = useRef<number>(-1);
-  useEffect(() => {
-    for (let i = lastAutoApprovedIndexRef.current + 1; i < permissionHistory.length; i++) {
-      const entry = permissionHistory[i];
-      if (entry?.autoApproved) {
-        const modeTag = entry.bypass ? 'bypass' : (entry.requestedMode || 'dev');
-        addToast({
-          type: entry.bypass ? 'warning' : 'info',
-          message: `[Eternal] 自动放行 ${entry.toolName} → ${modeTag}（${entry.workerName || entry.source}）`,
-          duration: 4500,
-        });
-      }
-    }
-    lastAutoApprovedIndexRef.current = permissionHistory.length - 1;
-  }, [permissionHistory, addToast]);
-  const [input, setInput] = useState('');
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
-  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
-  const [uploadingCount, setUploadingCount] = useState(0);
-  const [attachmentError, setAttachmentError] = useState<string | null>(null);
-  const [showPermHistory, setShowPermHistory] = useState(false);
-  const [showSessionList, setShowSessionList] = useState(false);
-  const [sessionSearch, setSessionSearch] = useState('');
-  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState('');
-  const [isCreating, setIsCreating] = useState(false);
-  const [deepThinkingEnabled, setDeepThinkingEnabled] = useState(false);
-  const [deepThinkingSaving, setDeepThinkingSaving] = useState(false);
-  const [isEnhancing, setIsEnhancing] = useState(false);
-  const [enhanceStats, setEnhanceStats] = useState<PromptEnhanceStats | null>(null);
-  const [isDraggingOverChat, setIsDraggingOverChat] = useState(false);
-  const [modelSupportsVision, setModelSupportsVision] = useState<boolean | null>(null);
-  const [isCompressing, setIsCompressing] = useState(false);
-  const [compressResult, setCompressResult] = useState<{ oldTokens?: number; newTokens?: number; skipped?: boolean; inProgress?: boolean; reason?: string; error?: string } | null>(null);
-  const [workbenchPanelCollapsed, setWorkbenchPanelCollapsed] = useState(() => {
-    try {
-      const stored = localStorage.getItem(WORKBENCH_PANEL_COLLAPSED_STORAGE_KEY);
-      if (stored === 'true') return true;
-      if (stored === 'false') return false;
-    } catch {
-      return true;
-    }
-    return true;
-  });
-  const [workbenchToolRequest, setWorkbenchToolRequest] = useState<WorkbenchToolRequest | null>(null);
-  const [showAgentPanel, setShowAgentPanel] = useState(false);
-  const [agentPanelExpanded, setAgentPanelExpanded] = useState(false);
-  const lastAutoOpenedAgentRunRef = useRef('');
-  const manuallyClosedAgentRunRef = useRef('');
-  const [displayPhase, setDisplayPhase] = useState<SessionPhase>(phase);
-  const displaySessionRef = useRef<string | null>(sessionId);
 
-  useEffect(() => {
-    if (displaySessionRef.current !== sessionId) {
-      displaySessionRef.current = sessionId;
-      setDisplayPhase('idle');
-      return;
-    }
-    if (phase !== 'idle' && phase !== 'done') {
-      setDisplayPhase(phase);
-      return;
-    }
-    const id = window.setTimeout(() => setDisplayPhase(phase), 1200);
-    return () => window.clearTimeout(id);
-  }, [phase, sessionId]);
-  const [agentPanelWidth, setAgentPanelWidth] = useState(() => {
-    try {
-      const stored = Number(localStorage.getItem('lingxiao_agent_panel_width'));
-      if (Number.isFinite(stored) && stored >= 320) return stored;
-    } catch (error) {
-      console.warn('[ChatView] Failed to read stored agent panel width:', error);
-    }
-    return 384;
-  });
-  const [bugHuntEnabled, setBugHuntEnabled] = useState(false);
-  const [bugHuntLoading, setBugHuntLoading] = useState(false);
-  const [officeEnabled, setOfficeEnabled] = useState(false);
-  const [officeLoading, setOfficeLoading] = useState(false);
-  const [workflowEnabled, setWorkflowEnabled] = useState(false);
-  const [workflowLoading, setWorkflowLoading] = useState(false);
-  const [modeToolMeta, setModeToolMeta] = useState<Record<ModeId, ModeToolMeta>>({
-    bughunt: {},
-    office: {},
-    workflow: {},
-  });
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(WORKBENCH_PANEL_COLLAPSED_STORAGE_KEY, String(workbenchPanelCollapsed));
-    } catch (error) {
-      console.warn('[ChatView] Failed to persist workbench panel collapsed state:', error);
-    }
-  }, [workbenchPanelCollapsed]);
-  const [modeBurst, setModeBurst] = useState<ModeBurst | null>(null);
-  const modeBurstTimerRef = useRef<number | null>(null);
-  const [workbenchTerminalOpen, setWorkbenchTerminalOpen] = useState(false);
-  // 编辑消息状态
-  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
-  // 模型切换器
-  const [leaderModel, setLeaderModel] = useState('');
-  const [agentModel, setAgentModel] = useState('');
-  const [availableModels, setAvailableModels] = useState<ModelEntry[]>([]);
-  const [showModelPicker, setShowModelPicker] = useState<ModelPickerTarget | null>(null);
-  const [modelSwitching, setModelSwitching] = useState<ModelPickerTarget | null>(null);
-  const [modelSwitchError, setModelSwitchError] = useState<string | null>(null);
-  const modelPickerRef = useRef<HTMLDivElement>(null);
-  const modelPickerBtnRef = useRef<HTMLButtonElement>(null);
-  const modelPickerMaxH = usePopoverMaxHeight(modelPickerBtnRef, showModelPicker !== null, { cap: 320 });
-  const [leaderModelContextWindow, setLeaderModelContextWindow] = useState<number | null>(null);
-  const [agentModelContextWindow, setAgentModelContextWindow] = useState<number | null>(null);
-  const [deleteConfirmSession, setDeleteConfirmSession] = useState<string | null>(null);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const isComposingRef = useRef(false);
-  const isAtBottomRef = useRef(true);
-  // 初始滚动标记：sessionId 变化或历史首次加载完成时需要自动滚到底部。
-  // followOutput 只在 data 变化时触发，首次渲染/切换 session 不会自动滚。
-  const needsInitialScrollRef = useRef(true);
-  const [timelineIndex, setTimelineIndex] = useState(0);
-  // Search state
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchMatches, setSearchMatches] = useState<number[]>([]);
-  const [searchIndex, setSearchIndex] = useState(-1);
-  const searchInputRef = useRef<HTMLInputElement>(null);
-  // Scroll-to-bottom button
-  const [showScrollBtn, setShowScrollBtn] = useState(false);
-  // Export state
-  const [exportCopied, setExportCopied] = useState(false);
-  // Skill autocomplete
-  const [availableSkills, setAvailableSkills] = useState<SkillSuggestion[]>([]);
-  const [skillSuggestions, setSkillSuggestions] = useState<Array<{ name: string; description: string }>>([]);
-  const [showSkillDropdown, setShowSkillDropdown] = useState(false);
-  const [skillSelectedIndex, setSkillSelectedIndex] = useState(0);
-  const skillDropdownRef = useRef<HTMLDivElement>(null);
-  // Slash command autocomplete
-  const [cmdSuggestions, setCmdSuggestions] = useState<Array<{ name: string; desc: string; usage?: string }>>([]);
-  const [showCmdDropdown, setShowCmdDropdown] = useState(false);
-  const [cmdSelectedIndex, setCmdSelectedIndex] = useState(0);
-  const cmdDropdownRef = useRef<HTMLDivElement>(null);
-  // Agent mention autocomplete
-  const [agentSuggestions, setAgentSuggestions] = useState<Array<{ name: string; desc: string }>>([]);
-  const [showAgentDropdown, setShowAgentDropdown] = useState(false);
-  const [agentSelectedIndex, setAgentSelectedIndex] = useState(0);
-  const agentDropdownRef = useRef<HTMLDivElement>(null);
-  // Esc+Esc shortcut — navigate to changes/rollback view
-  const lastEscPressRef = useRef(0);
-  const enhanceAbortRef = useRef<AbortController | null>(null);
-  // 发送防重入锁：快速双击/连按回车时挡住同一瞬间的重复 session/prompt 提交
-  const sendingLockRef = useRef(false);
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      // Ctrl+E: 切换 Workers 视图
-      if (e.key === 'e' && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
-        e.preventDefault();
-        const { mainView, setMainView } = useViewStore.getState();
-        setMainView(mainView === 'workers' ? 'chat' : 'workers');
-        return;
-      }
-      if (e.key === 'Escape') {
-        const now = Date.now();
-        if (now - lastEscPressRef.current < 500 && input.trim() === '') {
-          e.preventDefault();
-          useViewStore.getState().setMainView('changes');
-          lastEscPressRef.current = 0;
-        } else {
-          lastEscPressRef.current = now;
-        }
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [input]);
-  // Prompt suggestions
-  const [promptSuggestions, setPromptSuggestions] = useState<string[]>([]);
-
-  const leaderModelLabel = useMemo(() => {
-    if (!leaderModel) return 'default';
-    const entry = availableModels.find(m => m.id === leaderModel);
-    return entry ? formatModelLabel(entry) : leaderModel;
-  }, [leaderModel, availableModels]);
-
-  const agentModelLabel = useMemo(() => {
-    if (!agentModel) return leaderModelLabel;
-    const entry = availableModels.find(m => m.id === agentModel);
-    return entry ? formatModelLabel(entry) : agentModel;
-  }, [agentModel, availableModels, leaderModelLabel]);
-
-  // 流式进度：tool_input / leader_text / leader_thinking / agent_text / agent_thinking / agent_tool 六种
-  // 都会在状态条显示"~N tokens · M chars · K/s"，让用户看到 token 在涨。每秒 tick 全局刷新一次。
-  const agentConversations = useSessionStore((s) => s.agentConversations);
-  const displayAgents = useMemo<AgentRuntime[]>(() => {
-    const byId = new Map<string, AgentRuntime>();
-    for (const agent of agents) {
-      byId.set(agent.agentId, agent);
-    }
-    for (const conv of Object.values(agentConversations)) {
-      const existing = byId.get(conv.agentId);
-      byId.set(conv.agentId, {
-        agentId: conv.agentId,
-        agentName: existing?.agentName || conv.agentName || conv.agentId,
-        role: existing?.role || conv.role || 'worker',
-        status: existing?.status || conv.status || 'completed',
-        taskId: existing?.taskId ?? conv.taskId,
-        workingDirectory: existing?.workingDirectory ?? conv.workingDirectory,
-        writeScope: existing?.writeScope ?? conv.writeScope,
-        backend: existing?.backend ?? conv.backend,
-        externalSessionId: existing?.externalSessionId ?? conv.externalSessionId,
-        pid: existing?.pid ?? conv.pid,
-        spawnedAt: existing?.spawnedAt ?? conv.messages[0]?.timestamp,
-      });
-    }
-    return Array.from(byId.values()).sort((a, b) => (a.spawnedAt ?? 0) - (b.spawnedAt ?? 0));
-  }, [agents, agentConversations]);
   const [streamingTick, setStreamingTick] = useState(0);
   const streamingProgress = useMemo<StreamingProgress | null>(() => {
     const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
@@ -817,8 +581,7 @@ export default function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages, agentConversations, streamingTick]);
   // 速率刷新 timer：只依赖"是否正在流式"布尔，避免 streamingProgress 因 messages
-  // 每次变化都返回新引用导致 effect 反复 cleanup+重建 setInterval，最终 600ms tick
-  // 永远等不到下一帧（这是 tool_input_delta 阶段速率/tokens/chars 数字"冻结"的根因之一）。
+  // 每次变化都返回新引用导致 effect 反复 cleanup+重建 setInterval。
   const isStreaming = !!streamingProgress;
   const eternalRuntime = runtimeSnapshot?.eternal ?? null;
   const eternalNeedsTick = Boolean(
@@ -830,6 +593,323 @@ export default function ChatView() {
     const id = setInterval(() => setStreamingTick((n) => (n + 1) & 0xffff), isStreaming ? 600 : 1000);
     return () => clearInterval(id);
   }, [eternalNeedsTick, isStreaming]);
+
+  const inlineStatusText = useMemo(() => {
+    return getInlineStatusText(displayPhase, displayAgents, streamingProgress, compactingProgress, t);
+  }, [displayAgents, compactingProgress, displayPhase, streamingProgress, t]);
+
+  const leaderDisplayStatus = inlineStatusText
+    || (runActive
+      ? t('chat.status.processing')
+      : leaderStatusText || (displayPhase === 'idle' ? t('chat.status.idleShort') : t('chat.status.processing')));
+
+  return (
+    <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] font-mono text-text-tertiary">
+      <span
+        className="min-w-0 flex-1 truncate whitespace-nowrap"
+        title={`${leaderModelLabel} · Leader · ${leaderDisplayStatus}`}
+      >
+        {leaderModelLabel} · Leader · {(inlineStatusText || runActive) && (
+          <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-accent-brand animate-pulse align-middle" />
+        )}{leaderDisplayStatus}
+      </span>
+    </div>
+  );
+});
+
+export default function ChatView() {
+  const { t } = useTranslation();
+  // 窄选择器 (2026-05-29)：此前用裸 useSessionStore() 订阅整个 store，任何一次 set()
+  // （包括每个流式 chunk）都会 re-render 整个 ChatView 子树。改为按字段订阅，让流式
+  // 文本更新只触发依赖 messages 的部分，其余字段不变则不重渲。
+  // 性能优化 (T-8)：对象/数组类型选择器用 useShallow 包裹，避免引用变化导致不必要的
+  // re-render；标量类型保持原样（引用相等即值相等）。
+  const sessionId = useSessionStore((s) => s.sessionId);
+  const sessions = useSessionStore(useShallow((s) => s.sessions));
+  const activeWorkspace = sessions.find((s) => s.id === sessionId)?.workspace || '';
+  const messages = useSessionStore((s) => s.messages);
+  const phase = useSessionStore((s) => s.phase);
+  const isConnected = useSessionStore((s) => s.isConnected);
+  const isLoadingHistory = useSessionStore((s) => s.isLoadingHistory);
+  const tokenUsage = useSessionStore(useShallow((s) => s.tokenUsage));
+  // token 消耗轨迹(火花图样本):事件驱动采样——tokenUsage.total 仅在 LLM 调用粒度变化,
+  // 无需 setInterval。处理增长/去重/会话切换重置,封顶 24 样本。
+  const [tokenHistory, setTokenHistory] = useState<number[]>([]);
+  const lastTokenTotalRef = useRef<number>(0);
+  useEffect(() => {
+    const total = tokenUsage.total;
+    if (total <= 0) {
+      lastTokenTotalRef.current = 0;
+      setTokenHistory([]);
+      return;
+    }
+    if (total < lastTokenTotalRef.current) {
+      // 会话切换/重置:total 回落,轨迹从头计
+      lastTokenTotalRef.current = total;
+      setTokenHistory([total]);
+      return;
+    }
+    if (total === lastTokenTotalRef.current) return;
+    lastTokenTotalRef.current = total;
+    setTokenHistory((h) => {
+      const next = h[h.length - 1] === total ? h : [...h, total];
+      return next.length > 24 ? next.slice(next.length - 24) : next;
+    });
+  }, [tokenUsage.total]);
+  const agents = useSessionStore((s) => s.agents);
+  const contextRuntimeState = useSessionStore((s) => s.contextRuntimeState);
+  const compactingProgress = useSessionStore(useShallow((s) => s.compactingProgress));
+  const orchestrationStatus = useSessionStore(useShallow((s) => s.orchestrationStatus));
+  const runExplanation = useSessionStore(useShallow((s) => s.runExplanation));
+  const runtimeSnapshot = useSessionStore(useShallow((s) => s.runtimeSnapshot));
+  // 性能优化 (T-8)：合并多个函数引用为单次 useShallow 订阅，减少订阅数量和比较开销。
+  const { fetchSessions, connectToSession, createAndConnect, deleteSession,
+    addMessage, setPhase, fetchTokenUsage, compressContext } =
+    useSessionStore(useShallow((s) => ({
+      fetchSessions: s.fetchSessions, connectToSession: s.connectToSession,
+      createAndConnect: s.createAndConnect, deleteSession: s.deleteSession,
+      addMessage: s.addMessage, setPhase: s.setPhase,
+      fetchTokenUsage: s.fetchTokenUsage, compressContext: s.compressContext,
+    })));
+  const pendingPermissionRequests = usePermissionStore((s) => s.pendingRequests);
+  const permissionHistory = usePermissionStore((s) => s.history);
+  const { addToast } = useToast();
+  const workbench = useWorkbenchContext(sessionId, activeWorkspace);
+  // Eternal 自动放行 toast：监听 history 末项，autoApproved 才弹一条提示。
+  // 不写 store 全量轮询，依赖 history 增量＋ ref 记录上次最大 index 即可。
+  const lastAutoApprovedIndexRef = useRef<number>(-1);
+  useEffect(() => {
+    for (let i = lastAutoApprovedIndexRef.current + 1; i < permissionHistory.length; i++) {
+      const entry = permissionHistory[i];
+      if (entry?.autoApproved) {
+        const modeTag = entry.bypass ? 'bypass' : (entry.requestedMode || 'dev');
+        addToast({
+          type: entry.bypass ? 'warning' : 'info',
+          message: `[Eternal] 自动放行 ${entry.toolName} → ${modeTag}（${entry.workerName || entry.source}）`,
+          duration: 4500,
+        });
+      }
+    }
+    lastAutoApprovedIndexRef.current = permissionHistory.length - 1;
+  }, [permissionHistory, addToast]);
+  const [input, setInput] = useState('');
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
+  const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const [uploadingCount, setUploadingCount] = useState(0);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [showPermHistory, setShowPermHistory] = useState(false);
+  const [showSessionList, setShowSessionList] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState('');
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [isCreating, setIsCreating] = useState(false);
+  const [deepThinkingEnabled, setDeepThinkingEnabled] = useState(false);
+  const [deepThinkingSaving, setDeepThinkingSaving] = useState(false);
+  const [isEnhancing, setIsEnhancing] = useState(false);
+  const [enhanceStats, setEnhanceStats] = useState<PromptEnhanceStats | null>(null);
+  const [isDraggingOverChat, setIsDraggingOverChat] = useState(false);
+  const [modelSupportsVision, setModelSupportsVision] = useState<boolean | null>(null);
+  const [isCompressing, setIsCompressing] = useState(false);
+  const [compressResult, setCompressResult] = useState<{ oldTokens?: number; newTokens?: number; skipped?: boolean; inProgress?: boolean; reason?: string; error?: string } | null>(null);
+  const [workbenchPanelCollapsed, setWorkbenchPanelCollapsed] = useState(() => {
+    try {
+      const stored = localStorage.getItem(WORKBENCH_PANEL_COLLAPSED_STORAGE_KEY);
+      if (stored === 'true') return true;
+      if (stored === 'false') return false;
+    } catch {
+      return true;
+    }
+    return true;
+  });
+  const [showAgentPanel, setShowAgentPanel] = useState(false);
+  const [agentPanelExpanded, setAgentPanelExpanded] = useState(false);
+  const lastAutoOpenedAgentRunRef = useRef('');
+  const manuallyClosedAgentRunRef = useRef('');
+  const [displayPhase, setDisplayPhase] = useState<SessionPhase>(phase);
+  const displaySessionRef = useRef<string | null>(sessionId);
+
+  useEffect(() => {
+    if (displaySessionRef.current !== sessionId) {
+      displaySessionRef.current = sessionId;
+      setDisplayPhase('idle');
+      return;
+    }
+    if (phase !== 'idle' && phase !== 'done') {
+      setDisplayPhase(phase);
+      return;
+    }
+    const id = window.setTimeout(() => setDisplayPhase(phase), 1200);
+    return () => window.clearTimeout(id);
+  }, [phase, sessionId]);
+  const [agentPanelWidth, setAgentPanelWidth] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem('lingxiao_agent_panel_width'));
+      if (Number.isFinite(stored) && stored >= 320) return stored;
+    } catch (error) {
+      log.warn('[ChatView] Failed to read stored agent panel width:', error);
+    }
+    return 384;
+  });
+  const [bugHuntEnabled, setBugHuntEnabled] = useState(false);
+  const [bugHuntLoading, setBugHuntLoading] = useState(false);
+  const [officeEnabled, setOfficeEnabled] = useState(false);
+  const [officeLoading, setOfficeLoading] = useState(false);
+  const [workflowEnabled, setWorkflowEnabled] = useState(false);
+  const [workflowLoading, setWorkflowLoading] = useState(false);
+  const [modeToolMeta, setModeToolMeta] = useState<Record<ModeId, ModeToolMeta>>({
+    bughunt: {},
+    office: {},
+    workflow: {},
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WORKBENCH_PANEL_COLLAPSED_STORAGE_KEY, String(workbenchPanelCollapsed));
+    } catch (error) {
+      log.warn('[ChatView] Failed to persist workbench panel collapsed state:', error);
+    }
+  }, [workbenchPanelCollapsed]);
+  const [modeBurst, setModeBurst] = useState<ModeBurst | null>(null);
+  const modeBurstTimerRef = useRef<number | null>(null);
+  const [workbenchTerminalOpen, setWorkbenchTerminalOpen] = useState(false);
+  // 编辑消息状态
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  // 模型切换器
+  const [leaderModel, setLeaderModel] = useState('');
+  const [agentModel, setAgentModel] = useState('');
+  const [availableModels, setAvailableModels] = useState<ModelEntry[]>([]);
+  const [showModelPicker, setShowModelPicker] = useState<ModelPickerTarget | null>(null);
+  const [modelSwitching, setModelSwitching] = useState<ModelPickerTarget | null>(null);
+  const [modelSwitchError, setModelSwitchError] = useState<string | null>(null);
+  const modelPickerRef = useRef<HTMLDivElement>(null);
+  const modelPickerBtnRef = useRef<HTMLButtonElement>(null);
+  const modelPickerMaxH = usePopoverMaxHeight(modelPickerBtnRef, showModelPicker !== null, { cap: 320 });
+  const [leaderModelContextWindow, setLeaderModelContextWindow] = useState<number | null>(null);
+  const [agentModelContextWindow, setAgentModelContextWindow] = useState<number | null>(null);
+  // Token popover — 顶栏 token/cost/sparkline 收进下拉气泡
+  const [showTokenPopover, setShowTokenPopover] = useState(false);
+  const tokenPopoverRef = useRef<HTMLDivElement>(null);
+  const [deleteConfirmSession, setDeleteConfirmSession] = useState<string | null>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
+  const isAtBottomRef = useRef(true);
+  // 用户手动滚动标记：当用户用滚轮上翻时，暂停 followOutput 自动跟随，
+  // 避免流式 chunk 的 auto 跳转和用户滚动互相打断造成抖动。
+  const userScrolledAwayRef = useRef(false);
+  // 初始滚动标记：sessionId 变化或历史首次加载完成时需要自动滚到底部。
+  // followOutput 只在 data 变化时触发，首次渲染/切换 session 不会自动滚。
+  const needsInitialScrollRef = useRef(true);
+  const [timelineIndex, setTimelineIndex] = useState(0);
+  // Search state
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchMatches, setSearchMatches] = useState<number[]>([]);
+  const [searchIndex, setSearchIndex] = useState(-1);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  // Scroll-to-bottom button
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  // Export state
+  const [exportCopied, setExportCopied] = useState(false);
+  // Skill autocomplete
+  const [availableSkills, setAvailableSkills] = useState<SkillSuggestion[]>([]);
+  const [skillSuggestions, setSkillSuggestions] = useState<Array<{ name: string; description: string }>>([]);
+  const [showSkillDropdown, setShowSkillDropdown] = useState(false);
+  const [skillSelectedIndex, setSkillSelectedIndex] = useState(0);
+  const skillDropdownRef = useRef<HTMLDivElement>(null);
+  // Slash command autocomplete
+  const [cmdSuggestions, setCmdSuggestions] = useState<Array<{ name: string; desc: string; usage?: string }>>([]);
+  const [showCmdDropdown, setShowCmdDropdown] = useState(false);
+  const [cmdSelectedIndex, setCmdSelectedIndex] = useState(0);
+  const cmdDropdownRef = useRef<HTMLDivElement>(null);
+  // Agent mention autocomplete
+  const [agentSuggestions, setAgentSuggestions] = useState<Array<{ name: string; desc: string }>>([]);
+  const [showAgentDropdown, setShowAgentDropdown] = useState(false);
+  const [agentSelectedIndex, setAgentSelectedIndex] = useState(0);
+  const agentDropdownRef = useRef<HTMLDivElement>(null);
+  // Esc+Esc shortcut — navigate to changes/rollback view
+  const lastEscPressRef = useRef(0);
+  const enhanceAbortRef = useRef<AbortController | null>(null);
+  // 发送防重入锁：快速双击/连按回车时挡住同一瞬间的重复 session/prompt 提交
+  const sendingLockRef = useRef(false);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // 焦点守卫：焦点在剑阁浏览器 canvas 上时不拦截任何全局快捷键，
+      // 让按键原样转发到 CDP 远程页面（修复浏览器键盘被劫持）
+      const activeEl = document.activeElement as HTMLElement | null;
+      if (activeEl?.tagName === 'CANVAS' && activeEl.closest('.browser-screencast-container')) {
+        return;
+      }
+      // Ctrl+E: 切换 Workers 视图
+      if (e.key === 'e' && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+        e.preventDefault();
+        const { mainView, setMainView } = useViewStore.getState();
+        setMainView(mainView === 'workers' ? 'chat' : 'workers');
+        return;
+      }
+      if (e.key === 'Escape') {
+        // Esc 关闭 token 气泡（优先级高于 Esc+Esc 导航）
+        if (showTokenPopover) {
+          e.preventDefault();
+          setShowTokenPopover(false);
+          return;
+        }
+        const now = Date.now();
+        if (now - lastEscPressRef.current < 500 && input.trim() === '') {
+          e.preventDefault();
+          useViewStore.getState().setMainView('changes');
+          lastEscPressRef.current = 0;
+        } else {
+          lastEscPressRef.current = now;
+        }
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [input, showTokenPopover]);
+  // Prompt suggestions
+  const [promptSuggestions, setPromptSuggestions] = useState<string[]>([]);
+
+  const leaderModelLabel = useMemo(() => {
+    if (!leaderModel) return 'default';
+    const entry = availableModels.find(m => m.id === leaderModel);
+    return entry ? formatModelLabel(entry) : leaderModel;
+  }, [leaderModel, availableModels]);
+
+  const agentModelLabel = useMemo(() => {
+    if (!agentModel) return leaderModelLabel;
+    const entry = availableModels.find(m => m.id === agentModel);
+    return entry ? formatModelLabel(entry) : agentModel;
+  }, [agentModel, availableModels, leaderModelLabel]);
+
+  // 流式进度：tool_input / leader_text / leader_thinking / agent_text / agent_thinking / agent_tool 六种
+  // 都会在状态条显示"~N tokens · M chars · K/s"，让用户看到 token 在涨。每秒 tick 全局刷新一次。
+  const agentConversations = useSessionStore((s) => s.agentConversations);
+  const displayAgents = useMemo<AgentRuntime[]>(() => {
+    const byId = new Map<string, AgentRuntime>();
+    for (const agent of agents) {
+      byId.set(agent.agentId, agent);
+    }
+    for (const conv of Object.values(agentConversations)) {
+      const existing = byId.get(conv.agentId);
+      byId.set(conv.agentId, {
+        agentId: conv.agentId,
+        agentName: existing?.agentName || conv.agentName || conv.agentId,
+        role: existing?.role || conv.role || 'worker',
+        status: existing?.status || conv.status || 'completed',
+        taskId: existing?.taskId ?? conv.taskId,
+        workingDirectory: existing?.workingDirectory ?? conv.workingDirectory,
+        writeScope: existing?.writeScope ?? conv.writeScope,
+        backend: existing?.backend ?? conv.backend,
+        externalSessionId: existing?.externalSessionId ?? conv.externalSessionId,
+        pid: existing?.pid ?? conv.pid,
+        spawnedAt: existing?.spawnedAt ?? conv.messages[0]?.timestamp,
+      });
+    }
+    return Array.from(byId.values()).sort((a, b) => (a.spawnedAt ?? 0) - (b.spawnedAt ?? 0));
+  }, [agents, agentConversations]);
+
+  const eternalRuntime = runtimeSnapshot?.eternal ?? null;
 
   const runState = useMemo(() => buildChatRunStateViewModel({
     phase,
@@ -862,10 +942,6 @@ export default function ChatView() {
     };
   }, [sessionId, messages.length, runtimeSnapshot]);
 
-  const inlineStatusText = useMemo(() => {
-    return getInlineStatusText(displayPhase, displayAgents, streamingProgress, compactingProgress, t);
-  }, [displayAgents, compactingProgress, displayPhase, streamingProgress, t]);
-
   const agentMentionCandidates = useMemo(() => {
     const seen = new Map<string, { name: string; desc: string }>();
     for (const agent of displayAgents) {
@@ -882,11 +958,6 @@ export default function ChatView() {
     [pendingPermissionRequests, sessionId],
   );
 
-  const leaderDisplayStatus = inlineStatusText
-    || (runActive
-      ? t('chat.status.processing')
-      : leaderStatusText || (displayPhase === 'idle' ? t('chat.status.idleShort') : t('chat.status.processing')));
-
   const fetchModels = useCallback(async () => {
     try {
       const res = await fetch('/api/v1/settings', {
@@ -894,9 +965,9 @@ export default function ChatView() {
       });
       const json = await res.json();
       const data = json?.data || {};
-      const workspacePreference = readWorkspaceModelPreference(activeWorkspace);
-      const nextLeaderModel = data.model || workspacePreference.leaderModel || '';
-      const nextAgentModel = data.agentModel || workspacePreference.agentModel || data.model || '';
+      const sessionPreference = readSessionModelPreference(sessionId || '');
+      const nextLeaderModel = sessionPreference.leaderModel || data.model || '';
+      const nextAgentModel = sessionPreference.agentModel || sessionPreference.leaderModel || data.model || '';
       if (nextLeaderModel) setLeaderModel(nextLeaderModel);
       if (nextAgentModel) setAgentModel(nextAgentModel);
       const allModels: ModelEntry[] = [];
@@ -906,19 +977,32 @@ export default function ChatView() {
         }
       }
       setAvailableModels(allModels);
-    } catch (e) { console.warn('[ChatView] fetchModels failed:', e); }
-  }, [activeWorkspace]);
+    } catch (e) { log.warn('[ChatView] fetchModels failed:', e); }
+  }, [sessionId, activeWorkspace]);
 
   // 获取当前模型 + 可用模型列表；Settings 是真实配置源，工作区偏好只作为旧版本兜底。
   useEffect(() => {
     fetchModels();
   }, [fetchModels]);
+  // 从 runtime snapshot 同步 leader/agent 模型：当服务端 setModel 改变模型后，
+  // runtime state 会携带新的 leaderModel/agentModel，覆盖本地 localStorage 值。
+  useEffect(() => {
+    const snapLeaderModel = runtimeSnapshot?.leader?.leaderModel;
+    const snapAgentModel = runtimeSnapshot?.leader?.agentModel;
+    if (snapLeaderModel && snapLeaderModel !== leaderModel) {
+      setLeaderModel(snapLeaderModel);
+    }
+    if (snapAgentModel && snapAgentModel !== agentModel) {
+      setAgentModel(snapAgentModel);
+    }
+  }, [runtimeSnapshot?.leader?.leaderModel, runtimeSnapshot?.leader?.agentModel]);
 
   useEffect(() => {
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<SettingsChangedDetail>).detail;
-      // 模型配置刷新、模型选择变更、provider 变更都会影响 chat 模型切换器。
-      if (detail?.key === 'modelRegistry' || detail?.key === 'model' || detail?.key === 'agentModel' || detail?.key === 'providers') {
+      // Only refresh on provider/model registry changes — NOT on 'model'/'agentModel' key changes,
+      // because those are now session-scoped and should NOT propagate across sessions.
+      if (detail?.key === 'modelRegistry' || detail?.key === 'providers') {
         fetchModels();
       }
       // 思考开关热加载：设置页改了也要即时跟随，避免顶栏开关与后端脱节。
@@ -945,7 +1029,7 @@ export default function ChatView() {
           .map(normalizeSkillSuggestion)
           .filter((skill): skill is SkillSuggestion => skill !== null));
       } catch (error) {
-        console.warn('[ChatView] Failed to fetch skills:', error);
+        log.warn('[ChatView] Failed to fetch skills:', error);
       }
     };
     fetchSkills();
@@ -969,7 +1053,7 @@ export default function ChatView() {
         setSlashCommands(commands);
         setSlashCommandRegistryStatus(commands.length > 0 ? 'ready' : 'empty');
       } catch (error) {
-        console.warn('[ChatView] command registry unavailable:', error);
+        log.warn('[ChatView] command registry unavailable:', error);
         if (cancelled) return;
         setSlashCommands([]);
         setSlashCommandRegistryStatus('error');
@@ -1015,14 +1099,14 @@ export default function ChatView() {
           setPromptSuggestions(json.data.suggestions);
         }
       } catch (error) {
-        console.warn('[ChatView] Failed to fetch prompt suggestions:', error);
+        log.warn('[ChatView] Failed to fetch prompt suggestions:', error);
       }
     };
     const timer = setTimeout(fetchSuggestions, 1500);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [promptSuggestionView.ready, promptSuggestionView.refreshKey, messages.length]);
 
-  // 关闭模型选择器和技能/命令/Agent 下拉的外部点击
+  // 关闭模型选择器、技能/命令/Agent 下拉和 token 气泡的外部点击
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (modelPickerRef.current && !modelPickerRef.current.contains(e.target as Node)) {
@@ -1037,39 +1121,35 @@ export default function ChatView() {
       if (agentDropdownRef.current && !agentDropdownRef.current.contains(e.target as Node)) {
         setShowAgentDropdown(false);
       }
+      if (tokenPopoverRef.current && !tokenPopoverRef.current.contains(e.target as Node)) {
+        setShowTokenPopover(false);
+      }
     };
-    if (showModelPicker || showSkillDropdown || showCmdDropdown || showAgentDropdown) document.addEventListener('mousedown', handler);
+    if (showModelPicker || showSkillDropdown || showCmdDropdown || showAgentDropdown || showTokenPopover) document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
-  }, [showModelPicker, showSkillDropdown, showCmdDropdown, showAgentDropdown]);
+  }, [showModelPicker, showSkillDropdown, showCmdDropdown, showAgentDropdown, showTokenPopover]);
 
   const handleSwitchModel = async (target: ModelPickerTarget, model: string) => {
     const previousLeaderModel = leaderModel;
     const previousAgentModel = agentModel;
-    const key = target === 'leader' ? 'model' : 'agentModel';
     setModelSwitching(target);
     setModelSwitchError(null);
     setShowModelPicker(null);
     if (target === 'leader') setLeaderModel(model);
     else setAgentModel(model);
     try {
-      await settingsApiFetch('/settings/general', {
-        method: 'PUT',
-        body: JSON.stringify({ key, value: model }),
-      });
-      notifySettingChanged({ key, value: model });
-      writeWorkspaceModelPreference(activeWorkspace, target === 'leader' ? { leaderModel: model } : { agentModel: model });
+      // Session-level model switch only — do NOT write global settings or broadcast
+      // SETTINGS_CHANGED_EVENT, which would pollute other sessions' model state.
+      writeSessionModelPreference(sessionId || '', target === 'leader' ? { leaderModel: model } : { agentModel: model });
       if (isConnected) {
-        try {
-          await acpClient.sendJsonRpc(target === 'leader' ? 'session/set_model' : 'session/set_agent_model', { model });
-        } catch (rpcError) {
-          console.warn('[ChatView] runtime model switch failed after settings save:', rpcError);
-          setModelSwitchError(rpcError instanceof Error ? rpcError.message : '模型已保存，当前会话热切换失败');
-        }
+        await acpClient.sendJsonRpc(target === 'leader' ? 'session/set_model' : 'session/set_agent_model', { model });
+      } else {
+        throw new Error('Not connected to server');
       }
     } catch (e) {
       setLeaderModel(previousLeaderModel);
       setAgentModel(previousAgentModel);
-      writeWorkspaceModelPreference(activeWorkspace, { leaderModel: previousLeaderModel, agentModel: previousAgentModel });
+      writeSessionModelPreference(sessionId || '', { leaderModel: previousLeaderModel, agentModel: previousAgentModel });
       setModelSwitchError(e instanceof Error ? e.message : '模型切换失败');
     } finally {
       setModelSwitching(null);
@@ -1114,6 +1194,8 @@ export default function ChatView() {
     let enhanced = '';
     let lastUsage: PromptEnhanceStats['usage'];
     let firstTokenMs: number | undefined;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let streamCompleted = false;
 
     const updateStats = (patch: Partial<PromptEnhanceStats>) => {
       setEnhanceStats((current) => {
@@ -1188,7 +1270,7 @@ export default function ChatView() {
       }
 
       updateStats({ status: 'waiting' });
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
       const handleEvent = (raw: string) => {
@@ -1266,7 +1348,10 @@ export default function ChatView() {
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          streamCompleted = true;
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         const parts = buffer.split(/\r?\n\r?\n/);
         buffer = parts.pop() || '';
@@ -1286,13 +1371,25 @@ export default function ChatView() {
         resizeComposerSoon();
       } else {
         const msg = err instanceof Error ? err.message : 'Prompt enhance failed';
-        console.warn('[enhancePrompt]', msg);
+        log.warn('[enhancePrompt]', msg);
         setInput(source);
         resizeComposerSoon();
         updateStats({ status: 'error', error: msg, elapsedMs: Date.now() - startedAt });
         addToast({ type: 'error', message: msg, duration: 5000 });
       }
     } finally {
+      if (reader) {
+        try {
+          if (!streamCompleted) await reader.cancel();
+        } catch {
+          // best-effort: fetch abort / network close may already have released it
+        }
+        try {
+          reader.releaseLock();
+        } catch {
+          // ignore: already released by browser implementation
+        }
+      }
       if (enhanceAbortRef.current === controller) enhanceAbortRef.current = null;
       setIsEnhancing(false);
     }
@@ -1311,7 +1408,7 @@ export default function ChatView() {
         try {
           await acpClient.sendJsonRpc('session/set_extended_thinking', { enabled: next });
         } catch (rpcError) {
-          console.warn('[ChatView] runtime thinking switch failed after settings save:', rpcError);
+          log.warn('[ChatView] runtime thinking switch failed after settings save:', rpcError);
           addToast({
             type: 'info',
             message: t('settings.saved', '设置已保存，当前会话将在下一次请求前同步'),
@@ -1391,6 +1488,7 @@ export default function ChatView() {
   }, [searchOpen, closeSearch]);
 
   const scrollToBottom = useCallback(() => {
+    userScrolledAwayRef.current = false;
     virtuosoRef.current?.scrollToIndex({ index: messages.length - 1, behavior: 'smooth' });
   }, [messages.length]);
 
@@ -1468,13 +1566,13 @@ export default function ChatView() {
     if (!isConnected) return;
     acpClient.sendJsonRpc('plugin/status', { pluginId: 'bughunt', sessionId })
       .then((res) => { setBugHuntEnabled(pluginEnabled(res)); rememberModeToolMeta('bughunt', res); })
-      .catch((e) => { console.warn('[ChatView] bugHunt status fetch failed:', e); });
+      .catch((e) => { log.warn('[ChatView] bugHunt status fetch failed:', e); });
     acpClient.sendJsonRpc('plugin/status', { pluginId: 'office', sessionId })
       .then((res) => { setOfficeEnabled(pluginEnabled(res)); rememberModeToolMeta('office', res); })
-      .catch((e) => { console.warn('[ChatView] office status fetch failed:', e); });
+      .catch((e) => { log.warn('[ChatView] office status fetch failed:', e); });
     acpClient.sendJsonRpc('plugin/status', { pluginId: 'workflow', sessionId })
       .then((res) => { setWorkflowEnabled(pluginEnabled(res)); rememberModeToolMeta('workflow', res); })
-      .catch((e) => { console.warn('[ChatView] workflow status fetch failed:', e); });
+      .catch((e) => { log.warn('[ChatView] workflow status fetch failed:', e); });
   }, [isConnected, sessionId, rememberModeToolMeta]);
 
   useEffect(() => {
@@ -1509,7 +1607,7 @@ export default function ChatView() {
         setBugHuntEnabled(true);
         triggerModeBurst('bughunt', true);
       }
-    } catch (e) { console.error('[BugHunt] toggle failed:', e); }
+    } catch (e) { log.error('[BugHunt] toggle failed:', e); }
     finally { setBugHuntLoading(false); }
   };
 
@@ -1528,7 +1626,7 @@ export default function ChatView() {
         setOfficeEnabled(true);
         triggerModeBurst('office', true);
       }
-    } catch (e) { console.error('[Office] toggle failed:', e); }
+    } catch (e) { log.error('[Office] toggle failed:', e); }
     finally { setOfficeLoading(false); }
   };
 
@@ -1547,7 +1645,7 @@ export default function ChatView() {
         setWorkflowEnabled(true);
         triggerModeBurst('workflow', true);
       }
-    } catch (e) { console.error('[Workflow] toggle failed:', e); }
+    } catch (e) { log.error('[Workflow] toggle failed:', e); }
     finally { setWorkflowLoading(false); }
   };
 
@@ -1602,21 +1700,22 @@ export default function ChatView() {
   }, []);
 
   const openRunReview = useCallback(() => {
+    // 剑阁已重构为 Canvas 工作台，审查入口仅展开剑阁（不再切 tab）。
     setWorkbenchPanelCollapsed(false);
-    setWorkbenchToolRequest((current) => ({
-      tool: 'review',
-      id: (current?.id ?? 0) + 1,
-    }));
   }, []);
 
   useEffect(() => {
     const handleOpenAgentPanel = () => setShowAgentPanel(true);
     const handleOpenWorkbenchReview = () => openRunReview();
+    // 下载产物「在画布打开」：展开剑阁侧栏（产物由 openArtifact 驱动 JiangeCanvas 内的 ArtifactView 预览）。
+    const handleOpenJiange = () => setWorkbenchPanelCollapsed(false);
     window.addEventListener('lingxiao:open-agent-panel', handleOpenAgentPanel);
     window.addEventListener('lingxiao:open-workbench-review', handleOpenWorkbenchReview);
+    window.addEventListener('lingxiao:open-jiange', handleOpenJiange);
     return () => {
       window.removeEventListener('lingxiao:open-agent-panel', handleOpenAgentPanel);
       window.removeEventListener('lingxiao:open-workbench-review', handleOpenWorkbenchReview);
+      window.removeEventListener('lingxiao:open-jiange', handleOpenJiange);
     };
   }, [openRunReview]);
 
@@ -1632,7 +1731,7 @@ export default function ChatView() {
           setModelSupportsVision(data.data?.supportsVision ?? false);
           setLeaderModelContextWindow(data.data?.contextWindowSize ?? null);
         }
-      } catch (e) { console.warn('[ChatView] leader model capabilities fetch failed:', e); }
+      } catch (e) { log.warn('[ChatView] leader model capabilities fetch failed:', e); }
     })();
   }, [leaderModel]);
 
@@ -1646,7 +1745,7 @@ export default function ChatView() {
           const data = await res.json();
           setAgentModelContextWindow(data.data?.contextWindowSize ?? null);
         }
-      } catch (e) { console.warn('[ChatView] agent model capabilities fetch failed:', e); }
+      } catch (e) { log.warn('[ChatView] agent model capabilities fetch failed:', e); }
     })();
   }, [agentModel]);
 
@@ -1828,7 +1927,7 @@ export default function ChatView() {
         const res = await fetch('/api/v1/settings', { headers: { 'x-lingxiao-token': getServerToken() } });
         if (res.ok) { const data = await res.json(); setDeepThinkingEnabled(!!data?.data?.alwaysThinkingEnabled); }
       } catch (error) {
-        console.warn('[ChatView] Failed to fetch settings:', error);
+        log.warn('[ChatView] Failed to fetch settings:', error);
       }
     })();
   }, []);
@@ -1884,7 +1983,7 @@ export default function ChatView() {
     if (isCreating) return;
     setIsCreating(true);
     try { await createAndConnect(); setShowSessionList(false); }
-    catch (e) { console.error('Failed to create session:', e); }
+    catch (e) { log.error('Failed to create session:', e); }
     finally { setIsCreating(false); }
   };
 
@@ -1928,7 +2027,7 @@ export default function ChatView() {
         prompt: payload.prompt,
       });
     } catch (e) {
-      console.error('Failed to send message:', e);
+      log.error('Failed to send message:', e);
       useSessionStore.getState().updateLastMessage('[Error] Failed to send message');
       // 显示错误后自动恢复到 idle，允许用户重试
       setPhase('idle');
@@ -2114,13 +2213,6 @@ export default function ChatView() {
     setCmdSelectedIndex(0);
   }, [input, showCmdDropdown, SLASH_COMMANDS, slashCommandRegistryStatus]);
 
-  const insertBrowserPrompt = useCallback((prompt: string) => {
-    setInput((prev) => prev.trim() ? `${prev.trimEnd()}\n\n${prompt}` : prompt);
-    setPromptSuggestions([]);
-    requestAnimationFrame(resizeInput);
-    setTimeout(() => textareaRef.current?.focus(), 30);
-  }, [resizeInput]);
-
   const insertWorkbenchGuidePrompt = useCallback((prompt: string) => {
     setInput((prev) => prev.trim() ? `${prev.trimEnd()}\n\n${prompt}` : prompt);
     setPromptSuggestions([]);
@@ -2148,18 +2240,6 @@ export default function ChatView() {
       throw err;
     }
   }, [addToast, t]);
-
-  const sendBrowserPrompt = useCallback(async (prompt: string) => {
-    if (!isConnected) {
-      insertBrowserPrompt(prompt);
-      return;
-    }
-    setPromptSuggestions([]);
-    setShowCmdDropdown(false);
-    setShowSkillDropdown(false);
-    setShowAgentDropdown(false);
-    await doSend(prompt, [], []);
-  }, [doSend, insertBrowserPrompt, isConnected]);
 
   const insertSkill = useCallback((skillName: string) => {
     setInput(prev => {
@@ -2270,7 +2350,7 @@ export default function ChatView() {
   };
 
   const handleStop = async () => {
-    try { await acpClient.sendJsonRpc('session/cancel'); } catch (error) { console.warn('[ChatView] Failed to cancel session:', error); }
+    try { await acpClient.sendJsonRpc('session/cancel'); } catch (error) { log.warn('[ChatView] Failed to cancel session:', error); }
     setPhase('idle');
     // 重置所有 Agent 状态，避免 hasRunningAgents() 残留阻塞后续状态转换
     useSessionStore.getState().agents.forEach(a => {
@@ -2321,6 +2401,74 @@ export default function ChatView() {
     }
   }, [messages, sessionId]);
 
+  // ── JSON 导出（凌霄对话格式）──
+  const handleExportJSON = useCallback(() => {
+    const jsonStr = messagesToJSON(messages, {
+      sessionId: sessionId || undefined,
+      title: `Session ${sessionId?.slice(0, 8) || 'unknown'}`,
+    });
+    downloadJSON(jsonStr, getExportFilename(sessionId || undefined, 'json'));
+  }, [messages, sessionId]);
+
+  // ── JSON 导入（凌霄对话格式）──
+  const jsonImportInputRef = useRef<HTMLInputElement>(null);
+  const [importStatus, setImportStatus] = useState<{ kind: 'idle' | 'loading' | 'success' | 'error'; message?: string }>({ kind: 'idle' });
+
+  const handleImportJSON = useCallback(() => {
+    jsonImportInputRef.current?.click();
+  }, []);
+
+  const handleImportFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // 重置 input 以便重复选择同一文件
+    e.target.value = '';
+    if (!file) return;
+
+    setImportStatus({ kind: 'loading' });
+    try {
+      const text = await readFileAsText(file);
+      const parsed = parseLingxiaoJSON(text);
+
+      if (parsed.messages.length === 0) {
+        setImportStatus({ kind: 'error', message: '文件中没有可导入的消息。' });
+        setTimeout(() => setImportStatus({ kind: 'idle' }), 4000);
+        return;
+      }
+
+      // 调用后端导入 API，创建新会话并写入消息
+      const res = await fetch('/api/sessions/import', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-lingxiao-token': getServerToken(),
+        },
+        body: JSON.stringify({
+          messages: parsed.messages,
+          title: parsed.title || `Imported ${file.name}`,
+          workspace: parsed.workspace,
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || `导入失败 (HTTP ${res.status})`);
+      }
+
+      const result = await res.json() as { id: string; messageCount: number };
+
+      // 刷新会话列表并连接到新会话
+      await fetchSessions();
+      await connectToSession(result.id);
+
+      setImportStatus({ kind: 'success', message: `已导入 ${result.messageCount} 条消息` });
+      setTimeout(() => setImportStatus({ kind: 'idle' }), 4000);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '导入失败，请检查文件格式。';
+      setImportStatus({ kind: 'error', message: msg });
+      setTimeout(() => setImportStatus({ kind: 'idle' }), 6000);
+    }
+  }, [fetchSessions, connectToSession]);
+
   const ctxPct = contextRuntimeState && contextRuntimeState.maxTokens > 0
     ? Math.round((contextRuntimeState.currentTokens / contextRuntimeState.maxTokens) * 100)
     : null;
@@ -2343,7 +2491,7 @@ export default function ChatView() {
     try {
       localStorage.setItem('lingxiao_agent_panel_width', String(agentPanelWidth));
     } catch (error) {
-      console.warn('[ChatView] Failed to persist agent panel width:', error);
+      log.warn('[ChatView] Failed to persist agent panel width:', error);
     }
   }, [agentPanelWidth]);
 
@@ -2355,7 +2503,7 @@ export default function ChatView() {
     try {
       handle.setPointerCapture(pointerId);
     } catch (error) {
-      console.warn('[ChatView] Failed to capture resize pointer:', error);
+      log.warn('[ChatView] Failed to capture resize pointer:', error);
     }
     const startX = event.clientX;
     const startWidth = agentPanelWidth;
@@ -2371,7 +2519,7 @@ export default function ChatView() {
       try {
         if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
       } catch (error) {
-        console.warn('[ChatView] Failed to release resize pointer:', error);
+        log.warn('[ChatView] Failed to release resize pointer:', error);
       }
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
@@ -2533,7 +2681,7 @@ export default function ChatView() {
                                   });
                                   fetchSessions();
                                 } catch (error) {
-                                  console.warn('[ChatView] Failed to rename session:', error);
+                                  log.warn('[ChatView] Failed to rename session:', error);
                                 }
                               }
                               setRenamingSessionId(null);
@@ -2610,59 +2758,111 @@ export default function ChatView() {
             </div>
           )}
 
-          {/* Token usage */}
+          {/* Token usage — 紧凑触发器 + popover 下拉详情 */}
           {tokenUsage.total > 0 && (
-            <div className="flex items-center gap-1.5 mr-2">
-              <div className={`flex items-center gap-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                tokenUsage.total > 800000 ? 'border-accent-red/30 bg-accent-red/5' :
-                tokenUsage.total > 500000 ? 'border-accent-yellow/30 bg-accent-yellow/5' :
-                'border-border-default/50'
-              }`}>
+            <div className="flex items-center gap-1.5 mr-2 relative" ref={tokenPopoverRef}>
+              <button
+                onClick={() => setShowTokenPopover((v) => !v)}
+                className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                  tokenUsage.total > 800000 ? 'border-accent-red/30 bg-accent-red/5' :
+                  tokenUsage.total > 500000 ? 'border-accent-yellow/30 bg-accent-yellow/5' :
+                  'border-border-default/50'
+                }`}
+              >
                 <Zap size={10} className={tokenUsage.total > 800000 ? 'text-accent-red' : tokenUsage.total > 500000 ? 'text-accent-yellow' : 'text-text-tertiary'} />
                 <span className={tokenUsage.total > 800000 ? 'text-accent-red' : tokenUsage.total > 500000 ? 'text-accent-yellow' : 'text-text-tertiary'}>{formatTokens(tokenUsage.total)}</span>
-                <span className="text-text-tertiary/40">↑{formatTokens(tokenUsage.prompt)}</span>
-                <span className="text-text-tertiary/40">↓{formatTokens(tokenUsage.completion)}</span>
-              </div>
-              {/* 消耗轨迹火花图:斜率即烧 token 速率 */}
-              <TokenSparkline data={tokenHistory} />
-              {/* Cost display */}
-              <span className="text-[10px] font-mono text-accent-green/70" title={t('chat.cost.tooltip', 'Estimated cost based on model pricing')}>
-                {formatCost(calculateCost(leaderModel || 'default', {
-                  prompt: tokenUsage.prompt,
-                  completion: tokenUsage.completion,
-                  cache_read: tokenUsage.cache_read,
-                  cache_creation: tokenUsage.cache_creation,
-                }))}
-              </span>
-              {/* Context window 占用 — 显示当前窗口已用/总量，而非累计消耗 */}
-              {ctxPct !== null && (
-                <div className={`flex items-center gap-0.5 text-[10px] font-mono px-1 ${
-                  contextRuntimeState!.warningLevel === 'critical' ? 'text-accent-red' :
-                  contextRuntimeState!.warningLevel === 'warning' ? 'text-accent-yellow' : 'text-text-tertiary'
-                }`} title={t('chat.input.contextWindowTooltip', { current: formatTokens(contextRuntimeState!.currentTokens), max: formatTokens(contextRuntimeState!.maxTokens) })}>
-                  ctx {formatTokens(contextRuntimeState!.currentTokens)}/{formatTokens(contextRuntimeState!.maxTokens)}
-                </div>
-              )}
-              <button onClick={handleCompress} disabled={isCompressing || compactingActive || runActive}
-                className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
-                  isCompressing || compactingActive
-                    ? 'border-accent-yellow/30 text-accent-yellow bg-accent-yellow/10'
-                    : compressResult?.error
-                      ? 'border-accent-red/30 text-accent-red bg-accent-red/10'
-                      : compressResult?.inProgress
-                        ? 'border-accent-yellow/30 text-accent-yellow bg-accent-yellow/10'
-                      : compressResult && !compressResult.skipped
-                        ? 'border-accent-green/30 text-accent-green bg-accent-green/10'
-                        : compressResult?.skipped
-                          ? 'border-text-tertiary/30 text-text-tertiary'
-                          : 'border-border-default text-text-tertiary hover:text-accent-yellow hover:border-accent-yellow/30 disabled:opacity-40'
-                }`}
-                title={compressResult?.error || (compactingActive ? compactingStatusText : (compressResult?.inProgress ? compressResult.reason : (compressResult?.skipped ? compressResult.reason : t('chat.input.compressTooltip'))))}>
-                <Minimize2 size={10} className={isCompressing || compactingActive || compressResult?.inProgress ? 'animate-pulse' : ''} />
-                {isCompressing || compactingActive ? '...' : compressResult ? (compressResult.error ? '!' : (compressResult.inProgress ? '...' : (compressResult.skipped ? '—' : <Check size={10} className="text-accent-green" />))) : t('chat.input.compress')}
               </button>
               {tokenUsage.total > 500000 && (
                 <AlertTriangle size={11} className={tokenUsage.total > 800000 ? 'text-accent-red animate-pulse' : 'text-accent-yellow'} />
+              )}
+              {showTokenPopover && (
+                <div className="absolute top-full left-0 mt-1 min-w-[200px] bg-bg-card/92 backdrop-blur-2xl border border-border-default rounded-xl shadow-2xl z-[200] p-2 flex flex-col gap-1.5">
+                  {/* 完整 token 分项 */}
+                  <div className={`flex items-center gap-1.5 text-[10px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                    tokenUsage.total > 800000 ? 'border-accent-red/30 bg-accent-red/5' :
+                    tokenUsage.total > 500000 ? 'border-accent-yellow/30 bg-accent-yellow/5' :
+                    'border-border-default/50'
+                  }`}>
+                    <Zap size={10} className={tokenUsage.total > 800000 ? 'text-accent-red' : tokenUsage.total > 500000 ? 'text-accent-yellow' : 'text-text-tertiary'} />
+                    <span className={tokenUsage.total > 800000 ? 'text-accent-red' : tokenUsage.total > 500000 ? 'text-accent-yellow' : 'text-text-tertiary'}>{formatTokens(tokenUsage.total)}</span>
+                    <span className="text-text-tertiary/40">↑{formatTokens(tokenUsage.prompt)}</span>
+                    <span className="text-text-tertiary/40">↓{formatTokens(tokenUsage.completion)}</span>
+                    {(tokenUsage.reasoning ?? 0) > 0 && <span className="text-text-tertiary/40">think {formatTokens(tokenUsage.reasoning ?? 0)}</span>}
+                    {((tokenUsage.cache_read ?? 0) + (tokenUsage.cache_creation ?? 0)) > 0 && <span className="text-text-tertiary/40">cache {formatTokens((tokenUsage.cache_read ?? 0) + (tokenUsage.cache_creation ?? 0))}</span>}
+                  </div>
+                  {/* 消耗轨迹火花图:斜率即烧 token 速率 */}
+                  <TokenSparkline data={tokenHistory} />
+                  {/* Cost display — 区分 estimated/partial/cache hit,避免伪精确 */}
+                  {(() => {
+                    const cost = calculateCostDetailed(leaderModel || 'default', {
+                      prompt: tokenUsage.prompt,
+                      completion: tokenUsage.completion,
+                      cache_read: tokenUsage.cache_read,
+                      cache_creation: tokenUsage.cache_creation,
+                    });
+                    const tooltipKey = cost.partial
+                      ? 'chat.cost.tooltipPartial'
+                      : (cost.estimated ? 'chat.cost.tooltip' : 'chat.cost.tooltip');
+                    const tooltip = cost.partial
+                      ? t(tooltipKey, { rate: cost.cacheHitRate.toFixed(0) })
+                      : t(tooltipKey);
+                    const accentClass = cost.partial
+                      ? 'text-accent-yellow/80'
+                      : (cost.estimated ? 'text-accent-green/60' : 'text-accent-green/80');
+                    return (
+                      <span
+                        className={`flex items-center gap-1 text-[10px] font-mono ${accentClass}`}
+                        title={tooltip}
+                        data-pricing-partial={cost.partial ? 'true' : undefined}
+                        data-pricing-estimated={cost.estimated ? 'true' : undefined}
+                      >
+                        <span>~{formatCost(cost.total)}</span>
+                        {cost.partial && (
+                          <span className="px-1 rounded-sm bg-accent-yellow/15 text-accent-yellow/90 border border-accent-yellow/30">
+                            {t('chat.cost.partialBadge')}
+                          </span>
+                        )}
+                        {!cost.partial && cost.estimated && (
+                          <span className="px-1 rounded-sm bg-text-tertiary/15 text-text-tertiary border border-text-tertiary/30">
+                            {t('chat.cost.estimatedBadge')}
+                          </span>
+                        )}
+                        {cost.cacheHitRate > 0 && (
+                          <span className="text-text-tertiary/70">
+                            {t('chat.cost.cacheHitSuffix', { rate: cost.cacheHitRate.toFixed(0) })}
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })()}
+                  {/* Context window 占用 — 显示当前窗口已用/总量，而非累计消耗 */}
+                  {ctxPct !== null && (
+                    <div className={`flex items-center gap-0.5 text-[10px] font-mono px-1 ${
+                      contextRuntimeState!.warningLevel === 'critical' ? 'text-accent-red' :
+                      contextRuntimeState!.warningLevel === 'warning' ? 'text-accent-yellow' : 'text-text-tertiary'
+                    }`} title={t('chat.input.contextWindowTooltip', { current: formatTokens(contextRuntimeState!.currentTokens), max: formatTokens(contextRuntimeState!.maxTokens) })}>
+                      ctx≈{formatTokens(contextRuntimeState!.currentTokens)}/{formatTokens(contextRuntimeState!.maxTokens)}
+                    </div>
+                  )}
+                  <button onClick={handleCompress} disabled={isCompressing || compactingActive || runActive}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
+                      isCompressing || compactingActive
+                        ? 'border-accent-yellow/30 text-accent-yellow bg-accent-yellow/10'
+                        : compressResult?.error
+                          ? 'border-accent-red/30 text-accent-red bg-accent-red/10'
+                          : compressResult?.inProgress
+                            ? 'border-accent-yellow/30 text-accent-yellow bg-accent-yellow/10'
+                          : compressResult && !compressResult.skipped
+                            ? 'border-accent-green/30 text-accent-green bg-accent-green/10'
+                            : compressResult?.skipped
+                              ? 'border-text-tertiary/30 text-text-tertiary'
+                              : 'border-border-default text-text-tertiary hover:text-accent-yellow hover:border-accent-yellow/30 disabled:opacity-40'
+                    }`}
+                    title={compressResult?.error || (compactingActive ? compactingStatusText : (compressResult?.inProgress ? compressResult.reason : (compressResult?.skipped ? compressResult.reason : t('chat.input.compressTooltip'))))}>
+                    <Minimize2 size={10} className={isCompressing || compactingActive || compressResult?.inProgress ? 'animate-pulse' : ''} />
+                    {isCompressing || compactingActive ? '...' : compressResult ? (compressResult.error ? '!' : (compressResult.inProgress ? '...' : (compressResult.skipped ? '—' : <Check size={10} className="text-accent-green" />))) : t('chat.input.compress')}
+                  </button>
+                </div>
               )}
             </div>
           )}
@@ -2732,30 +2932,77 @@ export default function ChatView() {
             </button>
           )}
 
-          {/* Export buttons */}
-          {messages.length > 0 && (
-            <div className="flex items-center gap-0.5">
-              <button
-                onClick={handleCopyMarkdown}
-                className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
-                  exportCopied
-                    ? 'border-accent-green/30 text-accent-green bg-accent-green/10'
+          {/* Export / Import buttons */}
+          <div className="flex items-center gap-0.5">
+            {messages.length > 0 && (
+              <>
+                <button
+                  onClick={handleCopyMarkdown}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
+                    exportCopied
+                      ? 'border-accent-green/30 text-accent-green bg-accent-green/10'
+                      : 'border-border-default text-text-tertiary hover:text-accent-blue hover:border-accent-blue/30'
+                  }`}
+                  title={t('chat.export.copy', 'Copy as Markdown')}
+                >
+                  <FileText size={10} />
+                  {exportCopied ? t('chat.export.copied', 'Copied!') : t('chat.export.copy', 'Copy')}
+                </button>
+                <button
+                  onClick={handleExportMarkdown}
+                  className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border border-border-default text-text-tertiary hover:text-accent-blue hover:border-accent-blue/30 transition-colors"
+                  title={t('chat.export.download', 'Download as Markdown')}
+                >
+                  <Archive size={10} />
+                  {t('chat.export.download', 'Export')}
+                </button>
+                <button
+                  onClick={handleExportJSON}
+                  className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border border-border-default text-text-tertiary hover:text-accent-green hover:border-accent-green/30 transition-colors"
+                  title={t('chat.export.json', 'Export as JSON (凌霄对话格式)')}
+                >
+                  <FileJson size={10} />
+                  {t('chat.export.jsonLabel', 'JSON')}
+                </button>
+              </>
+            )}
+            <button
+              onClick={handleImportJSON}
+              disabled={importStatus.kind === 'loading'}
+              className={`flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors ${
+                importStatus.kind === 'success'
+                  ? 'border-accent-green/30 text-accent-green bg-accent-green/10'
+                  : importStatus.kind === 'error'
+                    ? 'border-red-500/30 text-red-400 bg-red-500/10'
                     : 'border-border-default text-text-tertiary hover:text-accent-blue hover:border-accent-blue/30'
-                }`}
-                title={t('chat.export.copy', 'Copy as Markdown')}
-              >
-                <FileText size={10} />
-                {exportCopied ? t('chat.export.copied', 'Copied!') : t('chat.export.copy', 'Copy')}
-              </button>
-              <button
-                onClick={handleExportMarkdown}
-                className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono rounded border border-border-default text-text-tertiary hover:text-accent-blue hover:border-accent-blue/30 transition-colors"
-                title={t('chat.export.download', 'Download as Markdown')}
-              >
-                <Archive size={10} />
-                {t('chat.export.download', 'Export')}
-              </button>
-            </div>
+              } ${importStatus.kind === 'loading' ? 'opacity-50 cursor-wait' : ''}`}
+              title={t('chat.import.json', 'Import conversation from JSON')}
+            >
+              {importStatus.kind === 'loading'
+                ? <Loader2 size={10} className="animate-spin" />
+                : <Upload size={10} />}
+              {importStatus.kind === 'success'
+                ? t('chat.import.success', 'Imported!')
+                : importStatus.kind === 'error'
+                  ? t('chat.import.failed', 'Failed')
+                  : t('chat.import.label', 'Import')}
+            </button>
+            <input
+              ref={jsonImportInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportFileChange}
+              className="hidden"
+            />
+          </div>
+
+          {importStatus.kind === 'error' && importStatus.message && (
+            <span className="text-[10px] text-red-400 font-mono max-w-[200px] truncate" title={importStatus.message}>
+              {importStatus.message}
+            </span>
+          )}
+          {importStatus.kind === 'success' && importStatus.message && (
+            <span className="text-[10px] text-accent-green font-mono">{importStatus.message}</span>
           )}
 
           {isLoadingHistory && <span className="text-text-tertiary">Loading...</span>}
@@ -2813,6 +3060,8 @@ export default function ChatView() {
                 // isAtBottom 初始为 false，followOutput 返回 false 不滚动 → 死锁。
                 // 用 needsInitialScrollRef 在初始加载完成前强制返回 'auto'。
                 if (needsInitialScrollRef.current) return 'auto';
+                // 用户手动上翻后暂停自动跟随，直到用户滚回底部或点滚动按钮
+                if (userScrolledAwayRef.current) return false;
                 if (!isAtBottom) return false;
                 // 流式期间用 'auto'（瞬时跳转）而非 'smooth'：每帧 chunk 触发一次 smooth
                 // 滚动动画会互相打断、抖动。仅在非流式（离散新消息）时用平滑滚动。
@@ -2823,6 +3072,14 @@ export default function ChatView() {
               atBottomStateChange={(atBottom) => {
                 isAtBottomRef.current = atBottom;
                 setShowScrollBtn(!atBottom);
+                // 用户滚回底部时清除手动滚动标记，恢复自动跟随
+                if (atBottom) userScrolledAwayRef.current = false;
+              }}
+              onWheel={() => {
+                // 用户主动滚动且不在底部时，标记为手动上翻，暂停 followOutput
+                if (!isAtBottomRef.current) {
+                  userScrolledAwayRef.current = true;
+                }
               }}
               rangeChanged={(range) => {
                 setTimelineIndex(range.startIndex);
@@ -2916,17 +3173,13 @@ export default function ChatView() {
                   <button
                     ref={showModelPicker === picker.target ? modelPickerBtnRef : undefined}
                     onClick={() => setShowModelPicker((v) => v === picker.target ? null : picker.target)}
-                    className="codex-chip flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium transition-colors max-w-[240px]"
-                    title={`${picker.label}: ${picker.modelLabel}`}
+                    className="codex-chip flex items-center gap-1 px-2.5 py-0.5 text-[11px] font-medium transition-colors max-w-[240px]"
+                    title={picker.label}
                   >
-                    <Bot size={11} className="shrink-0" />
-                    <span className="text-text-tertiary/70 shrink-0">{picker.label}</span>
+                    <Bot size={10} className="shrink-0" />
                     <span className="max-w-[120px] truncate">{picker.modelLabel}</span>
-                    {picker.contextWindow && (
-                      <span className="text-[10px] text-text-tertiary/60 font-mono shrink-0">{picker.contextWindow >= 1000 ? `${Math.round(picker.contextWindow / 1000)}k` : picker.contextWindow}</span>
-                    )}
                     {modelSwitching === picker.target && <Loader2 size={10} className="animate-spin text-accent-brand shrink-0" />}
-                    {picker.target === 'leader' && modelSupportsVision && <span className="inline-flex shrink-0" title={t('chat.model.supportsVision')}><Eye size={10} className="text-accent-brand/70" /></span>}
+                    {picker.target === 'leader' && modelSupportsVision && <span className="inline-flex shrink-0" title={t('chat.model.supportsVision')}><Eye size={9} className="text-accent-brand/70" /></span>}
                     <ChevronDown size={10} className={`transition-transform shrink-0 ${showModelPicker === picker.target ? 'rotate-180' : ''}`} />
                   </button>
                   {showModelPicker === picker.target && (
@@ -2946,6 +3199,9 @@ export default function ChatView() {
                             {m.id === picker.model && <span className="w-1.5 h-1.5 rounded-full bg-accent-brand shrink-0" />}
                             {m.id !== picker.model && <span className="w-1.5 h-1.5 shrink-0" />}
                             <span className="truncate">{formatModelLabel(m)}</span>
+                            {m.id === picker.model && picker.contextWindow && (
+                              <span className="text-[10px] text-text-tertiary/60 font-mono shrink-0 ml-auto">{picker.contextWindow >= 1000 ? `${Math.round(picker.contextWindow / 1000)}k` : picker.contextWindow}</span>
+                            )}
                           </button>
                         ))}
                       </div>
@@ -2963,16 +3219,12 @@ export default function ChatView() {
               <ChatGitBranchPicker workspace={activeWorkspace} />
               <WorkspacePicker />
               {isConnected && (
-                <div className="min-w-0 flex-1 flex items-center gap-2 text-[11px] font-mono text-text-tertiary">
-                  <span
-                    className="min-w-0 flex-1 truncate whitespace-nowrap"
-                    title={`${leaderModelLabel} · Leader · ${leaderDisplayStatus}`}
-                  >
-                    {leaderModelLabel} · Leader · {(inlineStatusText || runActive) && (
-                      <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-accent-brand animate-pulse align-middle" />
-                    )}{leaderDisplayStatus}
-                  </span>
-                </div>
+                <LeaderStatusLine
+                  leaderModelLabel={leaderModelLabel}
+                  runActive={runActive}
+                  displayPhase={displayPhase}
+                  displayAgents={displayAgents}
+                />
               )}
             </div>
           )}
@@ -3143,6 +3395,26 @@ export default function ChatView() {
                 if (files.length > 0) {
                   e.preventDefault();
                   handleFileAttach(files);
+                  return;
+                }
+                // 大文本粘贴拦截：超过阈值时直接转为文件附件，不让巨量文本进入 textarea。
+                // 解决 308K 字符粘贴导致浏览器卡死的问题。
+                const pastedText = e.clipboardData?.getData('text/plain');
+                if (pastedText && pastedText.length > LONG_INPUT_ATTACHMENT_THRESHOLD) {
+                  e.preventDefault();
+                  // 异步上传，不阻塞 UI
+                  void (async () => {
+                    const longFile = await uploadLongInputAsFile(pastedText);
+                    if (longFile) {
+                      setPendingFiles((prev) => [...prev, longFile]);
+                      // 在输入框显示简短提示（而不是 308K 原文）
+                      const notice = t('chat.input.longMessageAttachmentNotice', {
+                        count: pastedText.length,
+                        name: longFile.name,
+                      });
+                      setInput((prev) => prev ? `${prev}\n${notice}` : notice);
+                    }
+                  })();
                 }
               }}
               placeholder={!isConnected ? t('connection.disconnected') : `${t('input.placeholder')} (Enter ${t('input.send')}, Shift+Enter)`}
@@ -3239,17 +3511,10 @@ export default function ChatView() {
           </button>
         </div>
       ) : (
-        <WorkbenchSidePanel
-          context={workbench.context}
-          isLoading={workbench.isLoading}
-          error={workbench.error}
-          terminalOpen={workbenchTerminalOpen}
-          toolRequest={workbenchToolRequest}
+        <JiangeCanvas
+          workspaceName={workbenchWorkspaceName}
           onRefresh={workbench.refresh}
           onCollapse={() => setWorkbenchPanelCollapsed(true)}
-          onToggleTerminal={() => setWorkbenchTerminalOpen((open) => !open)}
-          onInsertBrowserPrompt={insertBrowserPrompt}
-          onSendBrowserPrompt={sendBrowserPrompt}
         />
       )}
 

@@ -17,11 +17,21 @@
 
 import type { ToolDefinition } from '../../llm/types.js';
 import { BUGHUNT_SCAN_TOOL_NAMES } from '../../contracts/constants/leaderToolDefinitions.js';
-import { getToolMetadata } from '../../tools/ToolMetadata.js';
+import { getToolMetadata, type ToolMetadata } from '../../tools/ToolMetadata.js';
 import {
   filterToolsByModePolicy,
 } from '../../core/ModeToolPolicy.js';
 import type { ModeRuntimeProjection } from '../../core/ModeRuntimeProjection.js';
+import type { ToolPermissionContext } from '../../core/PermissionSystem.js';
+import {
+  decideAutonomyAction,
+  deriveOperationRisk,
+  inferActionFromToolName,
+} from '../AutonomyDecisionEngine.js';
+import type {
+  AutonomyAction,
+  AutonomyDecision,
+} from '../../contracts/types/AutonomyDecision.js';
 
 /**
  * Bughunt 扫描类工具（已下放为普通 Tool，注册在 ToolRegistry 中），
@@ -212,4 +222,148 @@ export const LEADER_EXECUTION_TOOLS: ReadonlySet<string> = new Set([
 
 export function isLeaderExecutionTool(toolName: string): boolean {
   return LEADER_EXECUTION_TOOLS.has(toolName.trim().toLowerCase());
+}
+
+export type LeaderAutonomyToolGateResult =
+  | { ok: true; decision: AutonomyDecision }
+  | {
+      ok: false;
+      decision: AutonomyDecision;
+      message: string;
+      gateKind: 'forbidden' | 'confirmation_required';
+    };
+
+export interface LeaderAutonomyToolGateInput {
+  toolName: string;
+  args?: Record<string, unknown>;
+  modes: ModeRuntimeProjection;
+  permissionContext?: ToolPermissionContext | null;
+  metadata?: ToolMetadata;
+}
+
+const AUTONOMY_CONFIRMATION_TOOLS: ReadonlySet<string> = new Set([
+  'create_task',
+  'update_task',
+  'delete_task',
+  'dispatch_agent',
+  'dispatch_batch',
+  'workflow',
+  'blackboard',
+  'terminal_control',
+  'git',
+  'request_permission_update',
+]);
+
+function normalizeLeaderAutonomyAction(toolName: string, metadata: ToolMetadata): AutonomyAction {
+  const lower = toolName.trim().toLowerCase();
+  if (lower === 'explore') return 'analyze';
+  if (lower === 'create_task') return 'create_task';
+  if (lower === 'dispatch_agent' || lower === 'dispatch_batch') return 'dispatch';
+  if (lower === 'workflow') return 'workflow_apply';
+  if (lower === 'structured_patch' || lower === 'file_create') return 'apply_change';
+  if (lower === 'shell' || lower === 'python_exec' || lower === 'terminal_control' || lower === 'git') return 'run_command';
+  if (metadata.readOnly || metadata.tier === 'read') return 'read';
+  if (metadata.tier === 'compute') return 'analyze';
+  return inferActionFromToolName(lower);
+}
+
+function shouldRequireAutonomyConfirmation(toolName: string, decision: AutonomyDecision): boolean {
+  const lower = toolName.trim().toLowerCase();
+  if (decision.kind === 'forbid' || decision.kind === 'escalate_to_leader') return true;
+  if (decision.kind === 'dry_run_only') return AUTONOMY_CONFIRMATION_TOOLS.has(lower);
+  if (decision.kind !== 'require_confirmation') return false;
+  if (decision.autonomyMode === 'review_first') return AUTONOMY_CONFIRMATION_TOOLS.has(lower);
+  return decision.evidence.some((item) => item.kind === 'required_gate' || item.kind === 'intent_constraint' || item.kind === 'rule_permission' || (item.kind === 'rule_action' && item.value === 'critical_risk'));
+}
+
+function extractTargetPaths(toolName: string, args?: Record<string, unknown>): readonly string[] | undefined {
+  if (!args) return undefined;
+  const lower = toolName.trim().toLowerCase();
+  const candidates: unknown[] = [];
+  if (lower === 'file_create') candidates.push(args.path, args.file_path, args.filename);
+  if (lower === 'structured_patch') candidates.push(args.path, args.file_path, args.target, args.files);
+  const paths = candidates.flatMap((value) => Array.isArray(value) ? value : value ? [value] : [])
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .map((value) => value.trim());
+  return paths.length > 0 ? Array.from(new Set(paths)) : undefined;
+}
+
+function extractCommand(toolName: string, args?: Record<string, unknown>): string | undefined {
+  if (!args) return undefined;
+  const lower = toolName.trim().toLowerCase();
+  if (lower !== 'shell' && lower !== 'python_exec' && lower !== 'terminal_control' && lower !== 'git') return undefined;
+  for (const key of ['command', 'cmd', 'script', 'args']) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (Array.isArray(value)) return value.map((item) => String(item)).join(' ').trim();
+  }
+  return undefined;
+}
+
+function formatAutonomyGateMessage(toolName: string, decision: AutonomyDecision, gateKind: 'forbidden' | 'confirmation_required'): string {
+  const evidence = decision.evidence
+    .map((item) => `${item.kind}=${item.value}${item.note ? ` (${item.note})` : ''}`)
+    .join('; ');
+  const prefix = gateKind === 'forbidden'
+    ? 'Autonomy gate blocked this tool call.'
+    : 'Autonomy gate requires explicit confirmation before this tool call.';
+  return [
+    prefix,
+    `tool=${toolName}`,
+    `decision=${decision.kind}`,
+    `intentProfile=${decision.intentProfile.primaryIntent}/${decision.intentProfile.phase}/${decision.intentProfile.scope.kind}`,
+    `autonomy=${decision.autonomyMode}`,
+    `reason=${decision.reason}`,
+    evidence ? `evidence=${evidence}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+export function evaluateLeaderAutonomyToolGate(input: LeaderAutonomyToolGateInput): LeaderAutonomyToolGateResult {
+  const toolName = input.toolName.trim();
+  const metadata = input.metadata ?? getToolMetadata(toolName);
+  const action = normalizeLeaderAutonomyAction(toolName, metadata);
+  const isReadOnly = metadata.readOnly === true || metadata.tier === 'read';
+  const decision = decideAutonomyAction({
+    intentProfile: input.modes.intentProfile,
+    autonomyMode: input.modes.autonomy,
+    permissionMode: input.permissionContext?.mode ?? input.modes.permission.mode,
+    leaderExecutionMode: input.modes.route.mode === 'unknown' ? undefined : input.modes.route.mode,
+    controlMode: input.modes.controlMode,
+    toolTier: metadata.tier,
+    operationRisk: deriveOperationRisk({
+      toolTier: metadata.tier,
+      readOnly: isReadOnly,
+      modifiesWorkspace: metadata.modifiesWorkspace,
+      isCritical: metadata.dangerous === true && metadata.privileged === true && (toolName === 'git' || toolName === 'terminal_control'),
+    }),
+    isReadOnly,
+    toolName,
+    action,
+    targetPaths: extractTargetPaths(toolName, input.args),
+    command: extractCommand(toolName, input.args),
+  });
+
+  if (decision.kind === 'allow') {
+    return { ok: true, decision };
+  }
+
+  if (decision.kind === 'forbid') {
+    return {
+      ok: false,
+      decision,
+      gateKind: 'forbidden',
+      message: formatAutonomyGateMessage(toolName, decision, 'forbidden'),
+    };
+  }
+
+  if (shouldRequireAutonomyConfirmation(toolName, decision)) {
+    return {
+      ok: false,
+      decision,
+      gateKind: 'confirmation_required',
+      message: formatAutonomyGateMessage(toolName, decision, 'confirmation_required'),
+    };
+  }
+
+  return { ok: true, decision };
 }

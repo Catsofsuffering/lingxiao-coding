@@ -1,4 +1,12 @@
 import { cleanupRegistry } from './CleanupRegistry.js';
+import { writeCrashReport, listCrashReports } from './CrashReporter.js';
+import { getLogDir } from './Log.js';
+import { restoreTerminalState } from './terminalRestore.js';
+
+// 本进程启动时刻（ms）。用于退出时识别「本次运行新产生」的崩溃报告，
+// 避免把历史 crash 文件误报给用户。留 1s 容差应对时钟/写盘抖动。
+const PROCESS_START_MS = Date.now();
+let crashExitNoticeInstalled = false;
 
 /**
  * Leader 侧 flush 回调注册接口。
@@ -113,11 +121,59 @@ export function isGracefulShuttingDown(): boolean {
   return gracefulShutdownLatched;
 }
 
+/**
+ * 安装崩溃退出提示：进程退出时，若本次运行新产生了 crash 报告，
+ * 向真实 stderr 直写一段醒目提示，引导用户提交 issue 时附带该文件。
+ *
+ * 设计要点：
+ * - 注册到 process.on('exit')，覆盖所有退出路径（gracefulShutdown / TUI 卸载 / 自然退出）。
+ * - 直写 process.stderr.write，绕过 Log.ts ConsoleSink（TUI 模式已关闭）与 muteConsole。
+ * - 仅在 PROCESS_START_MS 之后新增的 crash 文件才提示，避免误报历史崩溃。
+ * - best-effort：exit handler 内任何异常都被吞掉，绝不影响退出。
+ */
+function installCrashExitNotice(): void {
+  if (crashExitNoticeInstalled) return;
+  crashExitNoticeInstalled = true;
+
+  process.on('exit', () => {
+    try {
+      const reports = listCrashReports();
+      const fresh = reports.filter((r) => r.mtime >= PROCESS_START_MS - 1000);
+      if (fresh.length === 0) return;
+
+      const latest = fresh[0];
+      const logDir = getLogDir();
+      const lines = [
+        '',
+        '\u2501\u2501\u2501 \u5d29\u6e83\u62a5\u544a / Crash report \u2501\u2501\u2501',
+        `\u672c\u6b21\u8fd0\u884c\u53d1\u751f\u4e86\u5d29\u6e83\uff0c\u5df2\u751f\u6210\u7ed3\u6784\u5316\u62a5\u544a\uff1a`,
+        `  ${latest.path}`,
+        `\u65e5\u5fd7\u76ee\u5f55\uff1a${logDir}`,
+        `\u63d0\u4ea4 issue \u65f6\u8bf7\u9644\u4e0a\u8be5\u6587\u4ef6\uff0c\u6216\u8fd0\u884c \`lingxiao diagnose\` \u751f\u6210\u8bca\u65ad\u5305\u3002`,
+        '\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501',
+        '',
+      ];
+      process.stderr.write(lines.join('\n') + '\n');
+    } catch {
+      // 退出提示 best-effort，绝不阻塞退出
+    }
+  });
+}
+
 export function installProcessRuntimeGuards(): void {
   if (installed) {
     return;
   }
   installed = true;
+
+  installCrashExitNotice();
+
+  // 终端状态还原兜底：所有退出路径（正常/crash/信号/强退）最终都会触发 'exit' 事件。
+  // 在此统一关闭 mouse tracking / bracketed paste 并恢复光标，杜绝异常退出后宿主终端
+  // 残留 raw 模式导致鼠标动作打出 SGR 上报序列（^[[<65;70;25M）。幂等 + best-effort。
+  process.on('exit', () => {
+    restoreTerminalState();
+  });
 
   process.on('unhandledRejection', (reason) => {
     console.error('[RuntimeGuard] Unhandled promise rejection:', reason);
@@ -134,6 +190,11 @@ export function installProcessRuntimeGuards(): void {
       return;
     }
     // 真正未处理的拒绝（非基础设施类，确属 bug）：标记非零退出，但仍让进程自然 drain。
+    // 落盘结构化崩溃报告（best-effort，永不抛）。
+    const crashPath = writeCrashReport({ error, source: 'unhandledRejection' });
+    if (crashPath) {
+      console.error(`[RuntimeGuard] 崩溃报告已保存: ${crashPath}`);
+    }
     process.exitCode = 1;
   });
 
@@ -158,6 +219,11 @@ export function installProcessRuntimeGuards(): void {
     }
 
     console.error('[RuntimeGuard] Uncaught exception — exiting to avoid undefined state:', error);
+    // 真崩溃落盘结构化报告（best-effort，永不抛）。recoverable/suppressed 分支已在上方短路，不会到这里。
+    try {
+      const crashPath = writeCrashReport({ error, source: 'uncaughtException' });
+      if (crashPath) console.error(`[RuntimeGuard] 崩溃报告已保存: ${crashPath}`);
+    } catch { /* crash report best-effort */ }
     // Node.js 文档明确指出 uncaughtException 后继续运行是不安全的。
     // 收敛到单一 gracefulShutdown(F2):与信号 handler / daemon 自停共享 latch + force timer,
     // 避免并发关停时清理窗口被抢跑、worker 被 half-SIGKILL。

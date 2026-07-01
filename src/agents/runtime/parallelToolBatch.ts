@@ -6,7 +6,10 @@
  *
  *   1. PARALLEL_SAFE_TOOLS 常量
  *      - BASE_PARALLEL_SAFE_TOOLS：BaseAgent 子类（worker）允许并行的只读工具
- *      - LEADER_PARALLEL_SAFE_TOOLS：Leader 额外允许 web_search / web_fetch / create_task 并行
+ *      - LEADER_PARALLEL_SAFE_TOOLS：Leader 额外允许 web_search / web_fetch 并行。
+ *        注意：create_task / define_project_blueprint 不在此集合——它们通过 nextTaskId()
+ *        按到达顺序分配 task_id，并行 interleave 会打乱 ID 分配，破坏 blocked_by 依赖引用
+ *        与 dispatch peekNextTaskIds 顺序预测，故必须退回顺序执行。
  *   2. FILE_MODIFYING_TOOLS 常量：会修改工作区文件、需要触发 snapshot 的工具集合
  *   3. canBatchExecuteToolCalls / runToolCallsBatch 公共行为
  *      - canBatchExecuteToolCalls：长度 >1 且全部为 parallelSafe 时可批量

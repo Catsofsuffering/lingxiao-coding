@@ -16,6 +16,155 @@ import {
   type WorkerContractComplianceProof,
 } from '../../core/AgentProtocol.js';
 
+const VERIFICATION_KINDS = ['build', 'test', 'lint', 'typecheck', 'manual', 'screenshot', 'other'] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function cleanString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : undefined;
+  }
+  if (!Array.isArray(value)) return undefined;
+  const out = value
+    .map((item) => (typeof item === 'string' ? item.trim() : undefined))
+    .filter((item): item is string => Boolean(item));
+  return out.length > 0 ? out : undefined;
+}
+
+function coerceBooleanLike(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const normalized = value.trim().toLowerCase();
+  if (['true', 'yes', 'y', '1', 'pass', 'passed', 'success', 'succeeded', 'ok', '✅'].includes(normalized)) {
+    return true;
+  }
+  if (['false', 'no', 'n', '0', 'fail', 'failed', 'failure', 'error', 'blocked', 'skipped', '❌'].includes(normalized)) {
+    return false;
+  }
+  return value;
+}
+
+function normalizeVerificationKind(value: unknown): typeof VERIFICATION_KINDS[number] {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return (VERIFICATION_KINDS as readonly string[]).includes(normalized)
+    ? normalized as typeof VERIFICATION_KINDS[number]
+    : 'manual';
+}
+
+function normalizeContractStatus(value: unknown, verdict: unknown): WorkerContractComplianceProof['status'] {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
+  if (isWorkerContractComplianceStatus(normalized)) return normalized;
+  if (['upgrade', 'upgraded'].includes(normalized)) return 'upgraded';
+  if (['block', 'blocked', 'stuck'].includes(normalized)) return 'blocked';
+  if (['n/a', 'na', 'none', 'not_applicable', 'not_applicable.'].includes(normalized)) return 'not_applicable';
+  if (typeof verdict === 'string' && verdict.trim().toUpperCase() === 'BLOCKED') return 'blocked';
+  return 'complied';
+}
+
+function normalizeVerificationInput(value: unknown): unknown {
+  if (value === undefined || value === null) return value;
+  const values = Array.isArray(value) ? value : [value];
+  return values.map((item) => {
+    if (typeof item === 'string') {
+      return { kind: 'manual', detail: item.trim(), passed: true };
+    }
+    if (!isRecord(item)) return item;
+    const out: Record<string, unknown> = { ...item };
+    out.kind = normalizeVerificationKind(out.kind);
+    const detail = cleanString(out.detail) ?? cleanString(out.evidence) ?? cleanString(out.result) ?? cleanString(out.message);
+    if (detail) out.detail = detail;
+    if ('passed' in out) {
+      out.passed = coerceBooleanLike(out.passed);
+    } else if ('status' in out) {
+      out.passed = coerceBooleanLike(out.status);
+    }
+    return out;
+  });
+}
+
+function collectEvidence(input: Record<string, unknown>, verification: unknown): string[] {
+  const evidence = new Set<string>();
+  const addAll = (items: string[] | undefined): void => {
+    for (const item of items ?? []) evidence.add(item);
+  };
+
+  addAll(stringArray(input.evidence));
+  addAll(stringArray(input.evidence_refs));
+
+  if (Array.isArray(verification)) {
+    for (const item of verification) {
+      if (isRecord(item)) {
+        const detail = cleanString(item.detail);
+        if (detail) evidence.add(detail);
+      }
+    }
+  }
+
+  const artifacts = isRecord(input.artifacts) ? input.artifacts : undefined;
+  addAll(stringArray(artifacts?.files_modified));
+  addAll(stringArray(artifacts?.files_created));
+  addAll(stringArray(artifacts?.commands_run));
+
+  const result = cleanString(input.result);
+  if (result) evidence.add(result.length > 160 ? `${result.slice(0, 157)}...` : result);
+  const summary = cleanString(input.summary);
+  if (summary) evidence.add(`summary: ${summary}`);
+
+  return Array.from(evidence).filter(Boolean);
+}
+
+function normalizeContractComplianceInput(input: Record<string, unknown>, verification: unknown): Record<string, unknown> {
+  const rawProof = isRecord(input.contract_compliance) ? input.contract_compliance : {};
+  const surface =
+    cleanString(rawProof.surface) ??
+    cleanString(input.contract_surface) ??
+    cleanString(input.surface) ??
+    'task:<taskId>';
+  const evidence =
+    stringArray(rawProof.evidence) ??
+    collectEvidence(input, verification);
+
+  return {
+    ...rawProof,
+    surface,
+    status: normalizeContractStatus(rawProof.status ?? input.contract_status ?? input.status, input.verdict),
+    evidence: evidence.length > 0 ? evidence : [`summary: ${cleanString(input.summary) ?? '任务已完成'}`],
+    deviations: stringArray(rawProof.deviations ?? input.deviations) ?? ['无'],
+  };
+}
+
+function normalizeAttemptCompletionInput(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = { ...value };
+
+  if (isRecord(out.artifacts)) {
+    out.artifacts = {
+      ...out.artifacts,
+      files_modified: stringArray(out.artifacts.files_modified) ?? out.artifacts.files_modified,
+      files_created: stringArray(out.artifacts.files_created) ?? out.artifacts.files_created,
+      commands_run: stringArray(out.artifacts.commands_run) ?? out.artifacts.commands_run,
+    };
+  }
+
+  const verification = normalizeVerificationInput(out.verification);
+  if (verification !== undefined && verification !== null) out.verification = verification;
+  out.evidence_refs = stringArray(out.evidence_refs) ?? out.evidence_refs;
+  out.next_steps = stringArray(out.next_steps) ?? out.next_steps;
+  out.blocked_by_discovery = stringArray(out.blocked_by_discovery) ?? out.blocked_by_discovery;
+  if ('needs_leader_coordination' in out) out.needs_leader_coordination = coerceBooleanLike(out.needs_leader_coordination);
+  out.contract_compliance = normalizeContractComplianceInput(out, out.verification);
+
+  return out;
+}
+
 const ArtifactsSchema = z
   .object({
     files_modified: z
@@ -36,10 +185,10 @@ const ArtifactsSchema = z
 
 const VerificationItemSchema = z.object({
   kind: z
-    .enum(['build', 'test', 'lint', 'typecheck', 'manual', 'screenshot', 'other'])
+    .enum(VERIFICATION_KINDS)
     .describe('验证类别'),
   detail: z.string().describe('具体证据，如命令、退出码、测试名、截图路径等'),
-  passed: z.boolean().optional().describe('该项验证是否通过（未填默认视为 true）'),
+  passed: z.boolean().optional().describe('该项验证是否通过；必须传 JSON boolean true/false，不能传 "passed"/"failed" 字符串；未填默认视为 true'),
 });
 
 const ContractComplianceSchema = z.object({
@@ -49,18 +198,18 @@ const ContractComplianceSchema = z.object({
     .describe('本任务遵守/产出/升级的契约 surface；无跨栈契约时使用 task:<taskId>'),
   status: z
     .enum(['complied', 'upgraded', 'blocked', 'not_applicable'])
-    .describe('契约遵守结论：已遵守/已升级/被阻塞/不适用'),
+    .describe('契约遵守结论：complied/upgraded/blocked/not_applicable 之一'),
   evidence: z
     .array(z.string().min(1))
     .min(1)
-    .describe('证明该结论的证据，如文件路径、命令、测试、报告、graph_contract 或 work_note'),
+    .describe('证明该结论的证据数组，如文件路径、命令、测试、报告、graph_contract 或 work_note'),
   deviations: z
     .array(z.string().min(1))
     .optional()
     .describe('偏离契约之处；无偏离时可写 ["无"]'),
 });
 
-const AttemptCompletionSchema = z.object({
+const StrictAttemptCompletionSchema = z.object({
   summary: z
     .string()
     .describe('一句话总结你完成了什么——Leader 在 UI 上看到的就是这一行'),
@@ -72,13 +221,13 @@ const AttemptCompletionSchema = z.object({
   verification: z
     .array(VerificationItemSchema)
     .optional()
-    .describe('完成证据列表；至少应包含一项（编译/测试/手测），无法验证时显式说明'),
+    .describe('完成证据列表；至少应包含一项（编译/测试/手测）。每项 passed 必须是 boolean true/false。'),
   evidence_refs: z
     .array(z.string())
     .optional()
     .describe('证据/资源引用，如 MCP resource URI、网页 URL、截图路径、报告路径或外部工具结果 ID'),
   contract_compliance: ContractComplianceSchema
-    .describe('必填。契约遵守证明；每个任务收尾都必须生成，系统会据此拦截无证明完成。'),
+    .describe('必填嵌套对象。必须包含 surface、status、evidence；不要把 surface/status/evidence 放在顶层。'),
   next_steps: z
     .array(z.string())
     .optional()
@@ -98,6 +247,8 @@ const AttemptCompletionSchema = z.object({
       '可选的完整结果说明（Markdown）。如不提供，框架会自动用 summary + artifacts + verification 渲染。',
     ),
 });
+
+const AttemptCompletionSchema = z.preprocess(normalizeAttemptCompletionInput, StrictAttemptCompletionSchema);
 
 export type AttemptCompletionParams = z.infer<typeof AttemptCompletionSchema>;
 
@@ -231,8 +382,9 @@ export function normalizeAttemptCompletion(
 
 export class AttemptCompletionTool extends Tool {
   readonly name = 'attempt_completion';
-  readonly description = '声明当前 task 已完成并提交最终结果。Worker 唯一的任务收尾入口——不调用则框架不判定完成。必填：summary + contract_compliance。调用后 Worker 进程立即结束当前 task。字段说明见各参数 schema description。进度汇报用 send_message(report)。';
+  readonly description = '声明当前 task 已完成并提交最终结果。Worker 唯一的任务收尾入口；进度汇报请用 send_message(report)，不要用本工具。必填最小 JSON：{"summary":"完成了什么，至少 8 个字符","verification":[{"kind":"manual","detail":"验证证据","passed":true}],"contract_compliance":{"surface":"task:<taskId>","status":"complied","evidence":["文件/命令/测试/work_note 证据"],"deviations":["无"]}}。注意：verification[].passed 必须是 JSON boolean true/false，不能写 "passed"/"failed" 字符串；contract_compliance 必须是嵌套对象，必须含 surface/status/evidence。调用成功后 Worker 进程立即结束当前 task。';
   readonly parameters = AttemptCompletionSchema;
+  readonly exposedParameters = StrictAttemptCompletionSchema;
   readonly metadata: ToolMetadata = {
     tier: 'read',
     category: 'general',

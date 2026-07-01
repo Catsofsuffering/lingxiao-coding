@@ -24,6 +24,7 @@ import type {
   PermissionResponsePayload,
   AgentHealthCriticalPayload,
   WorkerRecoveryPayload,
+  ToolFailureLoopEscalationControlPayload,
 } from './AgentProtocol.js';
 import type { TeamProtocolMessage } from './TeamProtocol.js';
 import type { MessageContent } from '../contracts/types/Message.js';
@@ -37,6 +38,7 @@ export type BusMessageType =
   | 'permission_request'
   | 'permission_response'
   | 'agent_health_critical'
+  | 'tool_failure_loop_escalation'
   | 'user_intervention'
   | 'message'
   | 'force_terminate'
@@ -101,6 +103,7 @@ export interface BusMessagePayloadMap {
   permission_request: PermissionRequestControlPayload;
   permission_response: PermissionResponsePayload;
   agent_health_critical: AgentHealthCriticalPayload;
+  tool_failure_loop_escalation: ToolFailureLoopEscalationControlPayload;
   user_intervention: UserInterventionPayload;
   message: MessagePayload;
   force_terminate: ForceTerminatePayload;
@@ -132,7 +135,7 @@ export type BusMessage = BusMessageEnvelope & {
 // ── 7. 反序列化守卫(堵 transport/IPC 逃逸口) ───────────────────────
 const BUS_MESSAGE_TYPES: ReadonlySet<string> = new Set<BusMessageType>([
   'task_complete', 'task_failed', 'worker_recovery', 'permission_request',
-  'permission_response', 'agent_health_critical', 'user_intervention', 'message',
+  'permission_response', 'agent_health_critical', 'tool_failure_loop_escalation', 'user_intervention', 'message',
   'force_terminate', 'intervene', 'control', 'system_context', 'supervision_probe',
   'request_work_note', 'eternal_goal_set', 'worker_register',
 ]);

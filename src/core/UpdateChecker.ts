@@ -61,11 +61,13 @@ export class UpdateChecker {
     this.initialTimer = setTimeout(() => {
       this.check().catch(() => { /* 静默失败 */ });
     }, INITIAL_DELAY_MS);
+    this.initialTimer.unref?.();
 
     // 定期检查
     this.intervalTimer = setInterval(() => {
       this.check().catch(() => { /* 静默失败 */ });
     }, CHECK_INTERVAL_MS);
+    this.intervalTimer.unref?.();
   }
 
   /** 停止检查 */

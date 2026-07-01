@@ -115,9 +115,6 @@ export function SecuritySection({ settings, saveState, onSave }: { settings: Set
       <SettingsRow label={t('settings.item.dangerousCommandGuard')} desc={t('settings.item.dangerousCommandGuard.desc')} error={errors.dangerousCommandGuard}>
         <SettingsToggle value={settings.dangerousCommandGuard !== false} onChange={(v) => onSave('dangerousCommandGuard', v)} saving={saving.dangerousCommandGuard} saved={saved.dangerousCommandGuard} />
       </SettingsRow>
-      <SettingsRow label={t('settings.item.identityJudgeLlm')} desc={t('settings.item.identityJudgeLlm.desc')} error={errors.identityJudgeLlmEnabled}>
-        <SettingsToggle value={settings.identityJudgeLlmEnabled === true} onChange={(v) => onSave('identityJudgeLlmEnabled', v)} saving={saving.identityJudgeLlmEnabled} saved={saved.identityJudgeLlmEnabled} />
-      </SettingsRow>
       <SettingsRow label={t('settings.item.blockPrivateNetwork')} desc={t('settings.item.blockPrivateNetwork.desc')} error={errors.blockPrivateNetwork}>
         <SettingsToggle value={!!settings.blockPrivateNetwork} onChange={(v) => onSave('blockPrivateNetwork', v)} saving={saving.blockPrivateNetwork} saved={saved.blockPrivateNetwork} />
       </SettingsRow>

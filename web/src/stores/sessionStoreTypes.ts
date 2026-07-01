@@ -10,6 +10,7 @@ import type {
 } from '@contracts/types/Status';
 import type { TokenUsageView } from '@contracts/types/TokenUsage';
 import type { WorkerBackend } from '@contracts/types/Agent';
+import type { AutonomyMode, AutonomyLifecyclePhase, CapabilityIntentProfile } from '@contracts/types/Autonomy';
 import type { ProjectBlueprint } from '../types/blueprint';
 
 export type AgentStatusValue = AgentRunStatus | string;
@@ -247,7 +248,7 @@ export interface AgentConversation {
   /** Summary shown in the panel tab */
   summary?: string;
   /** Cumulative token usage for this agent (updated in real-time per LLM call) */
-  tokenUsage?: { prompt: number; completion: number; total: number; cache_read?: number; cache_creation?: number };
+  tokenUsage?: TokenUsageView;
   /** Context window usage ratio 0-1 (prompt tokens / model context limit) */
   contextRatio?: number;
   /** Timestamp of last token update — used to drop out-of-order SSE events */
@@ -355,6 +356,24 @@ export interface SessionRuntimeRecoveringTask {
   lastActivityAt?: number;
 }
 
+export type CapabilityIntentProfileView = CapabilityIntentProfile;
+
+export interface AutonomyDecisionTraceView {
+  toolName: string;
+  decision: {
+    kind?: string;
+    intentProfile?: CapabilityIntentProfileView;
+    autonomyMode?: AutonomyMode;
+    reason?: string;
+    evidence?: Array<{ kind?: string; value?: string; note?: string }>;
+    [key: string]: unknown;
+  };
+  gateResult: 'allow' | 'blocked' | 'confirmation_required';
+  gateKind?: 'forbidden' | 'confirmation_required' | null;
+  recordedAt: number;
+  source: string;
+}
+
 export interface SessionModeRuntimeProjection {
   controlMode: 'manual' | 'eternal';
   route: {
@@ -382,6 +401,14 @@ export interface SessionModeRuntimeProjection {
     summary?: string;
   };
   blueprint?: ProjectBlueprint | null;
+  /** Capability intent profile + lifecycle/generation/policy metadata. */
+  autonomy: AutonomyMode;
+  intentProfile: CapabilityIntentProfileView;
+  lifecyclePhase: AutonomyLifecyclePhase;
+  modeGeneration: number;
+  policyId: string | null;
+  policyHash: string | null;
+  lastDecisionTrace: AutonomyDecisionTraceView | null;
 }
 
 export type SessionEternalRuntimeStatus =
@@ -435,6 +462,8 @@ export interface SessionRuntimeSnapshot {
     executionMode?: string;
     executionReason?: string;
     permissionSummary?: string;
+    leaderModel?: string;
+    agentModel?: string;
   };
   pendingUserInput?: {
     raw?: unknown;

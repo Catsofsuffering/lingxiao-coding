@@ -39,6 +39,7 @@ import {
   Search, RefreshCw, CheckCircle2, AlertTriangle, ListChecks,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { toast } from '../ui/toastBridge';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useWorkflowStore } from '../../stores/workflowStore';
 import { useCanvasStore } from '../../stores/canvasStore';
@@ -60,6 +61,9 @@ import {
   type WorkflowRealtimeEventName,
 } from '../../types/workflow';
 import { isWorkflowNodeActiveStatus, normalizeWorkflowNodeStatus } from '@contracts/adapters/StatusAdapter';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('CanvasView');
+
 
 export type NodeType =
   | 'start'
@@ -533,7 +537,7 @@ function FlowCanvas({ onCtxMenu, onNodeClick, onCanvasChange, onActionHandlerRea
           }
         }
       } catch (e) {
-        console.error('Failed to create session for workflow execution:', e);
+        log.error('Failed to create session for workflow execution:', e);
       }
     }
 
@@ -878,7 +882,7 @@ export default function CanvasView() {
   const ensureExecutionSessionId = useCallback(async (): Promise<string | null> => {
     let sessionId = useSessionStore.getState().sessionId;
     if (sessionId) {
-      try { await acpClient.connect(sessionId); } catch (error) { console.warn('[CanvasView] ACP connect failed:', error); }
+      try { await acpClient.connect(sessionId); } catch (error) { log.warn('[CanvasView] ACP connect failed:', error); }
       return sessionId;
     }
 
@@ -893,7 +897,7 @@ export default function CanvasView() {
       sessionId = sessionData.id || sessionData.sessionId;
       if (sessionId) {
         await useSessionStore.getState().fetchSessions();
-        try { await acpClient.connect(sessionId); } catch (error) { console.warn('[CanvasView] ACP connect failed:', error); }
+        try { await acpClient.connect(sessionId); } catch (error) { log.warn('[CanvasView] ACP connect failed:', error); }
       }
       return sessionId || null;
     } catch {
@@ -1022,7 +1026,8 @@ export default function CanvasView() {
         headers: { 'x-lingxiao-token': getServerToken() },
       });
     } catch (e) {
-      console.error('cancel workflow failed:', e);
+      log.error('cancel workflow failed:', e);
+      toast.fromError(e, '取消工作流失败');
     } finally {
       applyCanvasWorkflowEvent({
         type: 'workflow:execution_cancelled',
@@ -1050,7 +1055,8 @@ export default function CanvasView() {
         receivedAt: Date.now(),
       });
     } catch (e) {
-      console.error('pause workflow failed:', e);
+      log.error('pause workflow failed:', e);
+      toast.fromError(e, '暂停工作流失败');
     }
   }, [applyCanvasWorkflowEvent, currentWfId]);
 
@@ -1441,7 +1447,7 @@ export default function CanvasView() {
                   const onUp = () => {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
-                    try { localStorage.setItem('lingxiao_exec_panel_height', String(execPanelHeight)); } catch (error) { console.warn('[CanvasView] Failed to persist execution panel height:', error); }
+                    try { localStorage.setItem('lingxiao_exec_panel_height', String(execPanelHeight)); } catch (error) { log.warn('[CanvasView] Failed to persist execution panel height:', error); }
                   };
                   document.addEventListener('mousemove', onMove);
                   document.addEventListener('mouseup', onUp);

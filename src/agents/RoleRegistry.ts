@@ -5,6 +5,7 @@
 
 import type { RoleCapabilityProfile } from './RoleCapabilityModel.js';
 import type { PromptLocale } from './prompts/i18n/catalog.js';
+import { agentLogger } from '../core/Log.js';
 
 /** 角色解析回落到的默认规范角色（无法从名字推断出任何已存在角色时使用）。 */
 export const ROLE_FALLBACK_DEFAULT = 'fullstack';
@@ -146,7 +147,7 @@ export class AgentRoleRegistry {
     if (this.roles.has(role.name)) {
       const existing = this.roles.get(role.name)!;
       // P0-1d: warn on duplicate registration to catch accidental overrides
-      console.warn(
+      agentLogger.warn(
         `[RoleRegistry] Role "${role.name}" is already registered ` +
         `(createdBy=${existing.createdBy}). Overwriting with new registration ` +
         `(createdBy=${role.createdBy}).`,
@@ -176,6 +177,19 @@ export class AgentRoleRegistry {
    */
   get(name: string): AgentRole | undefined {
     return this.roles.get(name);
+  }
+
+  /**
+   * 删除角色。默认禁止删除系统预设角色，避免把基础能力面删坏。
+   */
+  unregister(name: string, options: { allowSystem?: boolean } = {}): AgentRole | undefined {
+    const role = this.roles.get(name);
+    if (!role) return undefined;
+    if (role.createdBy === 'system' && !options.allowSystem) {
+      return undefined;
+    }
+    this.roles.delete(name);
+    return role;
   }
 
   /**

@@ -4,6 +4,7 @@
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { toast } from '../ui/toastBridge';
 import {
   Activity,
   Check,
@@ -38,6 +39,9 @@ import {
   type ModeFilter,
   type ThemeSite,
 } from './systemDemo';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('DesignMarketView');
+
 
 interface FacetInfo {
   name?: string;
@@ -652,7 +656,8 @@ export default function DesignMarketView() {
       setReturned(Array.isArray(data) ? normalizedSites.length : data.returned ?? normalizedSites.length);
       setFacets(Array.isArray(data) ? {} : data.facets || {});
     } catch (err) {
-      console.error('Theme system market load failed:', err);
+      log.error('Theme system market load failed:', err);
+      toast.fromError(err, '主题市场加载失败');
       setSites([]);
       setTotal(0);
       setReturned(0);
@@ -707,7 +712,8 @@ export default function DesignMarketView() {
         }
       })
       .catch(err => {
-        console.error('Theme system detail load failed:', err);
+        log.error('Theme system detail load failed:', err);
+        toast.fromError(err, '主题详情加载失败');
       })
       .finally(() => {
         if (!cancelled) setDetailLoading(false);

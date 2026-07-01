@@ -1,5 +1,16 @@
 import type { ControlMode, LeaderExecutionMode } from '../contracts/types/Session.js';
 import {
+  DEFAULT_AUTONOMY_MODE,
+  DEFAULT_AUTONOMY_LIFECYCLE_PHASE,
+  normalizeAutonomyMode,
+  normalizeAutonomyLifecyclePhase,
+  type AutonomyMode,
+  type AutonomyLifecyclePhase,
+  type CapabilityIntentProfile,
+} from '../contracts/types/Autonomy.js';
+import { defaultCapabilityIntentProfile, normalizeCapabilityIntentProfile } from '../agents/IntentClassifier.js';
+import type { AutonomyDecision } from '../contracts/types/AutonomyDecision.js';
+import {
   getDefaultToolPermissionContext,
   normalizeToolPermissionContext,
   summarizePermissionContextForDisplay,
@@ -18,6 +29,15 @@ export type RouteMode = LeaderExecutionMode | 'unknown';
 export type CollaborationModeSource = 'explicit' | 'legacy' | 'default';
 export type RouteModeSource = 'leader' | 'session' | 'default';
 export type BlackboardModeSource = 'default' | 'explicit' | 'team' | 'workflow' | 'contract_bound';
+
+export interface AutonomyDecisionTrace {
+  toolName: string;
+  decision: AutonomyDecision;
+  gateResult: 'allow' | 'blocked' | 'confirmation_required';
+  gateKind?: 'forbidden' | 'confirmation_required' | null;
+  recordedAt: number;
+  source: 'leader_tool_gate' | string;
+}
 
 export interface ModeRuntimeProjection {
   controlMode: ControlMode;
@@ -53,6 +73,17 @@ export interface ModeRuntimeProjection {
   };
   /** 项目蓝图(复杂项目结构化状态);无蓝图时为 null。投影到 runtime snapshot 供前端展示与覆盖判定。 */
   blueprint?: ProjectBlueprint | null;
+  /**
+   * 自治档位 + capability intent profile + 生命周期阶段 + policy generation。
+   * `intentProfile` 缺失或非法时会 fail-closed 到只读默认 profile。
+   */
+  autonomy: AutonomyMode;
+  intentProfile: CapabilityIntentProfile;
+  lifecyclePhase: AutonomyLifecyclePhase;
+  modeGeneration: number;
+  policyId: string | null;
+  policyHash: string | null;
+  lastDecisionTrace: AutonomyDecisionTrace | null;
 }
 
 export interface ModeRuntimeStateReader {
@@ -78,6 +109,43 @@ export interface ResolveModeRuntimeProjectionInput {
 
 function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+    } catch {
+      return null;
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function readNumber(value: unknown): number | null {
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+function readAutonomyDecisionTrace(value: unknown): AutonomyDecisionTrace | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const decisionRecord = asRecord(record.decision);
+  const toolName = asTrimmedString(record.toolName);
+  const recordedAt = readNumber(record.recordedAt);
+  const gateResult = record.gateResult === 'allow' || record.gateResult === 'blocked' || record.gateResult === 'confirmation_required'
+    ? record.gateResult
+    : null;
+  if (!decisionRecord || !toolName || recordedAt === null || !gateResult) return null;
+  return {
+    toolName,
+    decision: decisionRecord as unknown as AutonomyDecision,
+    gateResult,
+    gateKind: record.gateKind === 'forbidden' || record.gateKind === 'confirmation_required' ? record.gateKind : null,
+    recordedAt,
+    source: typeof record.source === 'string' && record.source.trim() ? record.source.trim() : 'leader_tool_gate',
+  };
 }
 
 function readControlMode(value: unknown): ControlMode {
@@ -229,6 +297,34 @@ export function resolveModeRuntimeProjection(input: ResolveModeRuntimeProjection
     blackboardModeOverride: input.blackboardModeOverride,
   });
   const blueprint = parseBlueprint(input.db.getSessionState(input.sessionId, SESSION_KEYS.PROJECT_BLUEPRINT));
+  const autonomy = normalizeAutonomyMode(
+    input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_MODE),
+  );
+  const currentTurnRaw = input.db.getSessionState(input.sessionId, SESSION_KEYS.CURRENT_USER_TURN_ID);
+  const currentTurnId = readNumber(currentTurnRaw);
+  const intentProfile = normalizeCapabilityIntentProfile(
+    input.db.getSessionState(input.sessionId, SESSION_KEYS.CAPABILITY_INTENT_PROFILE),
+    { turnId: currentTurnId, source: 'record_capability_intent' },
+  ) ?? defaultCapabilityIntentProfile('intent_profile_not_recorded', { turnId: currentTurnId });
+  const lifecyclePhase = normalizeAutonomyLifecyclePhase(
+    input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_LIFECYCLE_PHASE),
+  );
+  const modeGeneration = (() => {
+    const raw = input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_MODE_GENERATION);
+    const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+    return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : 1;
+  })();
+  const policyId = (() => {
+    const raw = input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_POLICY_ID);
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+  })();
+  const policyHash = (() => {
+    const raw = input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_POLICY_HASH);
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+  })();
+  const lastDecisionTrace = readAutonomyDecisionTrace(
+    input.db.getSessionState(input.sessionId, SESSION_KEYS.AUTONOMY_DECISION_TRACE),
+  );
 
   return {
     controlMode,
@@ -247,5 +343,12 @@ export function resolveModeRuntimeProjection(input: ResolveModeRuntimeProjection
     blackboard,
     permission: resolvePermissionProjection(input),
     blueprint,
+    autonomy,
+    intentProfile,
+    lifecyclePhase,
+    modeGeneration,
+    policyId,
+    policyHash,
+    lastDecisionTrace,
   };
 }

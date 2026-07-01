@@ -12,6 +12,7 @@
 
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { usePageVisibility } from '../../hooks/usePageVisibility';
 import {
   Cpu, MemoryStick, HardDrive, RefreshCw, Loader2,
   AlertTriangle, Pause, Play, Clock, Server, Gauge,
@@ -363,15 +364,17 @@ export default function MetricsView() {
     }
   }, []);
 
+  const isVisible = usePageVisibility();
+
   useEffect(() => {
     fetchMetrics();
-    if (autoRefresh) {
+    if (autoRefresh && isVisible) {
       intervalRef.current = setInterval(fetchMetrics, POLL_INTERVAL);
     }
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [fetchMetrics, autoRefresh]);
+  }, [fetchMetrics, autoRefresh, isVisible]);
 
   // ─── Derived values ──────────────────────────────────
   const history = historyRef.current;

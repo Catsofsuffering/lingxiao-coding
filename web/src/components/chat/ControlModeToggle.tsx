@@ -18,6 +18,9 @@ import { applyRuntimeSnapshotFromRpcResult, useSessionStore } from '../../stores
 import { acpClient } from '../../api/AcpClient';
 import { buildEternalControlModeViewModel, type RuntimePillTone } from '../../utils/eternalRuntimeViewModel';
 import { usePopoverMaxHeight } from '../../hooks/usePopoverMaxHeight';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('ControlModeToggle');
+
 
 function runtimeDotClass(tone: RuntimePillTone): string {
   if (tone === 'active') return 'bg-accent-brand';
@@ -80,7 +83,7 @@ export function ControlModeToggle() {
         useSessionStore.setState({ controlMode: next });
       }
     } catch (err) {
-      console.warn('[ControlModeToggle] set_control_mode failed:', err);
+      log.warn('[ControlModeToggle] set_control_mode failed:', err);
     } finally {
       setBusy(false);
       if (next === 'manual') setConfirming(false);
@@ -107,7 +110,7 @@ export function ControlModeToggle() {
       }
       if (action === 'clear') setDraftGoal('');
     } catch (err) {
-      console.warn('[ControlModeToggle] set_eternal_goal failed:', err);
+      log.warn('[ControlModeToggle] set_eternal_goal failed:', err);
     } finally {
       setBusy(false);
     }

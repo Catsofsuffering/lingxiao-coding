@@ -4,6 +4,7 @@ import { createEventProcessorState } from '@contracts/adapters/EventAdapter';
 import { acpClient } from '../api/AcpClient';
 import { getServerToken, tryRecoverToken } from '../api/headers';
 import { saveMessages, appendMessage, updateMessage, loadMessages } from '../utils/historyDB';
+import { createLogger } from '../utils/logger';
 import {
   extractText,
   isOpenToolCall,
@@ -41,6 +42,8 @@ import { usePermissionStore } from './permissionStore';
 import { useBlackboardStore } from './blackboardStore';
 import { useGitStore } from './gitStore';
 import { useGitActivityStore } from './gitActivityStore';
+import { useAgentActivityStore } from './agentActivityStore';
+import { loadLastSelectedSessionId, saveLastSelectedSessionId } from '../utils/sessionListViewModel';
 import {
   appendAgentTextSegment,
   appendAgentThinkingSegment,
@@ -78,6 +81,8 @@ import {
 
 // Re-export SSE utilities that are used by external components
 export { subscribeTaskUpdates, applyRuntimeSnapshotFromRpcResult } from './sseStore';
+
+const log = createLogger('sessionStore');
 
 // ─── Connection mutex ───
 let connectingSessionId: string | null = null;
@@ -156,7 +161,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   isLoadingHistory: false,
   streamingLastActivityAt: Date.now(),
   streamingWatchdogInterval: null,
-  tokenUsage: { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0 },
+  tokenUsage: { prompt: 0, completion: 0, total: 0, cache_read: 0, cache_creation: 0, reasoning: 0, credit: 0 },
   lastCompressedAt: null,
   compactingProgress: null,
   contextRuntimeState: null,
@@ -187,6 +192,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   addMessage: (msg) => set((s) => {
     const saved = { ...msg, id: msg.id || String(nextMsgId()) };
+    // 调试：记录消息添加来源
+    if (msg.role === 'user') {
+      log.debug('[addMessage] Adding user message:', {
+        id: saved.id,
+        content: saved.content.substring(0, 50),
+        timestamp: saved.timestamp,
+        stack: new Error().stack?.split('\n').slice(2, 5).join('\n'),
+      });
+    }
     const next = trimMessageWindow([...s.messages, saved]);
     if (s.sessionId) appendMessage(s.sessionId, saved).catch(() => {});
     return { messages: next };
@@ -477,14 +491,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const recovered = await tryRecoverToken();
         if (!recovered) {
           const appWindow = lingxiaoWindow();
-          if (!appWindow.__lingxiao_401_warned) { appWindow.__lingxiao_401_warned = true; console.warn('[fetchSessions] 401 Unauthorized — token expired. Refresh page manually.'); }
+          if (!appWindow.__lingxiao_401_warned) { appWindow.__lingxiao_401_warned = true; log.warn('[fetchSessions] 401 Unauthorized — token expired. Refresh page manually.'); }
           return;
         }
         // 恢复成功，重新拉取 sessions + active
         const retrySessionsRes = await fetch('/api/sessions', { headers: { 'x-lingxiao-token': getServerToken() } });
         if (!retrySessionsRes.ok) {
           const appWindow = lingxiaoWindow();
-          if (!appWindow.__lingxiao_401_warned) { appWindow.__lingxiao_401_warned = true; console.warn('[fetchSessions] 401 after token recovery — token mismatch.'); }
+          if (!appWindow.__lingxiao_401_warned) { appWindow.__lingxiao_401_warned = true; log.warn('[fetchSessions] 401 after token recovery — token mismatch.'); }
           return;
         }
         const retryActiveRes = await fetch('/api/v1/sessions/active', { headers: { 'x-lingxiao-token': getServerToken() } });
@@ -506,7 +520,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const sessions: SessionInfo[] = (Array.isArray(data) ? data : []).map((row) => normalizeSessionInfoRow(row as SessionListRow));
         set({ sessions, activeSessionId, sessionsLoaded: true });
       }
-    } catch (e) { console.warn('[fetchSessions] failed:', e); }
+    } catch (e) { log.warn('[fetchSessions] failed:', e); }
     set((s) => s.sessionsLoaded ? s : { ...s, sessionsLoaded: true });
   },
 
@@ -523,11 +537,44 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (connectingSessionId !== sessionId) return;
       usePermissionStore.setState((s) => ({ pendingRequests: s.pendingRequests.filter((request) => request.sessionId === sessionId) }));
       set({ sessionId, activeSessionId: sessionId, ...emptySessionRuntimeState(), isConnected: false, isLoadingHistory: true });
+      saveLastSelectedSessionId(sessionId);
       // 连接到(可能不同的)会话:清空黑板图,避免上一会话的图残留(#4)
       useBlackboardStore.getState().reset();
-      // 清空 Git 状态和活动记录，避免旧 workspace 数据残留
+      // 清空 Git 状态，避免旧 workspace 数据残留
       useGitStore.getState().setWorkspace('');
-      useGitActivityStore.getState().clear();
+      // Fetch persisted git activity from backend ring buffer.
+      // Don't clear first — fetch then replace to avoid empty window if fetch fails.
+      fetch(`/api/v1/git/activity/${encodeURIComponent(sessionId)}`, {
+        headers: { 'x-lingxiao-token': getServerToken() },
+      }).then(res => res.ok ? res.json() : null).then(data => {
+        if (connectingSessionId !== sessionId) return;
+        if (data?.data && Array.isArray(data.data)) {
+          useGitActivityStore.getState().setEvents(data.data);
+        } else {
+          useGitActivityStore.getState().setEvents([]);
+        }
+      }).catch(() => {
+        // Fetch failed — clear to avoid showing stale events from previous session
+        if (connectingSessionId === sessionId) {
+          useGitActivityStore.getState().setEvents([]);
+        }
+      });
+      fetch(`/api/v1/agent/activity/${encodeURIComponent(sessionId)}`, {
+        headers: { 'x-lingxiao-token': getServerToken() },
+      }).then(res => res.ok ? res.json() : null).then(data => {
+        if (connectingSessionId !== sessionId) return;
+        if (data?.data && Array.isArray(data.data)) {
+          useAgentActivityStore.getState().setEvents(data.data);
+        } else {
+          useAgentActivityStore.getState().setEvents([]);
+        }
+      }).catch(() => {
+        // Fetch failed — clear to avoid showing stale events from previous session
+        if (connectingSessionId === sessionId) {
+          useAgentActivityStore.getState().setEvents([]);
+        }
+      });
+
       await acpClient.connect(sessionId);
       if (connectingSessionId !== sessionId) { await acpClient.disconnect(); return; }
       try {
@@ -535,9 +582,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const snapshot = coerceSessionRuntimeSnapshot(asRecord(focusResult).runtime);
         if (snapshot && connectingSessionId === sessionId) { set((s) => applyRuntimeSnapshotPatch(s, snapshot, pendingStreamIsEmpty())); }
       } catch (e) {
-        if (import.meta.env.DEV) console.warn('[connectToSession] session/focus RPC failed:', e);
+        log.warn('[connectToSession] session/focus RPC failed:', e);
       }
-      try { await syncRuntimeSnapshotFromAcp(sessionId); } catch (e) { if (import.meta.env.DEV) console.warn('[connectToSession] runtime_state RPC failed:', e); }
+      try { await syncRuntimeSnapshotFromAcp(sessionId); } catch (e) { log.warn('[connectToSession] runtime_state RPC failed:', e); }
       try {
         const detailRes = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { headers: { 'x-lingxiao-token': getServerToken() }, signal: abortController.signal });
         if (connectingSessionId !== sessionId) return;
@@ -549,7 +596,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           const pendingPermission = detail?.pendingPermission;
           if (pendingPermission && typeof pendingPermission === 'object') { usePermissionStore.getState().addRequest(pendingPermission); }
         }
-      } catch (e) { console.warn('[connectToSession] 同步运行态失败:', e); }
+      } catch (e) { log.warn('[connectToSession] 同步运行态失败:', e); }
       try {
         const cached = await loadMessages(sessionId).catch(() => [] as Message[]);
         if (connectingSessionId !== sessionId) return;
@@ -568,12 +615,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             saveMessages(sessionId, useSessionStore.getState().messages).catch(() => {});
           }
         }
-      } catch (e: unknown) { if (e instanceof Error && e.name !== 'AbortError') { console.warn('[connectToSession] 加载消息历史失败:', (e as Error).message); } }
+      } catch (e: unknown) { if (e instanceof Error && e.name !== 'AbortError') { log.warn('[connectToSession] 加载消息历史失败:', (e as Error).message); } }
       try {
         const agentRes = await fetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/agents`, { headers: { 'x-lingxiao-token': getServerToken() }, signal: abortController.signal });
         if (connectingSessionId !== sessionId) return;
         if (!agentRes.ok) {
-          console.warn('[connectToSession] 加载 Agent 历史失败:', agentRes.status, await agentRes.text().catch(() => ''));
+          log.warn('[connectToSession] 加载 Agent 历史失败:', agentRes.status, await agentRes.text().catch(() => ''));
         } else {
           const agentData = await agentRes.json();
           if (connectingSessionId !== sessionId) return;
@@ -582,10 +629,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             if (Object.keys(agentConvs).length > 0) { set((s) => mergeAgentHistoryIntoState(s, agentConvs, { forceIncoming: true })); }
           }
         }
-      } catch (e: unknown) { if (e instanceof Error && e.name !== 'AbortError') { console.warn('[connectToSession] 加载 Agent 历史失败:', e.message); } }
+      } catch (e: unknown) { if (e instanceof Error && e.name !== 'AbortError') { log.warn('[connectToSession] 加载 Agent 历史失败:', e.message); } }
       set({ isLoadingHistory: false });
       get().fetchTokenUsage();
-    } catch (e) { console.error('Failed to connect to session:', e); set({ isConnected: false, isLoadingHistory: false }); }
+    } catch (e) { log.error('Failed to connect to session:', e); set({ isConnected: false, isLoadingHistory: false }); }
     finally { if (connectAbortController === abortController) connectAbortController = null; if (connectingSessionId === sessionId) connectingSessionId = null; }
   },
 
@@ -602,7 +649,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         if (newId) { await get().fetchSessions(); await get().connectToSession(newId); return newId; }
       }
       return undefined;
-    } catch (e) { console.error('Failed to create session:', e); throw e; }
+    } catch (e) { log.error('Failed to create session:', e); throw e; }
   },
 
   deleteSession: async (sessionId: string) => {
@@ -610,6 +657,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE', headers: { 'x-lingxiao-token': getServerToken() } });
       if (res.ok) {
         const { sessionId: currentId } = get();
+        if (loadLastSelectedSessionId() === sessionId) saveLastSelectedSessionId(null);
         if (currentId === sessionId) {
           connectAbortController?.abort(); connectAbortController = null; streamSaveTimers.clear(); clearPendingStreamBuffers();
           await acpClient.disconnect();
@@ -620,7 +668,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         }
         set((s) => ({ sessions: s.sessions.filter((sess) => sess.id !== sessionId) }));
       }
-    } catch (e) { console.error('Failed to delete session:', e); }
+    } catch (e) { log.error('Failed to delete session:', e); }
   },
 
   markQuestionAnswered: (messageId: string, answeredValue: string) => set((s) => ({

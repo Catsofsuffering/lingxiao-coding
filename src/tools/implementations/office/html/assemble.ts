@@ -16,6 +16,8 @@
 
 import { resolveHtmlOfficeTheme, renderThemeCssVars, type HtmlOfficeThemeId, type HtmlOfficeTheme } from './themes.js';
 import { renderSlide, renderDocBlock, type SlideData, type DocBlockData } from './components.js';
+import { injectProvenanceAttrs, buildSlideProvenance, buildBlockProvenance } from './provenance.js';
+import type { SourceProvenance } from '../../../../contracts/types/Canvas.js';
 
 export type HtmlOfficeMode = 'slides' | 'document';
 
@@ -48,6 +50,8 @@ export interface AssembledHtml {
   mode: HtmlOfficeMode;
   /** 幻灯片张数 / 文档块数（用于导出器分页）。 */
   count: number;
+  /** both_layered 溯源标记：每个顶层单元的 spec 锚点，作为 sourcemap.json 的 nodes。 */
+  nodes: SourceProvenance[];
 }
 
 /** 全局基础 + 布局 CSS（与主题无关的结构样式；颜色/字体走 var）。 */
@@ -174,10 +178,11 @@ export function assembleHtml(input: AssembleInput): AssembledHtml {
     input.mode === 'document' ? input.header : undefined,
   );
 
-  const body =
+  const bodyResult =
     input.mode === 'slides'
       ? renderSlidesBody(input)
       : renderDocumentBody(input);
+  const body = bodyResult.html;
 
   const html = [
     '<!DOCTYPE html>',
@@ -199,22 +204,29 @@ export function assembleHtml(input: AssembleInput): AssembledHtml {
     theme,
     mode: input.mode,
     count: input.mode === 'slides' ? input.slides.length : input.blocks.length,
+    nodes: bodyResult.nodes,
   };
 }
 
-function renderSlidesBody(input: AssembleSlidesInput): string {
-  const slides = input.slides.map((s) => renderSlide(s)).join('\n');
+function renderSlidesBody(input: AssembleSlidesInput): { html: string; nodes: SourceProvenance[] } {
+  const nodes = buildSlideProvenance(input.slides);
+  const slides = input.slides
+    .map((s, i) => injectProvenanceAttrs(renderSlide(s), { nodeId: `slides.${i}`, specPath: `slides[${i}]` }))
+    .join('\n');
   const footerLine = input.footer
     ? `<div class="lx-slide-footer">${escTitle(input.footer)}</div>`
     : '';
   // 页脚在每页底部：用 running element 近似——简单起见注入一个固定脚注（打印时每页重复靠 @page running，此处用 CSS position fixed 近似）。
-  return `<main class="lx-deck">\n${slides}\n</main>${footerLine}`;
+  return { html: `<main class="lx-deck">\n${slides}\n</main>${footerLine}`, nodes };
 }
 
-function renderDocumentBody(input: AssembleDocumentInput): string {
+function renderDocumentBody(input: AssembleDocumentInput): { html: string; nodes: SourceProvenance[] } {
+  const nodes = buildBlockProvenance(input.blocks);
   const header = input.header ? `<p class="lx-doc-header">${escTitle(input.header)}</p>` : '';
-  const blocks = input.blocks.map((b) => renderDocBlock(b)).join('\n');
-  return `<main class="lx-doc">\n<h1 class="lx-doc-title">${escTitle(input.title)}</h1>\n${input.author ? `<p class="lx-doc-author">${escTitle(input.author)}</p>` : ''}\n${header}\n${blocks}\n</main>`;
+  const blocks = input.blocks
+    .map((b, i) => injectProvenanceAttrs(renderDocBlock(b), { nodeId: `blocks.${i}`, specPath: `blocks[${i}]` }))
+    .join('\n');
+  return { html: `<main class="lx-doc">\n<h1 class="lx-doc-title">${escTitle(input.title)}</h1>\n${input.author ? `<p class="lx-doc-author">${escTitle(input.author)}</p>` : ''}\n${header}\n${blocks}\n</main>`, nodes };
 }
 
 function escTitle(value: string): string {

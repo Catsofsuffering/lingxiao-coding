@@ -6,6 +6,10 @@ import { useTranslation } from 'react-i18next';
 import { useSessionStore } from '../../../stores/sessionStore';
 import { useOfficeStore } from '../stores/officeStore';
 import { Send } from 'lucide-react';
+import { toast } from '../../ui/toastBridge';
+import { createLogger } from '../../../utils/logger';
+const log = createLogger('MessageInput');
+
 
 export default function MessageInput() {
   const { t } = useTranslation();
@@ -26,7 +30,7 @@ export default function MessageInput() {
   const handleSend = async () => {
     if (!message.trim() || !sessionId || sending) return;
     setSending(true);
-    try { const { acpClient } = await import('../../../api/AcpClient'); await acpClient.sendJsonRpc('session/prompt', { sessionId, content: `@${targetName} ${message.trim()}` }); setMessage(''); } catch (err) { console.error(err); }
+    try { const { acpClient } = await import('../../../api/AcpClient'); await acpClient.sendJsonRpc('session/prompt', { sessionId, content: `@${targetName} ${message.trim()}` }); setMessage(''); } catch (err) { log.error(err); toast.fromError(err, t('office.sendFailed', '发送失败')); }
     finally { setSending(false); }
   };
 

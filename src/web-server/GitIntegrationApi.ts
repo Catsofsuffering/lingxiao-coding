@@ -29,37 +29,45 @@ const ALLOWED_ROOTS: string[] = [SERVER_CWD];
 
 /**
  * Validate that a resolved path is inside an allowed root.
- * Throws if path traversal is detected.
+ * Returns the resolved path on success, null if path is outside allowed roots.
+ * Does NOT throw — callers decide how to handle (graceful degradation vs 500).
  */
-function assertPathInside(target: string): void {
-  const resolved = pathResolve(target);
+function safeResolveReadWorkspace(workspace?: string): string | null {
+  const dir = workspace?.trim() || SERVER_CWD;
+  const resolved = pathResolve(dir);
   const isAllowed = ALLOWED_ROOTS.some(root => isPathInside(root, resolved));
   if (!isAllowed) {
-    throw new Error(`Workspace path outside allowed roots: ${target}`);
+    return null;
   }
+  return resolved;
 }
 
 /**
  * Resolve workspace for READ-ONLY operations.
  * Falls back to SERVER_CWD rather than the (potentially changed) process.cwd().
  * P0-5 fix: validate resolved path is inside allowed roots.
+ * @deprecated Use safeResolveReadWorkspace to avoid uncaught throws.
  */
 function resolveReadWorkspace(workspace?: string): string {
   const dir = workspace?.trim() || SERVER_CWD;
-  assertPathInside(dir);
-  return dir;
+  const resolved = pathResolve(dir);
+  const isAllowed = ALLOWED_ROOTS.some(root => isPathInside(root, resolved));
+  if (!isAllowed) throw new Error(`Workspace path outside allowed roots: ${dir}`);
+  return resolved;
 }
 
 /**
  * Resolve workspace for WRITE operations.
- * Returns null if workspace is empty/missing — callers must reject the request.
+ * Returns null if workspace is empty/missing or outside allowed roots — callers must reject the request.
  * P0-5 fix: validate resolved path is inside allowed roots.
  */
 function resolveWriteWorkspace(workspace?: string): string | null {
   const w = workspace?.trim();
   if (!w) return null;
-  assertPathInside(w);
-  return w;
+  const resolved = pathResolve(w);
+  const isAllowed = ALLOWED_ROOTS.some(root => isPathInside(root, resolved));
+  if (!isAllowed) return null;
+  return resolved;
 }
 
 export class GitIntegrationApi {
@@ -112,7 +120,8 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/status', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: null, error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const isRepo = await git.isGitRepo();
@@ -123,12 +132,12 @@ export class GitIntegrationApi {
         reply.status(500).send({ error: e instanceof Error ? e.message : String(e) });
       }
     });
-
     // ── branches ──
     fastify.get('/api/v1/git/branches', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: [], error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const isRepo = await git.isGitRepo();
@@ -139,12 +148,12 @@ export class GitIntegrationApi {
         return { data: [], error: e instanceof Error ? e.message : String(e) };
       }
     });
-
     // ── log ──
     fastify.get('/api/v1/git/log', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace, branch, limit } = request.query as { workspace?: string; branch?: string; limit?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: [], error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const logs = await git.getLogs(branch, limit ? parseInt(limit, 10) : 30);
@@ -153,12 +162,12 @@ export class GitIntegrationApi {
         reply.status(500).send({ error: e instanceof Error ? e.message : String(e) });
       }
     });
-
     // ── diff ──
     fastify.get('/api/v1/git/diff', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace, staged, file } = request.query as { workspace?: string; staged?: string; file?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: '', error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const isStagedFlag = staged === 'true';
@@ -318,7 +327,8 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/remotes', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: [], error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const remotes = await git.getRemotes();
@@ -376,7 +386,8 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/stash', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: [] };
       try {
         const git = self.getGitService(dir);
         const list = await git.stashList();
@@ -390,7 +401,8 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/detect', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: { platform: 'none', apiUrl: '', owner: '', repo: '' }, error: 'Workspace path outside allowed roots' };
       try {
         const git = self.getGitService(dir);
         const detected = await git.detectPlatformFromRemote();
@@ -404,7 +416,8 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/platform/mrs', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace, state } = request.query as { workspace?: string; state?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: [], unavailable: true, reason: 'workspace_blocked', message: 'Workspace path outside allowed roots' };
       try {
         const api = await self.buildPlatformApi(dir);
         const mrs = await api.listMRs((state || 'open') as 'open' | 'closed' | 'merged' | 'all');
@@ -504,13 +517,18 @@ export class GitIntegrationApi {
     fastify.post('/api/v1/git/init', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.body as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = resolveWriteWorkspace(workspace);
+      if (!dir) return reply.status(400).send({ error: 'workspace is required for write operations' });
       try {
         const git = self.getGitService(dir);
-        const isRepo = await git.isGitRepo();
-        if (isRepo) return { data: { message: 'Already a git repository' } };
-        await git.init();
-        return { data: { message: 'Initialized empty Git repository', path: dir } };
+        const result = await git.initIfNeeded();
+        return {
+          data: {
+            message: result.message,
+            path: result.repositoryRoot,
+            initialized: result.initialized,
+          },
+        };
       } catch (e) {
         reply.status(500).send({ error: e instanceof Error ? e.message : String(e) });
       }
@@ -520,12 +538,16 @@ export class GitIntegrationApi {
     fastify.get('/api/v1/git/platform/info', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.query as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace);
+      if (!dir) return { data: null, unavailable: true, reason: 'workspace_blocked', message: 'Workspace path outside allowed roots' };
       try {
         const api = await self.buildPlatformApi(dir);
         const info = await api.getRepoInfo();
         return { data: info };
       } catch (e) {
+        if (e instanceof GitPlatformUnavailableError) {
+          return reply.status(503).send({ error: e.message, unavailable: true, reason: e.reason });
+        }
         reply.status(500).send({ error: e instanceof Error ? e.message : String(e) });
       }
     });
@@ -534,7 +556,7 @@ export class GitIntegrationApi {
     fastify.post('/api/v1/git/platform/test', async (request, reply) => {
       if (!requireAuth(request, reply)) return;
       const { workspace } = request.body as { workspace?: string };
-      const dir = resolveReadWorkspace(workspace);
+      const dir = safeResolveReadWorkspace(workspace) || SERVER_CWD;
       try {
         const api = await self.buildPlatformApi(dir);
         const result = await api.testConnection();

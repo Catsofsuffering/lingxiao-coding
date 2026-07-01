@@ -316,6 +316,10 @@ function hasRateLimitSignal(fields: ExtractedErrorFields): boolean {
 function isContextOverflowSemantic(fields: ExtractedErrorFields): boolean {
   if (hasRateLimitSignal(fields)) return false;
   const text = fields.lowerText;
+  // 排除已知的消息格式验证错误（如 Bedrock TOOL_USE_RESULT_MISMATCH）——
+  // 这些错误包含 "messages" 和 "exceeds" 但与上下文大小无关，
+  // 误分类为 context_overflow 会触发无意义的有损压缩，还会破坏消息序列。
+  if (/tool.?(?:result|use)|mismatch/i.test(text)) return false;
   const hasRequestSizePhrase = /\b(?:payload|request(?:\s+entity)?)\s+too\s+large\b/i.test(text);
   const hasSubject = /\b(context\s+(?:window|length|limit)|max(?:imum)?\s+context|tokens?|prompt|input|messages?)\b/i.test(text) || hasRequestSizePhrase;
   const hasOverflow = hasRequestSizePhrase || /exceed(?:s|ed)?|too\s+(?:long|large|many)|over\s+(?:the\s+)?(?:limit|maximum)|above\s+(?:the\s+)?(?:limit|maximum)|reduce\s+the\s+length|adjust\s+your\s+input/i.test(text);
@@ -413,6 +417,15 @@ const MALFORMED_TOOL_ARGS_TEXT_PATTERNS = [
   'could not parse tool call arguments',
   'tool call arguments are not valid',
   'invalid tool call arguments',
+  // GLM/MiniMax 等 provider 的工具调用响应格式校验失败：
+  // 400 + "tool call result does not follow tool call (2013)"。
+  // 与 content_empty 共用 2013 但语义完全不同——前者是 client 侧消息序列污染
+  // （上一轮 tool_result 与本轮 tool_call id 不匹配 / role 错位），重试同上下文必死，
+  // 必须 fast-fail 走 compact 路径。empty-content-text 的 `(2013)` 模糊匹配会把它
+  // 误判成"内容为空可重试"导致无脑重试烧光预算。靠本规则优先匹配 + parse_error
+  // (retryable=false) 阻断。
+  'tool call result does not follow tool call',
+  'tool_call_result',
 ] as const;
 
 const INVALID_BODY_TEXT_PATTERNS = [
@@ -586,6 +599,12 @@ const CLASSIFICATION_RULES: readonly ErrorClassificationRule[] = [
   {
     id: 'malformed-tool-args-text',
     textPatterns: MALFORMED_TOOL_ARGS_TEXT_PATTERNS,
+    classify: 'parse_error',
+    retryable: false,
+  },
+  {
+    id: 'tool-result-mismatch-text',
+    textPatterns: [/tool.?(?:result|use).*mismatch/i, /toolResult.*exceeds.*toolUse/i, /TOOL_USE_RESULT_MISMATCH/],
     classify: 'parse_error',
     retryable: false,
   },

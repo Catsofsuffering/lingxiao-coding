@@ -62,7 +62,7 @@ function downloadFile(url: string, dest: string): Promise<boolean> {
 
     // 监听文件流错误
     file.on('error', (err) => {
-      console.error(`[TiktokenCache] 文件写入失败: ${err.message}`);
+      coreLogger.error(`[TiktokenCache] 文件写入失败: ${err.message}`);
       file.close();
       try {
         fs.unlinkSync(dest);
@@ -89,7 +89,7 @@ function downloadFile(url: string, dest: string): Promise<boolean> {
         resolve(true);
       });
     }).on('error', (err) => {
-      console.error(`[TiktokenCache] 下载失败: ${err.message}`);
+      coreLogger.error(`[TiktokenCache] 下载失败: ${err.message}`);
       file.close();
       try {
         fs.unlinkSync(dest);
@@ -126,7 +126,7 @@ export async function ensureCached(encodingName: SupportedEncoding = 'cl100k_bas
     coreLogger.debug(`使用 js-tiktoken 内置缓存: ${encodingName}`);
     return true;
   } catch (e) {
-    console.error(`[TiktokenCache] 无法获取编码器 ${encodingName}:`, e);
+    coreLogger.error(`[TiktokenCache] 无法获取编码器 ${encodingName}:`, e);
     return false;
   }
 }
@@ -145,7 +145,7 @@ export function getCachedEncoder(encodingName: SupportedEncoding = 'cl100k_base'
     _encoderCache.set(encodingName, encoder);
     return encoder;
   } catch (e) {
-    console.error(`[TiktokenCache] 获取编码器失败:`, e);
+    coreLogger.error(`[TiktokenCache] 获取编码器失败:`, e);
     return null;
   }
 }

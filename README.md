@@ -10,6 +10,9 @@
 
 ![LingXiao WebUI 指挥中心](./docs/images/homepage.png)
 
+## 赞助合作推广
+良心稳定GPT 首选小黑
+https://www.heilovehei.com/home
 ## 前言
 
 AI 编程工具已经不少了，各有各的擅长。我们在长期使用和实践中，一直有一个小愿望： AI 工具能不能更像一个有经验的技术总监那样，帮我们拆解任务、并行推进、全程可追溯？
@@ -184,6 +187,6 @@ npm run build
 - **社区**：已链接并认可 [LINUX DO 社区](https://linux.do)
 
 <p align="center">
-  <img src="./docs/images/QQ.jpg" width="200" alt="QQ群二维码" /><img src="./docs/images/weixin.jpg" width="200" alt="微信群二维码" /><br>
-  扫码加入 QQ/微信 交流群，获取最新动态、使用帮助和开发者交流
+  <img src="./docs/images/weixin.jpg" width="200" alt="微信群二维码" /><br>
+  扫码加入 微信 交流群，获取最新动态、使用帮助和开发者交流
 </p>

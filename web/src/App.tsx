@@ -9,9 +9,10 @@ import { ToastProvider } from './components/ui/Toast';
 import UpdateNotification from './components/ui/UpdateNotification';
 import ErrorBoundary from './components/ui/ErrorBoundary';
 import { useSessionStore } from './stores/sessionStore';
-import { pickBootstrapSessionId } from './utils/sessionListViewModel';
+import { loadLastSelectedSessionId, pickBootstrapSessionId } from './utils/sessionListViewModel';
 import InkBackground from './components/decor/InkBackground';
 import OnboardingWizard from './components/onboarding/OnboardingWizard';
+import { useResourceHousekeeping } from './hooks/useResourceHousekeeping';
 
 /**
  * Session bootstrap — runs at app level so SSE connection is established
@@ -45,7 +46,8 @@ function useSessionBootstrap() {
       store.createAndConnect().finally(() => { connectingRef.current = false; });
       return;
     }
-    const targetId = pickBootstrapSessionId(sessions, activeSessionId);
+    const lastSelectedSessionId = loadLastSelectedSessionId();
+    const targetId = pickBootstrapSessionId(sessions, activeSessionId, lastSelectedSessionId);
     if (targetId) {
       connectingRef.current = true;
       store.connectToSession(targetId).finally(() => { connectingRef.current = false; });
@@ -115,6 +117,8 @@ function useOnboardingCheck() {
 export default function App() {
   useSessionBootstrap();
   useConfigLanguageSync();
+  // 性能优化 (T-3 P2)：idle 周期回收旧 activity events，App 顶层挂载一次。
+  useResourceHousekeeping();
   const { needsOnboarding, setNeedsOnboarding } = useOnboardingCheck();
 
   const handleOnboardingComplete = () => {

@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import type { DatabaseManager } from '../Database.js';
 import type { GraphNode, WorkerGraphOutput } from './types.js';
 import { parseWorkerOutput, type ParseResult } from './WorkerOutputParser.js';
+import { getContractsDir, getProjectContractsDir, sanitizeSurfaceForFilename } from '../ContractPack.js';
 
 // ═══════════════════════════════════════════════════════════════
 // 类型
@@ -112,11 +113,54 @@ export function scanSessionFilesForContracts(
  *
  * @returns contract 节点对象，或 null（无元数据 / 非 contract 任务 / 已有同 surface 活跃契约）
  */
+/**
+ * BUG FIX: 从磁盘加载已有的完整契约内容,防止薄模板覆盖 worker 写入的完整契约。
+ *
+ * Fallback 2 只在 worker completion 无 graph_contract 块时触发。
+ * 如果此时磁盘已有同 surface 的契约文件,它一定是 worker 通过 file_create
+ * 等方式写入的完整契约（模板只存在于 orchestration.contract 元数据中）。
+ * 此时应该用磁盘文件内容构造 graph 节点,而非用薄模板——否则后续
+ * persistContractPack 会用模板覆盖磁盘完整文件。
+ *
+ * 检查顺序: session-scoped contracts dir → project-level .lingxiao/contracts/
+ */
+function loadContractContentFromDisk(
+  surface: string,
+  sessionId: string,
+  workspace: string,
+): string | null {
+  const fileName = `${sanitizeSurfaceForFilename(surface)}.json`;
+  const searchDirs = [
+    getContractsDir(sessionId, workspace),
+    getProjectContractsDir(workspace),
+  ];
+  for (const dir of searchDirs) {
+    const filePath = join(dir, fileName);
+    if (!existsSync(filePath)) continue;
+    try {
+      const raw = readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object'
+        && typeof (parsed as Record<string, unknown>).content === 'string'
+        && typeof (parsed as Record<string, unknown>).surface === 'string') {
+        const fileContent = (parsed as Record<string, string>).content;
+        const fileSurface = (parsed as Record<string, string>).surface;
+        // surface 必须匹配,确保是同一契约
+        if (fileSurface === surface && fileContent.length > 0) {
+          return fileContent;
+        }
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return null;
+}
+
 export function extractContractsFromTaskMetadata(
   db: DatabaseManager,
   sessionId: string,
   taskId: string,
   getActiveContract?: (sessionId: string, surface: string) => GraphNode | null,
+  workspace?: string,
 ): { sessionId: string; title: string; content: string; tags: string[]; createdBy: string } | null {
   try {
     const row = db.getDb().prepare(
@@ -136,10 +180,22 @@ export function extractContractsFromTaskMetadata(
     // 如果黑板已有同 surface 的活跃契约,跳过(避免重复)
     if (getActiveContract?.(sessionId, surface)) return null;
     const version = typeof contract.version === 'number' && contract.version > 0 ? contract.version : undefined;
+
+    // BUG FIX: 在使用薄模板内容前,检查磁盘是否已有 worker 写入的完整契约文件。
+    // 场景: architect worker 通过 file_create/write_work_note 写入完整契约 JSON,
+    // 但 attempt_completion 文本未内联 graph_contract 块,触发 Fallback 2。
+    // 此时磁盘文件就是 worker 的真实产出,应该用它而非模板构造 graph 节点。
+    // 如果直接用模板内容,后续 persistContractPack 会用模板覆盖磁盘完整文件。
+    let content = contract.content;
+    const diskContent = loadContractContentFromDisk(surface, sessionId, workspace ?? process.cwd());
+    if (diskContent !== null) {
+      content = diskContent;
+    }
+
     return {
       sessionId,
       title: contract.title ?? `Contract: ${surface}`,
-      content: contract.content,
+      content,
       tags: Array.from(new Set([
         `contract:${surface}`,
         ...(version !== undefined ? [`v${version}`, `contract-version:${version}`] : []),
@@ -196,7 +252,7 @@ export function parseAndValidateGraphBlocks(
   // worker completion 无 graph_contract 块，但任务自身有 contract 元数据
   // (Leader 通过 create_task(contract={...}) 创建契约任务时, orchestration.contract 存有契约正文)。
   if ((graphOutput.newContracts?.length ?? 0) === 0 && db) {
-    const taskContract = extractContractsFromTaskMetadata(db, sessionId, taskId, getActiveContract);
+    const taskContract = extractContractsFromTaskMetadata(db, sessionId, taskId, getActiveContract, workspace);
     if (taskContract) {
       graphOutput.newContracts = [taskContract];
       contractFallbackSource = 'task-metadata';

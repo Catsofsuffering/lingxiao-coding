@@ -152,6 +152,10 @@ export interface PromptCatalog {
       readonly toolDescription: string;
       readonly system: string;
     };
+    readonly intentClassification: {
+      readonly toolDescription: string;
+      readonly system: string;
+    };
     readonly toolSelection: {
       readonly toolDescription: string;
       readonly selectedToolNamesDescription: string;
@@ -368,6 +372,20 @@ const catalogByLocale: Record<PromptLocale, PromptCatalog> = {
           '执行具体 intent、调查、验证或实现路径选择 explore。',
           '普通编码、研究、审查、QA 或交付工作，且不需要 blackboard-specific prompt mode 时选择 generic。',
           '只调用 submit_task_classification 一次作为回复。',
+        ].join(' '),
+      },
+      intentClassification: {
+        toolDescription: '对用户消息的意图进行分类。',
+        system: [
+          'Leader 在同一次主 LLM 调用中负责记录用户消息意图；不要额外发起分类 LLM 调用。',
+          '必须根据整句语义判断真实意图，不要使用关键词匹配、正则匹配或局部词命中。',
+          'record_capability_intent 记录的是 capability envelope，不是单标签；primaryIntent 只是摘要，grants/denies/requiredGates/constraints 才是 gate 依据。',
+          '根据完整语义填写 primaryIntent、scope、phase、grants、denies、requiredGates、constraints；不要用关键词匹配。',
+          'grants/denies 只允许五类粗能力：read/write/shell/task/dispatch。read=读/搜索/分析/计划；write=写 workspace 文件；shell=命令/git/npm/test/deploy/python/terminal；task=任务图；dispatch=派发 worker。',
+          '只读/解释/方案类请求默认 scope=read_only，只授予 read，并用 denies 禁止 write/shell/task/dispatch。',
+          '实现/修复类请求按用户授权授予 read/write；如果用户说不要命令/不要 git/不要 deploy/不要 npm/test，一律 deny shell；不要派 worker 则 deny dispatch。',
+          '完整项目/复杂项目应表达为 implement + project/workspace scope + design/prepare phase + read/write/task/dispatch grants，并按需要加入 blueprint_coverage/verify_after_change gate。',
+          '每个新的用户 turn 如看到 record_capability_intent 可用，应先调用一次记录 profile；如果该工具不可用或工具结果提示本轮已记录，绝不要重复调用，直接继续执行用户请求。',
         ].join(' '),
       },
       toolSelection: {
@@ -590,6 +608,20 @@ const catalogByLocale: Record<PromptLocale, PromptCatalog> = {
           'Choose explore for executing a specific intent, investigation, validation, or implementation path.',
           'Choose generic for ordinary coding, research, review, QA, or delivery work that does not need a blackboard-specific prompt mode.',
           'Reply by calling submit_task_classification exactly once.',
+        ].join(' '),
+      },
+      intentClassification: {
+        toolDescription: 'Classify the intent of the user message.',
+        system: [
+          'The Leader records user-message intent inside the same main LLM call; do not start an extra classifier LLM call.',
+          'Judge the true intent from the full sentence semantics; do not use keyword matching, regex matching, or local token hits.',
+          'record_capability_intent records a capability envelope, not a single label; primaryIntent is only a summary, while grants/denies/requiredGates/constraints drive gates.',
+          'Fill primaryIntent, scope, phase, grants, denies, requiredGates, and constraints from the full-message semantics; do not use keyword matching.',
+          'grants/denies may only use five coarse capabilities: read/write/shell/task/dispatch. read=file/search/analysis/planning; write=workspace file writes; shell=commands/git/npm/test/deploy/python/terminal; task=task graph; dispatch=worker dispatch.',
+          'For read-only, explanation, or proposal requests, default to scope=read_only, grant only read, and deny write/shell/task/dispatch.',
+          'For implementation or fix requests, grant read/write as authorized. If the user says no commands/git/deploy/npm/test, deny shell. If the user says no workers, deny dispatch.',
+          'For complex/full-project work, use implement + project/workspace scope + design/prepare phase + read/write/task/dispatch grants, and include blueprint_coverage/verify_after_change gates as needed.',
+          "For each new user turn, if record_capability_intent is available, call it once to record the profile; if it is unavailable or its result says the turn is already recorded, never call it again and continue executing the user's request directly.",
         ].join(' '),
       },
       toolSelection: {

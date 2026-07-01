@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { acpClient } from '../../api/AcpClient';
 import { useSessionStore } from '../../stores/sessionStore';
+import { usePageVisibility } from '../../hooks/usePageVisibility';
 import { SessionUpdateKind, subscribeSessionUpdateEvents } from '../../stores/sseStore';
 import { getServerToken } from '../../api/headers';
 import { isAgentActiveStatus } from '../../stores/sessionStoreHelpers';
@@ -695,12 +696,14 @@ export default function TracesView() {
     fetchTraces();
   }, [fetchTraces]);
 
-  // Auto refresh
+  const isVisible = usePageVisibility();
+
+  // Auto refresh — suspended when tab is hidden
   useEffect(() => {
-    if (!autoRefresh || !selectedSessionId) return;
+    if (!autoRefresh || !selectedSessionId || !isVisible) return;
     const interval = setInterval(fetchTraces, 5000);
     return () => clearInterval(interval);
-  }, [autoRefresh, selectedSessionId, fetchTraces]);
+  }, [autoRefresh, selectedSessionId, fetchTraces, isVisible]);
 
   // SSE: append live events
   useEffect(() => {

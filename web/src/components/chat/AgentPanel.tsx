@@ -66,6 +66,8 @@ function AgentPanel({ onClose, onExpandChange }: { onClose: () => void; onExpand
   }, [stopAgent]);
   const handleSetExpanded = (v: boolean) => { setIsExpanded(v); onExpandChange?.(v); };
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const userScrolledAwayRef = useRef(false);
+  const isAtBottomRef = useRef(true);
 
   // Get agent list from both runtime state and conversation history.
   // 会话切换/重连时这两路数据可能短暂只到一边：只要任一侧存在，就应能打开面板。
@@ -129,9 +131,17 @@ function AgentPanel({ onClose, onExpandChange }: { onClose: () => void; onExpand
       });
     }
 
-    return Array.from(byId.values())
+    const all = Array.from(byId.values())
       // 稳定排序：按首次出现时间升序，避免 tab 顺序随 SSE 事件到达序抖动
       .sort((a, b) => (a.spawnedAt ?? 0) - (b.spawnedAt ?? 0));
+    // 优先显示 running agent；终态 agent 保留但排在后面
+    return all.sort((a, b) => {
+      const aRunning = a.normalizedStatus === 'running' || a.normalizedStatus === 'recovering';
+      const bRunning = b.normalizedStatus === 'running' || b.normalizedStatus === 'recovering';
+      if (aRunning && !bRunning) return -1;
+      if (!aRunning && bRunning) return 1;
+      return 0;
+    });
   }, [agents, agentConversations]);
 
   const runningCount = useMemo(() =>
@@ -155,6 +165,7 @@ function AgentPanel({ onClose, onExpandChange }: { onClose: () => void; onExpand
   // agent switch we jump to the bottom of the newly-selected conversation.
   const activeAgent = activeAgentId ? agentList.find((a) => a.agentId === activeAgentId) : null;
   useEffect(() => {
+    userScrolledAwayRef.current = false;
     virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'auto' });
   }, [activeAgentId]);
 
@@ -427,7 +438,17 @@ function AgentPanel({ onClose, onExpandChange }: { onClose: () => void; onExpand
                 ref={virtuosoRef}
                 className="h-full"
                 data={groupedMessages}
-                followOutput={(atBottom) => atBottom}
+                followOutput={(atBottom) => {
+                  if (userScrolledAwayRef.current) return false;
+                  return atBottom;
+                }}
+                atBottomStateChange={(atBottom) => {
+                  isAtBottomRef.current = atBottom;
+                  if (atBottom) userScrolledAwayRef.current = false;
+                }}
+                onWheel={() => {
+                  if (!isAtBottomRef.current) userScrolledAwayRef.current = true;
+                }}
                 increaseViewportBy={{ top: 200, bottom: 200 }}
                 components={{
                   Footer: () =>
@@ -484,6 +505,35 @@ function formatAgentElapsedShort(ms: number): string {
   const s = Math.floor(sec % 60);
   return `${m}m${s.toString().padStart(2, '0')}s`;
 }
+
+/**
+ * 性能优化 (T-3 P1-b)：把 agent 工具卡的"耗时秒数"显示抽成独立 memo 叶子组件。
+ * 此前 AgentMessageView 整体每秒 setTick 重渲染，唯一目的只是刷新这一个耗时数字。
+ * 迁入后 1000ms tick 只重渲染这个 span，整条 agent 消息不再每秒重渲染。
+ * 终态（isRunning=false）后不再 tick，定格在最终耗时（用 endedAt 计算）。
+ */
+const AgentElapsedTimer = memo(function AgentElapsedTimer({
+  from,
+  endedAt,
+  isRunning,
+  className,
+}: {
+  from: number | undefined;
+  endedAt: number | undefined;
+  isRunning: boolean;
+  className?: string;
+}) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = window.setInterval(() => setTick((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [isRunning]);
+  const to = isRunning ? Date.now() : endedAt;
+  const elapsedMs = from && to ? Math.max(0, to - from) : null;
+  if (elapsedMs === null) return null;
+  return <span className={className}>{formatAgentElapsedShort(elapsedMs)}</span>;
+});
 
 function parseAgentMaybeJsonObject(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -729,16 +779,11 @@ function groupAgentMessages(messages: AgentMessage[]): GroupedAgentItem[] {
 function AgentMessageView({ msg, result }: { msg: AgentMessage; result?: AgentMessage }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
-  // tool_call running 期间每秒重渲染计时
-  const [, setTick] = useState(0);
+  // 性能优化 (T-3 P1-b)：tool_call running 期间的"耗时秒数"已抽到 AgentElapsedTimer
+  // 叶子组件自行 tick，本组件不再整体每秒重渲染。
   const isToolCall = msg.type === 'tool_call';
   const isToolRunning = isToolCall && isAgentToolOpenStatus(msg.toolStatus, msg.isStreaming);
   const outputRef = useRef<HTMLPreElement>(null);
-  useEffect(() => {
-    if (!isToolRunning) return;
-    const id = window.setInterval(() => setTick((n) => n + 1), 1000);
-    return () => window.clearInterval(id);
-  }, [isToolRunning]);
   // 流式输出自动滚动到底（对齐 leader MessageBubble.tsx:630）
   useEffect(() => {
     if (outputRef.current) {
@@ -802,7 +847,18 @@ function AgentMessageView({ msg, result }: { msg: AgentMessage; result?: AgentMe
             </span>
           )}
           {isToolRunning && <span className="codex-live-dot" />}
-          {event.meta && <span className="agent-status-chip font-mono tabular-nums">{event.meta}</span>}
+          {/* 性能优化 (T-3 P1-b)：running 时耗时由 AgentElapsedTimer 自行每秒 tick，
+              整条 agent 消息不再每秒重渲染；终态定格用 describeAgentToolEvent 的 meta。 */}
+          {isToolRunning ? (
+            <AgentElapsedTimer
+              from={isStreamingInput ? msg.firstDeltaAt : msg.startedAt}
+              endedAt={msg.endedAt}
+              isRunning={true}
+              className="agent-status-chip font-mono tabular-nums"
+            />
+          ) : (
+            event.meta && <span className="agent-status-chip font-mono tabular-nums">{event.meta}</span>
+          )}
           <button onClick={() => setExpanded(!expanded)} className="text-text-tertiary hover:text-text-secondary transition-colors ml-auto" aria-expanded={expanded}>
             {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
           </button>

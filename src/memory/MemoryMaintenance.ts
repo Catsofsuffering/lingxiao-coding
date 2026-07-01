@@ -79,7 +79,7 @@ export function runDueMemoryMaintenance(options: MemoryMaintenanceOptions): void
           coreLogger.info(`[MemoryMaintenance] dream done: ${result.checkpointsProcessed} checkpoints → ${result.linesWritten} lines`);
         } catch (err) {
           coreLogger.warn(`[MemoryMaintenance] dream failed: ${err instanceof Error ? err.message : err}`);
-        }
+          dreamTrigger.markExecuted();        }
       })();
     }
   }
@@ -104,7 +104,7 @@ export function runDueMemoryMaintenance(options: MemoryMaintenanceOptions): void
           coreLogger.info(`[MemoryMaintenance] distill done: ${result.created.length} assets created`);
         } catch (err) {
           coreLogger.warn(`[MemoryMaintenance] distill failed: ${err instanceof Error ? err.message : err}`);
-        }
+          distillTrigger.markExecuted();        }
       })();
     }
   }

@@ -9,6 +9,9 @@ import { useTranslation } from 'react-i18next';
 import {
   Keyboard, Search, RotateCcw, ChevronDown, ChevronRight,
 } from 'lucide-react';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('KeybindingsView');
+
 
 interface Keybinding {
   actionKey: string;
@@ -77,7 +80,7 @@ export default function KeybindingsView() {
 
   const handleResetAll = () => {
     setCustomBindings(null);
-    try { localStorage.removeItem('lingxiao_custom_keybindings'); } catch (err) { console.warn('[KeybindingsView] Failed to reset custom keybindings:', err); }
+    try { localStorage.removeItem('lingxiao_custom_keybindings'); } catch (err) { log.warn('[KeybindingsView] Failed to reset custom keybindings:', err); }
   };
 
   // Load custom bindings from localStorage on mount
@@ -86,7 +89,7 @@ export default function KeybindingsView() {
       const stored = localStorage.getItem('lingxiao_custom_keybindings');
       if (stored) setCustomBindings(JSON.parse(stored));
     } catch (err) {
-      console.warn('[KeybindingsView] Failed to load custom keybindings:', err);
+      log.warn('[KeybindingsView] Failed to load custom keybindings:', err);
     }
   });
 

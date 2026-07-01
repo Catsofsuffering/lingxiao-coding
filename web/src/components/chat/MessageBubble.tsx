@@ -21,7 +21,11 @@ import { isToolCallOpenStatus, normalizeAgentStatus, normalizeToolCallStatus } f
 import { formatFileChangeSummary } from '../../utils/fileChangeSummary';
 import { classifyTool, type ToolUiKind } from './toolClassification';
 import ToolOutputView from './ToolOutputView';import McpAppRenderer from './McpAppRenderer';
-import { inferInputLanguage, inferOutputLanguage } from './toolOutputFormat';
+import { inferInputLanguage, inferOutputLanguage } from './toolOutputFormat';import OfficeResultCard, { isOfficeToolResult } from './OfficeResultCard';import OfficeProgressCard, { isOfficeGenerateTool } from './OfficeProgressCard';
+import OfficeOutlineCard, { extractOutlineFromInput } from './OfficeOutlineCard';
+import { createLogger } from '../../utils/logger';
+const log = createLogger('MessageBubble');
+
 
 // Module-level settings cache for hook output collapse preference
 let _hookOutputCollapsed: boolean | null = null;
@@ -364,6 +368,8 @@ function DownloadArtifactCard({ artifact }: { artifact: DownloadArtifact }) {
   ].filter(Boolean).join(' · ');
 
   const handlePreview = () => {
+    // 在剑阁 Canvas 工作台中索引/预览：openArtifact 驱动 JiangeCanvas 内的 ArtifactView，
+    // 切到 chat 视图并派发事件展开剑阁侧栏（而非跳独立全屏 artifact 视图）。
     openArtifact({
       name: artifact.name,
       path: artifact.path,
@@ -372,7 +378,8 @@ function DownloadArtifactCard({ artifact }: { artifact: DownloadArtifact }) {
       mimeType: artifact.mimeType,
       expiresAt: artifact.expiresAt,
     });
-    setMainView('artifact');
+    setMainView('chat');
+    window.dispatchEvent(new CustomEvent('lingxiao:open-jiange'));
   };
 
   const handleDownload = async () => {
@@ -421,9 +428,8 @@ function DownloadArtifactCard({ artifact }: { artifact: DownloadArtifact }) {
       <button
         type="button"
         onClick={handlePreview}
-        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border-muted text-text-tertiary hover:text-accent-blue hover:bg-bg-hover disabled:opacity-40"
-        disabled={!artifact.path}
-        title={artifact.path ? t('artifact.action.previewInCanvas') : t('artifact.error.noPath')}
+        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border-muted text-text-tertiary hover:text-accent-blue hover:bg-bg-hover"
+        title={t('artifact.action.previewInCanvas')}
       >
         <Eye size={14} />
       </button>
@@ -645,6 +651,37 @@ function describeToolEvent(tc: ToolCall): { title: string; detail: string; meta:
   };
 }
 
+/**
+ * 性能优化 (T-3 P1-b)：把"耗时秒数"显示抽成独立 memo 叶子组件。
+ * 此前 running 工具卡片整体每秒 setTick 重渲染，唯一目的只是刷新这一个耗时数字。
+ * 迁入后 1000ms tick 只重渲染这个 span，工具卡片主体不再每秒重渲染。
+ * 终态（isRunning=false）后不再 tick，定格在最终耗时（用 endedAt 计算）。
+ */
+const ElapsedTimer = memo(function ElapsedTimer({
+  from,
+  endedAt,
+  isRunning,
+  format,
+  className,
+}: {
+  from: number | undefined;
+  endedAt: number | undefined;
+  isRunning: boolean;
+  format: (ms: number) => string;
+  className?: string;
+}) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = window.setInterval(() => setTick((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [isRunning]);
+  const to = isRunning ? Date.now() : endedAt;
+  const elapsedMs = from && to ? Math.max(0, to - from) : null;
+  if (elapsedMs === null) return null;
+  return <span className={className}>{format(elapsedMs)}</span>;
+});
+
 function ToolCallCard({ tc }: { tc: ToolCall }) {
   const [expanded, setExpanded] = useState(() => {
     // streaming_input / running 阶段默认展开，让用户实时看到参数生成和执行输出
@@ -682,6 +719,7 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
   const hasResult = resultValue !== undefined;
   const displayStatus = toolDisplayStatus(tc, hasResult);
   const downloadArtifact = parseDownloadArtifact(resultValue);
+  const isOfficeResult = isOfficeToolResult(tc.tool, resultValue);
 
   // Truncate input for display
   const inputStr = tc.input
@@ -691,23 +729,36 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
 
   // Truncate result for display — 终态优先显示 result，fallback 到 streamingOutput
   const effectiveResult = hasResult ? resultValue : (isDone || isFailed ? tc.streamingOutput : undefined);
-  const resultParts = parseToolResultParts(effectiveResult);
-  const resultStr = effectiveResult
-    ? (resultParts ? toolResultPartsToText(resultParts) : typeof effectiveResult === 'string' ? effectiveResult : structuredToolResultText(effectiveResult) ?? JSON.stringify(effectiveResult, null, 2))
-    : '';
+  // 缓存结果解析 + 序列化：每个 running 工具卡片每秒 setTick 重渲染，若不缓存
+  // 则大 result 对象每秒被 JSON.stringify 全量序列化，是流式期 CPU 热点之一。
+  // 按 effectiveResult 引用缓存：终态后 result 引用稳定，tick 不再触发重算。
+  const { resultParts, resultStr } = useMemo(() => {
+    const parts = parseToolResultParts(effectiveResult);
+    const str = effectiveResult
+      ? (parts ? toolResultPartsToText(parts) : typeof effectiveResult === 'string' ? effectiveResult : structuredToolResultText(effectiveResult) ?? JSON.stringify(effectiveResult, null, 2))
+      : '';
+    return { resultParts: parts, resultStr: str };
+  }, [effectiveResult]);
   const metaSummary = summarizeMetaTool(tc.tool, tc.input, tc.result);
   const event = describeToolEvent(tc);
 
-  // 计时器：running / streaming_input 期间每秒重渲染，让用户看到耗时在涨。
-  // 终态后不再 tick，定格在最终耗时。
+  const kind = classifyTool(tc.tool, { input: tc.input, result: tc.result }).kind;
+  // Office 工具特化渲染
+  const isOfficeGen = isOfficeGenerateTool(tc.tool);
+  const officeOutline = isOfficeGen && isStreaming ? extractOutlineFromInput(tc.input) : null;
+
+  // 计时器：性能优化 (T-3 P1-b)。
+  // 普通工具卡的"耗时数字"已抽到 ElapsedTimer 叶子组件自行 tick，整卡不再每秒重渲染。
+  // 仅 Office 生成卡仍需整卡 tick——其 OfficeProgressCard 的进度阶段由 officeElapsed 驱动，
+  // 必须每秒推进；officeElapsed 也只在该场景下使用。
+  const needsCardTick = isRunning && isOfficeGen;
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (!isRunning) return;
+    if (!needsCardTick) return;
     const id = window.setInterval(() => setTick((n) => n + 1), 1000);
     return () => window.clearInterval(id);
-  }, [isRunning]);
-
-  const kind = classifyTool(tc.tool, { input: tc.input, result: tc.result }).kind;
+  }, [needsCardTick]);
+  const officeElapsed = tc.startedAt ? Date.now() - tc.startedAt : 0;
 
   return (
     <div data-kind={kind} className={`tool-event-card text-xs ${
@@ -731,15 +782,40 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
           </span>
         )}
         {isRunning && <span className="codex-live-dot" />}
-        {event.meta && <span className="tool-status-chip shrink-0 font-mono tabular-nums">{event.meta}</span>}
+        {/* 性能优化 (T-3 P1-b)：运行中耗时交给 ElapsedTimer 自行 tick，整卡不再每秒重渲染；
+            终态定格用 describeToolEvent 算好的 event.meta。elapsedFrom/elapsedTo 口径对齐 describeToolEvent。 */}
+        {isRunning ? (
+          <ElapsedTimer
+            from={tc.status === 'streaming_input' ? tc.firstDeltaAt : tc.startedAt}
+            endedAt={tc.endedAt}
+            isRunning={isRunning}
+            format={formatElapsedShort}
+            className="tool-status-chip shrink-0 font-mono tabular-nums"
+          />
+        ) : (
+          event.meta && <span className="tool-status-chip shrink-0 font-mono tabular-nums">{event.meta}</span>
+        )}
         {expanded ? <ChevronDown size={12} className="text-text-tertiary shrink-0" /> : <ChevronRight size={12} className="text-text-tertiary shrink-0" />}
       </button>
 
       {/* Expanded details */}
       {expanded && (
         <div className="tool-detail-block space-y-2">
-          {downloadArtifact && (
+          {/* Office 生成进度卡片 */}
+          {isOfficeGen && isRunning && (
+            <OfficeProgressCard toolName={tc.tool} elapsedMs={officeElapsed} />
+          )}
+
+          {/* Office 大纲蓝图（streaming_input 阶段） */}
+          {officeOutline && officeOutline.length > 0 && (
+            <OfficeOutlineCard slides={officeOutline} editable={false} />
+          )}
+
+          {downloadArtifact && !isOfficeResult && (
             <DownloadArtifactCard artifact={downloadArtifact} />
+          )}
+          {isOfficeResult && (
+            <OfficeResultCard toolName={tc.tool} result={resultValue} />
           )}
           {inputStr && (
             <div>
@@ -794,14 +870,26 @@ function ToolCallCard({ tc }: { tc: ToolCall }) {
       )}
 
       {/* Quick preview when collapsed */}
+      {/* Office 生成进度（折叠状态下也展示） */}
+      {!expanded && isOfficeGen && isRunning && (
+        <div className="px-3 pb-2">
+          <OfficeProgressCard toolName={tc.tool} elapsedMs={officeElapsed} />
+        </div>
+      )}
+
       {!expanded && (displayStatus || metaSummary || inputPreview) && (
         <div className={`px-3 pb-2 text-[11px] truncate ${metaSummary ? 'text-text-secondary' : 'text-text-tertiary'}`}>
           {displayStatus || metaSummary || inputPreview}
         </div>
       )}
-      {!expanded && downloadArtifact && (
+      {!expanded && downloadArtifact && !isOfficeResult && (
         <div className="px-3 pb-2">
           <DownloadArtifactCard artifact={downloadArtifact} />
+        </div>
+      )}
+      {!expanded && isOfficeResult && (
+        <div className="px-3 pb-2">
+          <OfficeResultCard toolName={tc.tool} result={resultValue} />
         </div>
       )}
     </div>
@@ -1073,7 +1161,7 @@ function MessageBubble({ message, onAgentClick, onEdit, onRetry }: Props) {
             addMessage({ id: String(Date.now() + 1), role: 'assistant', content: '', timestamp: Date.now(), isStreaming: true });
             try {
               await acpClient.sendJsonRpc('session/prompt', { prompt: answer, askUserAnswer: structured });
-            } catch (e) { console.error('Failed to send answer:', e); }
+            } catch (e) { log.error('Failed to send answer:', e); }
           }}
         />
       </div>
