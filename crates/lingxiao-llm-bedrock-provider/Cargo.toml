@@ -1,0 +1,29 @@
+[package]
+name = "lingxiao-llm-bedrock-provider"
+version = "0.1.0"
+description = "LingXiao LLM provider executor for AWS Bedrock Runtime"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lingxiao-llm-bedrock-provider"
+path = "src/main.rs"
+
+[dependencies]
+aws-credential-types = "=1.2.0"
+aws-runtime = "=1.2.2"
+aws-sdk-bedrockruntime = "=1.27.0"
+aws-smithy-async = "=1.2.1"
+aws-smithy-eventstream = "=0.60.4"
+aws-smithy-http = { version = "=0.60.8", features = ["event-stream"] }
+aws-smithy-json = "=0.60.7"
+aws-smithy-runtime = { version = "=1.5.0", features = ["client", "tls-rustls"] }
+aws-smithy-runtime-api = { version = "=1.6.0", features = ["client", "http-02x"] }
+aws-smithy-types = { version = "=1.1.9", features = ["rt-tokio"] }
+aws-types = "=1.2.1"
+lingxiao-llm-host-protocol = { path = "../lingxiao-llm-host-protocol" }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }

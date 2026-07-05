@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lingxiao-core",
+    "crates/lingxiao-core-protocol",
+    "crates/lingxiao-core-daemon",
+    "crates/lingxiao-tool-host-protocol",
+    "crates/lingxiao-llm-host-protocol",
+    "crates/lingxiao-llm-openai-provider",
+    "crates/lingxiao-llm-anthropic-provider",
+    "crates/lingxiao-llm-gemini-provider",
+    "crates/lingxiao-llm-bedrock-provider",
+]
+
+[workspace.package]
+authors = ["LingXiao Contributors"]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"

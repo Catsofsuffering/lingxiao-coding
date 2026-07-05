@@ -1,0 +1,22 @@
+[package]
+name = "lingxiao-core"
+version = "0.1.0"
+description = "LingXiao Rust Core — canonical domain model, state machines, command router, persistence, event log"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lingxiao-core-protocol = { path = "../lingxiao-core-protocol" }
+lingxiao-tool-host-protocol = { path = "../lingxiao-tool-host-protocol" }
+lingxiao-llm-host-protocol = { path = "../lingxiao-llm-host-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+fastrand = "2"
+wait-timeout = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

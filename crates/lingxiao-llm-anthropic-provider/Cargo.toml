@@ -1,0 +1,20 @@
+[package]
+name = "lingxiao-llm-anthropic-provider"
+version = "0.1.0"
+description = "LingXiao LLM provider executor for Anthropic Messages API"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lingxiao-llm-anthropic-provider"
+path = "src/main.rs"
+
+[dependencies]
+anthropic-sdk-rust = "0.1.1"
+futures = "0.3"
+lingxiao-llm-host-protocol = { path = "../lingxiao-llm-host-protocol" }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }

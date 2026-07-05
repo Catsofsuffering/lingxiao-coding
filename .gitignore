@@ -9,6 +9,7 @@ web/.vite/
 build/
 coverage/
 *.tsbuildinfo
+target/
 
 # Lingxiao local runtime state
 .lingxiao/

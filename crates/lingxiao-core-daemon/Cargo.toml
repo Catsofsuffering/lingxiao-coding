@@ -1,0 +1,19 @@
+[package]
+name = "lingxiao-core-daemon"
+version = "0.1.0"
+description = "LingXiao Core daemon — binary entry point, transport layer, lifecycle, shutdown"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lingxiao-core = { path = "../lingxiao-core" }
+lingxiao-core-protocol = { path = "../lingxiao-core-protocol" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,21 @@
+[package]
+name = "lingxiao-llm-gemini-provider"
+version = "0.1.0"
+description = "LingXiao LLM provider executor for Google Gemini"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lingxiao-llm-gemini-provider"
+path = "src/main.rs"
+
+[dependencies]
+gemini-rust = "1.7.1"
+lingxiao-llm-host-protocol = { path = "../lingxiao-llm-host-protocol" }
+serde_json = "1"
+thiserror = "2"
+time = "=0.3.41"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"

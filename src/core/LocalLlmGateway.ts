@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { getConfigValue, saveSettings, setConfigValue, config as runtimeConfig } from '../config.js';
 import { getModelManager } from '../config/ModelManager.js';
+import { toCustomModelName } from '../llm/customModelName.js';
 
 export type LocalLlmGatewayProvider = 'openai' | 'anthropic';
 
@@ -171,6 +172,7 @@ function resolveAccessForModel(
     throw new Error('Lingxiao local LLM gateway has no model configured');
   }
   const model = getModelManager().getModelByIdStrict(modelId);
+  const apiModel = model.model || modelId;
   return {
     gateway,
     keyId: input.keyId,
@@ -178,7 +180,7 @@ function resolveAccessForModel(
     virtualKey: input.virtualKey,
     provider: input.provider || gateway.provider,
     modelId,
-    apiModel: model.model || modelId,
+    apiModel: toCustomModelName(apiModel),
     rpm: input.rpm || readPositiveInt('llm_gateway.default_rpm', 60),
     tpm: input.tpm || readPositiveInt('llm_gateway.default_tpm', 200_000),
     dailyTokenBudget: input.dailyTokenBudget || readPositiveInt('llm_gateway.default_daily_token_budget', 2_000_000),
@@ -197,7 +199,7 @@ export function resolveLocalLlmGateway(): LocalLlmGatewayResolved | null {
   if (!modelId) return null;
 
   const model = getModelManager().getModelByIdStrict(modelId);
-  const apiModel = model.model || modelId;
+  const apiModel = toCustomModelName(model.model || modelId);
   const token = ensureGatewayToken();
   // 网关端口：优先用运行时绑定的实际端口（随机分配），
   // 回退到配置端口（用于未启动时显示默认地址或外部直连场景）。

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { ExternalAgentInput, ExternalDriver, ExternalEvent, ExternalExecutionPlan } from '../types.js';
 import { extractDriverUsage } from '../../../llm/usageExtractor.js';
+import { toCustomModelName } from '../../../llm/customModelName.js';
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -37,6 +38,7 @@ export class ClaudeCodeDriver implements ExternalDriver {
   buildExecute(input: ExternalAgentInput): ExternalExecutionPlan {
     const sessionIdHint = randomUUID();
     const command = process.env.LINGXIAO_CLAUDE_BIN || 'claude';
+    const codeBuddyModel = toCustomModelName(input.model.apiModel);
     // 抑制 claude-code 内置身份/语气注入：
     // - 二进制内的 "You are Claude Code, Anthropic's official CLI..." 系统提示无法从外部删除，
     //   只能通过 --append-system-prompt 在其后追加一段强覆写指令，让模型按凌霄 worker 角色执行。
@@ -60,7 +62,7 @@ export class ClaudeCodeDriver implements ExternalDriver {
       '--include-partial-messages',
       '--no-session-persistence',
       '--session-id', sessionIdHint,
-      '--model', input.model.apiModel,
+      '--model', codeBuddyModel,
       '--add-dir', input.workingDirectory,
       '--add-dir', input.workspace,
       '--append-system-prompt', mergedSystemPrompt,
@@ -77,7 +79,7 @@ export class ClaudeCodeDriver implements ExternalDriver {
         ANTHROPIC_BASE_URL: input.model.baseUrl,
         ANTHROPIC_AUTH_TOKEN: input.model.apiKey,
         ANTHROPIC_API_KEY: input.model.apiKey,
-        ANTHROPIC_MODEL: input.model.apiModel,
+        ANTHROPIC_MODEL: codeBuddyModel,
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       },
     };

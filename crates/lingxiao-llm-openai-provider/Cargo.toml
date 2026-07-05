@@ -1,0 +1,23 @@
+[package]
+name = "lingxiao-llm-openai-provider"
+version = "0.1.0"
+description = "LingXiao LLM provider executor for OpenAI-compatible Chat Completions"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lingxiao-llm-openai-provider"
+path = "src/main.rs"
+
+[dependencies]
+async-openai = { version = "0.41.1", features = ["chat-completion", "rustls"] }
+lingxiao-llm-host-protocol = { path = "../lingxiao-llm-host-protocol" }
+futures-util = "0.3"
+reqwest = { version = "0.13.4", features = ["json", "stream"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
