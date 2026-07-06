@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -78,6 +78,7 @@ export function ModelAndReasoningSection({
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [autoDetected, setAutoDetected] = useState(false);
   const [testingModelId, setTestingModelId] = useState<string | null>(null);
+  const modelFormRef = useRef<HTMLDivElement | null>(null);
 
   const configuredModels = useMemo<ModelItem[]>(
     () => providers.flatMap((p) => p.models.flatMap((m) => (m.provider ? [{ ...m, provider: m.provider }] : []))),
@@ -194,7 +195,7 @@ export function ModelAndReasoningSection({
     const existingMaxTokens = model.generationConfig?.max_tokens;
     setNewModel({
       protocol: model.provider,
-      name: model.id,
+      name: model.name || model.id,
       model: model.model || model.id,
       apiKey: '',
       baseUrl: model.baseUrl || DEFAULT_MODEL_BASE_URL[model.provider],
@@ -205,6 +206,10 @@ export function ModelAndReasoningSection({
     setModelFormOpen(true);
     setModelStatus(null);
     setAutoDetected(false);
+    // 展开编辑表单后滚动到表单位置，避免用户还要手动往上滑
+    requestAnimationFrame(() => {
+      modelFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const resetModelForm = () => {
@@ -478,7 +483,7 @@ export function ModelAndReasoningSection({
         </div>
 
         {modelFormOpen && (
-          <div className="rounded-md border border-border-default bg-bg-primary/55 p-3">
+          <div ref={modelFormRef} className="rounded-md border border-border-default bg-bg-primary/55 p-3">
             <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <div className="text-sm font-medium text-text-primary">{existingModel ? t('settings.model.editModelTitle') : t('settings.model.addModelTitle')}</div>
@@ -868,7 +873,7 @@ function ModelConfigCard({
     <div className="min-w-0 rounded-md border border-border-muted bg-bg-primary/45 p-3 transition-colors hover:border-accent-brand/40 hover:bg-bg-hover">
       <div className="flex min-w-0 items-start justify-between gap-2">
         <div className="min-w-0">
-          <div className="truncate font-mono text-sm text-text-primary" title={model.id}>{model.id}</div>
+          <div className="truncate font-mono text-sm text-text-primary" title={model.name && model.name !== model.id ? `${model.name} (${model.id})` : model.id}>{model.name || model.id}</div>
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-text-tertiary">
             <StatusPill tone={model.provider === 'anthropic' ? 'warning' : 'info'} label={model.provider} />
             {active && <StatusPill tone="success" label={activeLabel} />}
