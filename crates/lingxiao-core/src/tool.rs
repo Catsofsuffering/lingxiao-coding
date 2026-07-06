@@ -1,11 +1,16 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use wait_timeout::ChildExt;
 
 pub type ToolName = String;
+
+const NATIVE_PROCESS_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// Result from a native tool execution.
 #[derive(Debug, Clone)]
@@ -908,36 +913,90 @@ fn tool_shell() -> ToolDefinition {
                 Ok(c) => c,
                 Err(e) => return ToolResult::err(format!("shell spawn failed: {e}")),
             };
+            let stdout_drain = child.stdout.take().map(spawn_output_drain);
+            let stderr_drain = child.stderr.take().map(spawn_output_drain);
 
-            match child.wait_timeout(Duration::from_millis(timeout_ms)) {
-                Ok(Some(_)) => {}
+            let status = match child.wait_timeout(Duration::from_millis(timeout_ms)) {
+                Ok(Some(status)) => status,
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = collect_output(stdout_drain);
+                    let _ = collect_output(stderr_drain);
                     return ToolResult::err(format!(
-                        "shell command timed out after {timeout_ms}ms: {cmd_str}"
+                        "shell command timed out after {timeout_ms}ms"
                     ));
                 }
                 Err(e) => return ToolResult::err(format!("shell wait error: {e}")),
-            }
+            };
 
-            match child.wait_with_output() {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                    let exit_code = out.status.code().unwrap_or(-1);
-                    ToolResult::ok(json!({
-                        "exit_code": exit_code,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "command": cmd_str,
-                        "success": out.status.success(),
-                    }))
-                }
-                Err(e) => ToolResult::err(format!("shell output read failed: {e}")),
-            }
+            let stdout_bytes = collect_output(stdout_drain);
+            let stderr_bytes = collect_output(stderr_drain);
+            let stdout_truncated = stdout_bytes.truncated;
+            let stderr_truncated = stderr_bytes.truncated;
+            let stdout = String::from_utf8_lossy(&stdout_bytes.bytes).to_string();
+            let stderr = String::from_utf8_lossy(&stderr_bytes.bytes).to_string();
+            let exit_code = status.code().unwrap_or(-1);
+            ToolResult::ok(json!({
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "command": cmd_str,
+                "success": status.success(),
+            }))
         }),
     }
+}
+
+struct OutputDrain {
+    buffer: Arc<Mutex<BoundedOutput>>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_output_drain<R>(mut reader: R) -> OutputDrain
+where
+    R: Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(BoundedOutput::default()));
+    let thread_buffer = buffer.clone();
+    let handle = thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => append_bounded_output(&thread_buffer, &chunk[..n]),
+                Err(_) => break,
+            }
+        }
+    });
+    OutputDrain { buffer, handle }
+}
+
+fn append_bounded_output(buffer: &Arc<Mutex<BoundedOutput>>, bytes: &[u8]) {
+    let mut guard = buffer.lock().unwrap();
+    guard.bytes.extend_from_slice(bytes);
+    if guard.bytes.len() > NATIVE_PROCESS_OUTPUT_LIMIT {
+        let overflow = guard.bytes.len() - NATIVE_PROCESS_OUTPUT_LIMIT;
+        guard.bytes.drain(..overflow);
+        guard.truncated = true;
+    }
+}
+
+fn collect_output(drain: Option<OutputDrain>) -> BoundedOutput {
+    let Some(drain) = drain else {
+        return BoundedOutput::default();
+    };
+    let _ = drain.handle.join();
+    let output = drain.buffer.lock().unwrap().clone();
+    output
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1369,6 +1428,36 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains("Missing required param: content"));
+    }
+
+    #[test]
+    fn test_shell_large_stdout_drain_does_not_deadlock() {
+        let r = registry();
+        let started = std::time::Instant::now();
+        let result = r.execute(
+            "shell",
+            &json!({
+                "command": large_stdout_command(),
+                "timeout_ms": 30_000,
+            }),
+        );
+        assert!(result.success, "unexpected shell error: {:?}", result.error);
+        assert_eq!(result.output["exit_code"], 0);
+        assert_eq!(result.output["stdout_truncated"], true);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "large stdout command likely blocked on an OS pipe"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn large_stdout_command() -> String {
+        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand JABzAD0AJwBYACcAKgA4ADAAMAAwADAAOwAgAGYAbwByACAAKAAkAGkAPQAwADsAIAAkAGkAIAAtAGwAdAAgADMAMAA7ACAAJABpACsAKwApACAAewAgAFcAcgBpAHQAZQAtAE8AdQB0AHAAdQB0ACAAJABzACAAfQA=".into()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn large_stdout_command() -> String {
+        "i=0; while [ $i -lt 30 ]; do printf '%080000d\\n' 0; i=$((i+1)); done".into()
     }
 
     #[test]

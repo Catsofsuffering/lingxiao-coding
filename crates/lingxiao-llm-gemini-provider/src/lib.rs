@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use gemini_rust::{
     Content as GeminiContent, FinishReason as GeminiFinishReason,
     FunctionCall as GeminiFunctionCall, FunctionCallingMode, FunctionDeclaration, Gemini,
@@ -77,11 +78,7 @@ pub async fn execute_generate_content(
         builder = add_message(builder, message);
     }
     for tool in &request.tools {
-        builder = builder.with_function(FunctionDeclaration::new(
-            tool.name.clone(),
-            tool.description.clone(),
-            None,
-        ));
+        builder = builder.with_function(gemini_function_declaration(tool)?);
     }
     if !request.tools.is_empty() {
         builder = builder.with_function_calling_mode(FunctionCallingMode::Auto);
@@ -99,11 +96,43 @@ pub async fn execute_generate_content(
         builder = builder.with_stop_sequences(stop.clone());
     }
 
+    if request.stream {
+        let mut stream = match builder.execute_stream().await {
+            Ok(stream) => stream,
+            Err(error) => return Ok(vec![StreamEvent::Error(provider_error_from_gemini(error))]),
+        };
+        let mut events = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(response) => events.extend(response_to_stream_events(response)),
+                Err(error) => events.push(StreamEvent::Error(provider_error_from_gemini(error))),
+            }
+        }
+        if events.is_empty() {
+            events.push(StreamEvent::Error(ProviderError::new(
+                ProviderErrorCode::StreamInterrupted,
+                "Gemini streaming response ended without events",
+            )));
+        }
+        return Ok(events);
+    }
+
     let response = match builder.execute().await {
         Ok(response) => response,
         Err(error) => return Ok(vec![StreamEvent::Error(provider_error_from_gemini(error))]),
     };
     Ok(response_to_stream_events(response))
+}
+
+fn gemini_function_declaration(
+    tool: &lingxiao_llm_host_protocol::ToolDefinition,
+) -> Result<FunctionDeclaration, GeminiProviderError> {
+    serde_json::from_value(json!({
+        "name": tool.name.clone(),
+        "description": tool.description.clone(),
+        "parameters": tool.input_schema.clone(),
+    }))
+    .map_err(|error| GeminiProviderError::RequestBuild(error.to_string()))
 }
 
 fn resolved_config(request: &GenerateRequest) -> Result<(String, String), GeminiProviderError> {
@@ -217,24 +246,31 @@ fn response_to_stream_events(response: GenerationResponse) -> Vec<StreamEvent> {
 }
 
 fn extract_gemini_tool_calls(value: &Value) -> Vec<ToolCall> {
-    value
+    let mut calls = Vec::new();
+    for (candidate_index, candidate) in value
         .get("candidates")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .flat_map(|candidate| {
-            candidate
-                .get("content")
-                .and_then(|content| content.get("parts"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|part| {
+        .enumerate()
+    {
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
             let function_call = part
                 .get("functionCall")
-                .or_else(|| part.get("function_call"))?;
-            let name = function_call.get("name").and_then(Value::as_str)?;
+                .or_else(|| part.get("function_call"));
+            let Some(function_call) = function_call else {
+                continue;
+            };
+            let Some(name) = function_call.get("name").and_then(Value::as_str) else {
+                continue;
+            };
             let arguments = function_call
                 .get("args")
                 .or_else(|| function_call.get("arguments"))
@@ -244,14 +280,15 @@ fn extract_gemini_tool_calls(value: &Value) -> Vec<ToolCall> {
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("gemini_call_{name}"));
-            Some(ToolCall {
+                .unwrap_or_else(|| format!("gemini_call_{candidate_index}_{part_index}_{name}"));
+            calls.push(ToolCall {
                 id,
                 name: name.to_string(),
                 arguments,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    calls
 }
 
 fn map_finish_reason(reason: GeminiFinishReason) -> FinishReason {
@@ -380,7 +417,7 @@ mod tests {
                 ..Default::default()
             }],
             tools: Vec::new(),
-            stream: true,
+            stream: false,
             auth_context: AuthContext::ApiKey {
                 provider: "gemini".into(),
                 key: "AIza-test".into(),
@@ -512,6 +549,56 @@ mod tests {
             body_str.contains("list_dir"),
             "expected tool name 'list_dir' in the request body, got: {body_str}"
         );
+        let body_json: Value = serde_json::from_str(&body_str).unwrap();
+        let declarations = body_json["tools"][0]
+            .get("functionDeclarations")
+            .or_else(|| body_json["tools"][0].get("function_declarations"))
+            .and_then(Value::as_array)
+            .expect("function declarations must be present");
+        let declaration = &declarations[0];
+        assert_eq!(
+            declaration["parameters"]["properties"]["path"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn test_gemini_stream_true_uses_streaming_endpoint() {
+        use std::sync::{Arc, Mutex};
+        let captured_request: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_request_clone = captured_request.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request_bytes = read_http_request(&mut stream);
+            let request_str = String::from_utf8_lossy(&request_bytes).to_string();
+            *captured_request_clone.lock().unwrap() = Some(request_str);
+            let event = r#"{"candidates":[{"content":{"parts":[{"text":"stream-ok"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#;
+            let body = format!("data: {event}\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut request = sample_request(&format!("http://{addr}/v1beta/"));
+        request.stream = true;
+        let events = execute_generate_content_blocking(&request).unwrap();
+        handle.join().unwrap();
+        let request_str = captured_request.lock().unwrap().clone().unwrap();
+        assert!(
+            request_str
+                .starts_with("POST /v1beta/models/gemini-test:streamGenerateContent?alt=sse"),
+            "stream=true must use Gemini streamGenerateContent endpoint, got: {request_str}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "stream-ok")));
     }
 
     #[test]
@@ -586,5 +673,27 @@ mod tests {
         assert_eq!(tool_calls[0].name, "file_read");
         assert_eq!(tool_calls[0].arguments["path"], "src/main.rs");
         assert!(!tool_calls[0].id.is_empty(), "id must be non-empty");
+    }
+
+    #[test]
+    fn test_gemini_fallback_tool_call_ids_are_unique_for_same_name_calls() {
+        let response_json: serde_json::Value = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "file_read", "args": {"path": "a.txt"}}},
+                        {"functionCall": {"name": "file_read", "args": {"path": "b.txt"}}}
+                    ],
+                    "role": "model"
+                },
+                "finishReason": "STOP",
+                "index": 0
+            }]
+        });
+        let tool_calls = extract_gemini_tool_calls(&response_json);
+        assert_eq!(tool_calls.len(), 2);
+        assert_ne!(tool_calls[0].id, tool_calls[1].id);
+        assert_eq!(tool_calls[0].id, "gemini_call_0_0_file_read");
+        assert_eq!(tool_calls[1].id, "gemini_call_0_1_file_read");
     }
 }

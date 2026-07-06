@@ -63,7 +63,6 @@ fn test_stdio_session_create_input_snapshot() {
 
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-
     // GS-001 (Phase 1 subset): session.create → session.input → session.snapshot
     // Step 1: session.create
     let resp = send_and_recv(
@@ -584,7 +583,7 @@ fn test_stdio_user_task_completes_end_to_end() {
 }
 
 #[test]
-fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present() {
+fn test_stdio_real_openai_responses_tool_call_executes_canonical_tool_when_key_is_present() {
     let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
         eprintln!("skipping real OpenAI E2E: OPENAI_API_KEY is not set");
         return;
@@ -596,6 +595,13 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
 
     let (db_path, dir) = make_db_path();
     let db = db_path.to_string_lossy().to_string();
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let evidence_file = dir.path().join("live-evidence.txt");
+    std::fs::write(
+        &evidence_file,
+        "OPENAI_TOOL_E2E_FILE_CONTENT=canonical-file-read-ok",
+    )
+    .unwrap();
     let provider = std::env::current_exe()
         .unwrap()
         .parent()
@@ -621,7 +627,7 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
             "provider_id": "openai",
             "program": provider,
             "args": [],
-            "models": ["gpt-4o-mini"],
+            "models": [model.clone()],
             "timeout_ms": 120000
         }]
     });
@@ -639,43 +645,116 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
 
-    let cmd = serde_json::json!({
-        "request_id": "real-openai-1",
-        "method": "session.run_task",
+    let create_cmd = serde_json::json!({
+        "request_id": "real-openai-create",
+        "method": "session.create",
         "params": {
-            "content": "Reply with exactly: TASK_DONE_REAL_PROVIDER",
-            "task_id": "real-openai-task",
-            "workspace": db,
-            "model": "gpt-4o-mini",
+            "workspace": dir.path().display().to_string()
+        },
+        "actor": {"kind": "user"},
+        "submitted_at": 6000
+    });
+    let create = send_and_recv(&mut stdin, &mut reader, &create_cmd.to_string());
+    assert_eq!(create["success"], true, "session.create failed: {create:?}");
+    let session_id = create["events"][0]["payload"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let mut openai_metadata = serde_json::json!({"api": "responses"});
+    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+        if !base_url.trim().is_empty() {
+            openai_metadata["base_url"] = serde_json::Value::String(base_url);
+        }
+    }
+
+    let cmd = serde_json::json!({
+        "request_id": "real-openai-tool-1",
+        "method": "leader.run",
+        "params": {
+            "objective": "You must call the file_read tool exactly once with path \"live-evidence.txt\" before answering. After you observe the file content, answer with exactly: OPENAI_TOOL_E2E_FINAL canonical-file-read-ok",
+            "model": model.clone(),
             "provider": "openai",
+            "max_rounds": 4,
             "auth_context": {
                 "type": "ApiKey",
                 "provider": "openai",
                 "key": api_key
             },
             "options": {
-                "max_tokens": 16,
-                "temperature": 0.0
+                "max_tokens": 256,
+                "temperature": 0.0,
+                "metadata": openai_metadata
             }
         },
         "actor": {"kind": "user"},
-        "submitted_at": 6000
+        "session_id": session_id,
+        "submitted_at": 6001
     });
     let resp = send_and_recv(&mut stdin, &mut reader, &cmd.to_string());
-    assert_eq!(resp["success"], true, "session.run_task failed: {resp:?}");
+    assert_eq!(resp["success"], true, "leader.run failed: {resp:?}");
     assert_eq!(resp["result"]["status"], "completed");
     assert!(
         resp["result"]["answer"]
             .as_str()
             .unwrap_or_default()
-            .contains("TASK_DONE_REAL_PROVIDER"),
+            .contains("OPENAI_TOOL_E2E_FINAL canonical-file-read-ok"),
         "unexpected real provider answer: {}",
         resp["result"]["answer"]
     );
-    assert_eq!(
-        resp["events"].as_array().unwrap().last().unwrap()["event_type"],
-        "session.completed"
+    let event_types: Vec<_> = resp["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["event_type"].as_str())
+        .collect();
+    assert!(
+        event_types.contains(&"tool.call_initiated"),
+        "missing tool.call_initiated: {event_types:?}"
     );
+    assert!(
+        event_types.contains(&"tool.call_completed"),
+        "missing tool.call_completed: {event_types:?}"
+    );
+    assert!(
+        resp["result"]["observations"][0]["tool_name"] == "file_read",
+        "expected file_read observation: {resp:?}"
+    );
+
+    let debug_cmd = serde_json::json!({
+        "request_id": "real-openai-debug",
+        "method": "runtime.debug_dump",
+        "params": {},
+        "actor": {"kind": "user"},
+        "submitted_at": 6002
+    });
+    let debug = send_and_recv(&mut stdin, &mut reader, &debug_cmd.to_string());
+    assert_eq!(
+        debug["success"], true,
+        "runtime.debug_dump failed: {debug:?}"
+    );
+    assert_eq!(
+        debug["result"]["tool_calls_by_status"]["completed"], 1,
+        "expected completed canonical tool_calls row: {debug:?}"
+    );
+
+    let replay_cmd = serde_json::json!({
+        "request_id": "real-openai-replay",
+        "method": "event.replay",
+        "params": {"from_seq": 0, "limit": 100},
+        "actor": {"kind": "user"},
+        "session_id": session_id,
+        "submitted_at": 6003
+    });
+    let replay = send_and_recv(&mut stdin, &mut reader, &replay_cmd.to_string());
+    assert_eq!(replay["success"], true, "event.replay failed: {replay:?}");
+    let replay_types: Vec<_> = replay["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["event_type"].as_str())
+        .collect();
+    assert!(replay_types.contains(&"tool.call_initiated"));
+    assert!(replay_types.contains(&"tool.call_completed"));
 
     drop(stdin);
     let status = child.wait().expect("wait daemon");

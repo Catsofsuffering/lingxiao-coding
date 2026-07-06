@@ -61,6 +61,12 @@ pub fn execute_invoke_model_blocking(
 pub async fn execute_invoke_model(
     request: &GenerateRequest,
 ) -> Result<Vec<StreamEvent>, BedrockProviderError> {
+    if request.stream {
+        return Ok(vec![StreamEvent::Error(ProviderError::new(
+            ProviderErrorCode::UnsupportedModel,
+            "Bedrock streaming is not implemented by this provider; stream=true is unsupported",
+        ))]);
+    }
     let resolved = ResolvedBedrockConfig::from_request(request)?;
     let client = Client::from_conf(resolved.to_sdk_config());
     let body = build_invoke_body(request)?;
@@ -525,6 +531,20 @@ mod tests {
         assert!(matches!(
             ResolvedBedrockConfig::from_request(&request),
             Err(BedrockProviderError::UnsupportedAuth)
+        ));
+    }
+
+    #[test]
+    fn test_stream_true_returns_explicit_unsupported_error_without_invoking_model() {
+        let mut request = sample_request();
+        request.stream = true;
+        request.options.metadata = Some(json!({"endpoint_url": "http://127.0.0.1:9"}));
+
+        let events = execute_invoke_model_blocking(&request).unwrap();
+        assert!(matches!(
+            &events[0],
+            StreamEvent::Error(err)
+                if err.code == ProviderErrorCode::UnsupportedModel && !err.retryable
         ));
     }
 

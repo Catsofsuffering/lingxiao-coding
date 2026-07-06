@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 pub use lingxiao_llm_host_protocol::*;
+
+const EXTERNAL_PROCESS_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// Retry engine with exponential backoff and full jitter.
 #[derive(Debug, Clone)]
@@ -268,7 +270,10 @@ impl ExternalProcessProvider {
         }
         drop(child.stdin.take());
 
-        match child
+        let stdout_drain = child.stdout.take().map(spawn_external_output_drain);
+        let mut stderr_drain = child.stderr.take().map(spawn_external_output_drain);
+
+        let status = match child
             .wait_timeout(Duration::from_millis(timeout_ms))
             .map_err(|e| {
                 ProviderError::new(
@@ -276,30 +281,28 @@ impl ExternalProcessProvider {
                     format!("provider executor wait failed: {e}"),
                 )
             })? {
-            Some(_) => {}
+            Some(status) => status,
             None => {
                 let _ = child.kill();
-                let _ = child.wait_with_output();
+                let _ = child.wait();
+                let _ = collect_external_output(stdout_drain);
+                let _ = collect_external_output(stderr_drain.take());
                 return Err(ProviderError::new(
                     ProviderErrorCode::Timeout,
                     "provider executor timeout",
                 ));
             }
-        }
+        };
 
-        let output = child.wait_with_output().map_err(|e| {
-            ProviderError::new(
-                ProviderErrorCode::ServerError,
-                format!("provider executor output read failed: {e}"),
-            )
-        })?;
-        if !output.status.success() {
+        let stdout = collect_external_output(stdout_drain);
+        let stderr = collect_external_output(stderr_drain);
+        if !status.success() {
             return Err(ProviderError::new(
                 ProviderErrorCode::ServerError,
-                format!("provider executor exited with status {}", output.status),
+                provider_exit_message(status.to_string(), &stderr.bytes),
             ));
         }
-        String::from_utf8(output.stdout).map_err(|e| {
+        String::from_utf8(stdout.bytes).map_err(|e| {
             ProviderError::new(
                 ProviderErrorCode::StreamInterrupted,
                 format!("provider executor emitted non-utf8 stdout: {e}"),
@@ -381,6 +384,7 @@ impl LlmProvider for ExternalProcessProvider {
                 "provider executor stdout unavailable",
             )
         })?;
+        let mut stderr_drain = child.stderr.take().map(spawn_external_output_drain);
         let (tx, rx) = mpsc::channel();
         let reader = thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -418,8 +422,9 @@ impl LlmProvider for ExternalProcessProvider {
             }
             if started.elapsed() > Duration::from_millis(timeout_ms) {
                 let _ = child.kill();
-                let _ = child.wait_with_output();
+                let _ = child.wait();
                 let _ = reader.join();
+                let _ = collect_external_output(stderr_drain.take());
                 return Err(ProviderError::new(
                     ProviderErrorCode::Timeout,
                     "provider executor timeout",
@@ -434,27 +439,24 @@ impl LlmProvider for ExternalProcessProvider {
                 format!("provider executor wait failed: {e}"),
             )
         })? {
-            Some(_) => {}
+            Some(status) => {
+                let stderr = collect_external_output(stderr_drain.take());
+                if !status.success() {
+                    return Err(ProviderError::new(
+                        ProviderErrorCode::ServerError,
+                        provider_exit_message(status.to_string(), &stderr.bytes),
+                    ));
+                }
+            }
             None => {
                 let _ = child.kill();
-                let _ = child.wait_with_output();
+                let _ = child.wait();
+                let _ = collect_external_output(stderr_drain.take());
                 return Err(ProviderError::new(
                     ProviderErrorCode::Timeout,
                     "provider executor timeout",
                 ));
             }
-        }
-        let output = child.wait_with_output().map_err(|e| {
-            ProviderError::new(
-                ProviderErrorCode::ServerError,
-                format!("provider executor output read failed: {e}"),
-            )
-        })?;
-        if !output.status.success() {
-            return Err(ProviderError::new(
-                ProviderErrorCode::ServerError,
-                format!("provider executor exited with status {}", output.status),
-            ));
         }
         if emitted == 0 {
             return Err(ProviderError::new(
@@ -463,6 +465,65 @@ impl LlmProvider for ExternalProcessProvider {
             ));
         }
         Ok(())
+    }
+}
+
+struct ExternalOutputDrain {
+    buffer: Arc<Mutex<ExternalBoundedOutput>>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+struct ExternalBoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_external_output_drain<R>(mut reader: R) -> ExternalOutputDrain
+where
+    R: Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(ExternalBoundedOutput::default()));
+    let thread_buffer = Arc::clone(&buffer);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => append_external_output(&thread_buffer, &chunk[..n]),
+                Err(_) => break,
+            }
+        }
+    });
+    ExternalOutputDrain { buffer, handle }
+}
+
+fn append_external_output(buffer: &Arc<Mutex<ExternalBoundedOutput>>, bytes: &[u8]) {
+    let mut guard = buffer.lock().unwrap();
+    guard.bytes.extend_from_slice(bytes);
+    if guard.bytes.len() > EXTERNAL_PROCESS_OUTPUT_LIMIT {
+        let overflow = guard.bytes.len() - EXTERNAL_PROCESS_OUTPUT_LIMIT;
+        guard.bytes.drain(..overflow);
+        guard.truncated = true;
+    }
+}
+
+fn collect_external_output(drain: Option<ExternalOutputDrain>) -> ExternalBoundedOutput {
+    let Some(drain) = drain else {
+        return ExternalBoundedOutput::default();
+    };
+    let _ = drain.handle.join();
+    let output = drain.buffer.lock().unwrap().clone();
+    output
+}
+
+fn provider_exit_message(status: String, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let first_line = stderr.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() || first_line.contains("sk-") {
+        format!("provider executor exited with status {status}")
+    } else {
+        format!("provider executor exited with status {status}: {first_line}")
     }
 }
 
@@ -1734,6 +1795,34 @@ mod tests {
     }
 
     #[test]
+    fn test_external_process_provider_stream_drains_large_stderr() {
+        let provider = ExternalProcessProvider::new("external", powershell())
+            .with_args(vec![
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &write_large_stderr_stream_provider().to_string_lossy(),
+            ])
+            .with_timeout_ms(30_000);
+
+        let started = Instant::now();
+        let events = provider
+            .generate_stream(sample_request(true))
+            .expect("large stderr should not deadlock stream provider");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "provider likely blocked on stderr pipe"
+        );
+        assert!(matches!(&events[0], Ok(StreamEvent::TextDelta(text)) if text == "stderr-ok"));
+        assert!(matches!(
+            &events[1],
+            Ok(StreamEvent::Finished(FinishReason::Stop))
+        ));
+    }
+
+    #[test]
     fn test_external_process_provider_timeout() {
         let provider = ExternalProcessProvider::new("external", powershell())
             .with_args(vec![
@@ -1839,6 +1928,19 @@ $null = [Console]::In.ReadLine()
     reasoning_tokens = $null
   }
 } | ConvertTo-Json -Depth 8 -Compress
+@{ Finished = 'Stop' } | ConvertTo-Json -Compress
+"#,
+        )
+    }
+
+    fn write_large_stderr_stream_provider() -> PathBuf {
+        write_provider_script(
+            "large_stderr_stream_provider.ps1",
+            r#"
+$null = [Console]::In.ReadLine()
+$chunk = 'E' * 80000
+for ($i = 0; $i -lt 30; $i++) { [Console]::Error.WriteLine($chunk) }
+@{ TextDelta = 'stderr-ok' } | ConvertTo-Json -Compress
 @{ Finished = 'Stop' } | ConvertTo-Json -Compress
 "#,
         )

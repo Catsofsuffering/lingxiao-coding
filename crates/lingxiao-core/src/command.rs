@@ -100,6 +100,7 @@ const BUS_POP: &str = "bus.pop";
 const BUS_DEAD_LETTERS: &str = "bus.dead_letters";
 const COMMAND_DEDUPE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const DEFAULT_RETENTION_RETAIN_PER_SESSION: i64 = 1_000;
+const PERSISTED_TEXT_LIMIT: usize = 64 * 1024;
 const SCHEDULE_CREATE: &str = "schedule.create";
 const SCHEDULE_LIST: &str = "schedule.list";
 const SCHEDULE_FIRE: &str = "schedule.fire";
@@ -228,7 +229,7 @@ impl crate::agent::AgentContextStore for SqliteAgentContextStore {
                 agent_id,
                 agent_name,
                 &message.role,
-                &message.content,
+                persistable_conversation_content(&message.role, &message.content),
                 &message.tool_call_id,
                 now_ms() as f64 / 1000.0,
             ],
@@ -630,15 +631,20 @@ impl AgentLlmExecutor for RouterAgentLlmExecutor {
 
         let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
         let mut finish_reason = "unknown".to_string();
-        let mut tool_calls = Vec::new();
+        let mut model_tool_requests: Vec<ToolCall> = Vec::new();
+        let mut tool_accumulator = ToolCallAccumulator::new();
         for item in &stream {
             match item {
                 Ok(StreamEvent::ToolCall(call)) => {
-                    tool_calls.push(json!({
-                        "tool_call_id": call.id,
-                        "name": call.name,
-                        "arguments": call.arguments,
-                    }));
+                    if !model_tool_requests
+                        .iter()
+                        .any(|existing| existing.id == call.id)
+                    {
+                        model_tool_requests.push(call.clone());
+                    }
+                }
+                Ok(StreamEvent::ToolCallDelta(delta)) => {
+                    tool_accumulator.append(delta.clone());
                 }
                 Ok(StreamEvent::Usage(token_usage)) => {
                     usage = json!({
@@ -663,6 +669,17 @@ impl AgentLlmExecutor for RouterAgentLlmExecutor {
                 }
             }
         }
+        for call in tool_accumulator.finalize() {
+            if call.id.is_empty() && call.name.is_empty() {
+                continue;
+            }
+            if !model_tool_requests
+                .iter()
+                .any(|existing| existing.id == call.id)
+            {
+                model_tool_requests.push(call);
+            }
+        }
 
         let persist_result: std::result::Result<(), rusqlite::Error> =
             self.db.with_transaction(|tx| {
@@ -679,6 +696,18 @@ impl AgentLlmExecutor for RouterAgentLlmExecutor {
                     occurred_at,
                     &request_id,
                 )?);
+                let (model_tool_request_payloads, response_model_tool_requests) =
+                    persist_model_tool_requests_in_tx(
+                        tx,
+                        session_id,
+                        generation,
+                        actor.clone(),
+                        &request_id,
+                        &llm_call_id,
+                        &model_tool_requests,
+                        occurred_at,
+                        &mut events,
+                    )?;
                 events.push(simple_event(
                     tx,
                     session_id,
@@ -691,7 +720,8 @@ impl AgentLlmExecutor for RouterAgentLlmExecutor {
                         "agent_id": agent_id,
                         "finish_reason": finish_reason,
                         "usage": usage,
-                        "tool_calls": tool_calls,
+                        "model_tool_requests": model_tool_request_payloads,
+                        "tool_calls": response_model_tool_requests,
                     }),
                     occurred_at,
                     &request_id,
@@ -1194,8 +1224,12 @@ impl CommandRouter {
             .params
             .get("workspace")
             .and_then(|v| v.as_str())
-            .unwrap_or("/default")
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(default_workspace);
+        let workspace = match validate_session_workspace(&workspace) {
+            Ok(workspace) => workspace,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
         let session_id = cmd
             .params
             .get("session_id")
@@ -1287,7 +1321,11 @@ impl CommandRouter {
                     correlation_id: Some(cmd.request_id),
                 };
                 event.seq = next_seq;
-                insert_event(tx, &event)?;
+                let persisted_event = EventEnvelope {
+                    payload: redact_persistence_secrets(&event.payload),
+                    ..event.clone()
+                };
+                insert_event(tx, &persisted_event)?;
                 update_meta_seq(tx, &Some(session_id.clone()), next_seq)?;
 
                 let response = CommandResponse::with_event(
@@ -1417,7 +1455,11 @@ impl CommandRouter {
                     correlation_id: Some(cmd.request_id),
                 };
                 event.seq = next_seq;
-                insert_event(tx, &event)?;
+                let persisted_event = EventEnvelope {
+                    payload: redact_persistence_secrets(&event.payload),
+                    ..event.clone()
+                };
+                insert_event(tx, &persisted_event)?;
                 update_meta_seq(tx, &Some(session_id.clone()), next_seq)?;
 
                 // Write conversation record (same transaction)
@@ -1425,7 +1467,11 @@ impl CommandRouter {
                 tx.execute(
                     "INSERT INTO leader_conversation (session_id, role, content, timestamp) \
                      VALUES (?1, 'user', ?2, ?3)",
-                    params![session_id, content, insert_ts],
+                    params![
+                        session_id,
+                        persistable_conversation_content("user", &content),
+                        insert_ts
+                    ],
                 )?;
 
                 let response = CommandResponse::with_event(
@@ -1465,7 +1511,11 @@ impl CommandRouter {
                 CoreError::new(ErrorCode::InvalidTransition, "Missing task content"),
             );
         }
-        let workspace = string_param(&cmd, &["workspace"]).unwrap_or_else(|| "/default".into());
+        let workspace = string_param(&cmd, &["workspace"]).unwrap_or_else(default_workspace);
+        let workspace = match validate_session_workspace(&workspace) {
+            Ok(workspace) => workspace,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
         let model = string_param(&cmd, &["model"]).unwrap_or_else(|| "mock/model".into());
         let provider_id = string_param(&cmd, &["provider", "provider_id"]).unwrap_or_else(|| {
             if self.llm_router.is_some() {
@@ -1515,6 +1565,8 @@ impl CommandRouter {
         let mut realtime = Vec::new();
         let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
         let mut finish_reason = "unknown".to_string();
+        let mut model_tool_requests: Vec<ToolCall> = Vec::new();
+        let mut tool_accumulator = ToolCallAccumulator::new();
         for item in stream {
             match item {
                 Ok(StreamEvent::ThinkingDelta(text)) => realtime.push(json!({
@@ -1528,15 +1580,18 @@ impl CommandRouter {
                         "payload": {"text": text},
                     }));
                 }
-                Ok(StreamEvent::ToolCallDelta(delta)) => realtime.push(json!({
-                    "event_type": "realtime.llm.tool_call_delta",
-                    "payload": {
-                        "index": delta.index,
-                        "tool_call_id": delta.id,
-                        "name": delta.name,
-                        "args_delta": delta.partial_json,
-                    },
-                })),
+                Ok(StreamEvent::ToolCallDelta(delta)) => {
+                    realtime.push(json!({
+                        "event_type": "realtime.llm.tool_call_delta",
+                        "payload": {
+                            "index": delta.index,
+                            "tool_call_id": delta.id,
+                            "name": delta.name,
+                            "args_delta": delta.partial_json,
+                        },
+                    }));
+                    tool_accumulator.append(delta);
+                }
                 Ok(StreamEvent::Usage(token_usage)) => {
                     usage = json!({
                         "prompt_tokens": token_usage.prompt_tokens,
@@ -1548,7 +1603,14 @@ impl CommandRouter {
                 Ok(StreamEvent::Finished(reason)) => {
                     finish_reason = format!("{:?}", reason).to_lowercase();
                 }
-                Ok(StreamEvent::ToolCall(_)) => {}
+                Ok(StreamEvent::ToolCall(call)) => {
+                    if !model_tool_requests
+                        .iter()
+                        .any(|existing| existing.id == call.id)
+                    {
+                        model_tool_requests.push(call);
+                    }
+                }
                 Ok(StreamEvent::Error(err)) | Err(err) => {
                     return CommandResponse::err(
                         request_id,
@@ -1562,6 +1624,18 @@ impl CommandRouter {
                 }
             }
         }
+        for call in tool_accumulator.finalize() {
+            if call.id.is_empty() && call.name.is_empty() {
+                continue;
+            }
+            if !model_tool_requests
+                .iter()
+                .any(|existing| existing.id == call.id)
+            {
+                model_tool_requests.push(call);
+            }
+        }
+        let waiting_for_tool = !model_tool_requests.is_empty() || finish_reason == "toolcalls";
 
         let outcome: std::result::Result<CommandResponse, rusqlite::Error> =
             self.db.with_transaction(|tx| {
@@ -1627,18 +1701,28 @@ impl CommandRouter {
                 tx.execute(
                     "INSERT INTO leader_conversation (session_id, role, content, timestamp) \
                      VALUES (?1, 'user', ?2, ?3)",
-                    params![session_id, content, occurred_at as f64 / 1000.0],
+                    params![
+                        session_id,
+                        persistable_conversation_content("user", &content),
+                        occurred_at as f64 / 1000.0
+                    ],
                 )?;
                 tx.execute(
                     "INSERT INTO tasks \
                      (id, session_id, subject, description, status, run_generation, agent_type, \
                       assigned_agent, result, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, '', 'terminal', 1, 'core', 'core-runtime', ?4, ?5, ?5)",
+                     VALUES (?1, ?2, ?3, '', ?4, 1, 'core', 'core-runtime', ?5, ?6, ?6)",
                     params![
                         task_id,
                         session_id,
                         content,
-                        json!({"answer": answer, "finish_reason": finish_reason}).to_string(),
+                        if waiting_for_tool { "running" } else { "terminal" },
+                        json!({
+                            "answer": answer,
+                            "finish_reason": finish_reason,
+                            "waiting_for_tool": waiting_for_tool,
+                        })
+                        .to_string(),
                         occurred_at as f64 / 1000.0
                     ],
                 )?;
@@ -1689,6 +1773,19 @@ impl CommandRouter {
                     Some(request_id.clone()),
                     format!("session_run_task_llm_started_{session_id}_{task_id}"),
                 )?);
+                let llm_call_id = format!("llm_{task_id}");
+                let (model_tool_request_payloads, response_model_tool_requests) =
+                    persist_model_tool_requests_in_tx(
+                        tx,
+                        &session_id,
+                        generation,
+                        actor.clone(),
+                        &request_id,
+                        &llm_call_id,
+                        &model_tool_requests,
+                        occurred_at,
+                        &mut events,
+                    )?;
                 events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
@@ -1697,60 +1794,64 @@ impl CommandRouter {
                     actor.clone(),
                     json!({
                         "session_id": session_id,
-                        "llm_call_id": format!("llm_{task_id}"),
+                        "llm_call_id": llm_call_id,
                         "model": model,
                         "finish_reason": finish_reason,
                         "usage": usage,
+                        "model_tool_requests": model_tool_request_payloads,
                     }),
                     occurred_at,
                     Some(request_id.clone()),
                     Some(request_id.clone()),
                     format!("session_run_task_llm_finished_{session_id}_{task_id}"),
                 )?);
-                events.push(append_event_in_tx(
-                    tx,
-                    Some(session_id.clone()),
-                    generation,
-                    "task.completed",
-                    actor.clone(),
-                    json!({
-                        "session_id": session_id,
-                        "task_id": task_id,
-                        "run_generation": 1,
-                        "status": "terminal",
-                        "exit_reason": "completed",
-                        "result": {"answer": answer},
-                    }),
-                    occurred_at,
-                    Some(request_id.clone()),
-                    Some(request_id.clone()),
-                    format!("session_run_task_task_completed_{session_id}_{task_id}"),
-                )?);
-                tx.execute(
-                    "UPDATE sessions SET status = 'completed', summary = ?1 WHERE id = ?2",
-                    params![answer, session_id],
-                )?;
-                events.push(append_event_in_tx(
-                    tx,
-                    Some(session_id.clone()),
-                    generation,
-                    "session.completed",
-                    actor.clone(),
-                    json!({"session_id": session_id, "status": "completed"}),
-                    occurred_at,
-                    Some(request_id.clone()),
-                    Some(request_id.clone()),
-                    format!("session_run_task_session_completed_{session_id}_{request_id}"),
-                )?);
+                if !waiting_for_tool {
+                    events.push(append_event_in_tx(
+                        tx,
+                        Some(session_id.clone()),
+                        generation,
+                        "task.completed",
+                        actor.clone(),
+                        json!({
+                            "session_id": session_id,
+                            "task_id": task_id,
+                            "run_generation": 1,
+                            "status": "terminal",
+                            "exit_reason": "completed",
+                            "result": {"answer": answer},
+                        }),
+                        occurred_at,
+                        Some(request_id.clone()),
+                        Some(request_id.clone()),
+                        format!("session_run_task_task_completed_{session_id}_{task_id}"),
+                    )?);
+                    tx.execute(
+                        "UPDATE sessions SET status = 'completed', summary = ?1 WHERE id = ?2",
+                        params![answer, session_id],
+                    )?;
+                    events.push(append_event_in_tx(
+                        tx,
+                        Some(session_id.clone()),
+                        generation,
+                        "session.completed",
+                        actor.clone(),
+                        json!({"session_id": session_id, "status": "completed"}),
+                        occurred_at,
+                        Some(request_id.clone()),
+                        Some(request_id.clone()),
+                        format!("session_run_task_session_completed_{session_id}_{request_id}"),
+                    )?);
+                }
                 tx.execute(
                     "INSERT INTO llm_gateway_requests \
                      (trace_id, session_id, agent_id, agent_name, requested_model, selected_model, final_model, provider, status, prompt_tokens, completion_tokens, total_tokens, created_at) \
-                     VALUES (?1, ?2, '', 'core-runtime', ?3, ?3, ?3, ?4, 'completed', ?5, ?6, ?7, ?8)",
+                     VALUES (?1, ?2, '', 'core-runtime', ?3, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         format!("llm_{task_id}"),
                         session_id,
                         model,
                         provider_id,
+                        if waiting_for_tool { "model_tool_request" } else { "completed" },
                         usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                         usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                         usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1764,10 +1865,11 @@ impl CommandRouter {
                     json!({
                         "session_id": session_id,
                         "task_id": task_id,
-                        "status": "completed",
+                        "status": if waiting_for_tool { "waiting_for_tool" } else { "completed" },
                         "answer": answer,
                         "finish_reason": finish_reason,
                         "usage": usage,
+                        "model_tool_requests": response_model_tool_requests,
                         "realtime_events": realtime,
                     }),
                 );
@@ -5245,48 +5347,18 @@ impl CommandRouter {
                         model_tool_requests.push(call);
                     }
                 }
-                let mut model_tool_request_payloads = Vec::new();
-                let mut response_model_tool_requests = Vec::new();
-                for call in &model_tool_requests {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO tool_calls \
-                         (id, session_id, tool_name, tool_type, status, args_json, started_at, resource_usage_json) \
-                         VALUES (?1, ?2, ?3, 'model_tool_request', 'model_tool_request', ?4, ?5, ?6)",
-                        params![
-                            call.id,
-                            session_id,
-                            call.name,
-                            sanitized_persistence_value(&call.arguments).to_string(),
-                            occurred_at,
-                            json!({"llm_call_id": llm_call_id}).to_string()
-                        ],
-                    )?;
-                    let payload = json!({
-                        "llm_call_id": llm_call_id,
-                        "tool_call_id": call.id,
-                        "tool_name": call.name,
-                        "args": sanitized_persistence_value(&call.arguments),
-                        "status": "model_tool_request",
-                    });
-                    response_model_tool_requests.push(json!({
-                        "llm_call_id": llm_call_id,
-                        "tool_call_id": call.id,
-                        "tool_name": call.name,
-                        "args": call.arguments,
-                        "status": "model_tool_request",
-                    }));
-                    events.push(simple_event(
+                let (model_tool_request_payloads, response_model_tool_requests) =
+                    persist_model_tool_requests_in_tx(
                         tx,
                         &session_id,
                         generation,
-                        "llm.model_tool_request",
                         actor.clone(),
-                        payload.clone(),
-                        occurred_at,
                         &request_id,
-                    )?);
-                    model_tool_request_payloads.push(payload);
-                }
+                        &llm_call_id,
+                        &model_tool_requests,
+                        occurred_at,
+                        &mut events,
+                    )?;
 
                 events.push(simple_event(
                     tx,
@@ -6732,11 +6804,11 @@ impl CommandRouter {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let args = string_array_param(&cmd, "args");
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(&self.db, &session_id, string_param(&cmd, &["cwd"])) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -6756,7 +6828,7 @@ impl CommandRouter {
             bridge_id: bridge_id.clone(),
             program: std::path::PathBuf::from(program),
             args,
-            cwd,
+            cwd: Some(cwd),
             payload,
             timeout_ms,
         }) {
@@ -6818,11 +6890,11 @@ impl CommandRouter {
             );
         };
         let args = string_array_param(&cmd, "args");
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(&self.db, &session_id, string_param(&cmd, &["cwd"])) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -6834,29 +6906,18 @@ impl CommandRouter {
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
         let init_payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-        let init_result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:initialize"),
+        let start_result = match self.mcp_bridge.start_server(McpBridgeRequest {
+            bridge_id: server_id.clone(),
             program: std::path::PathBuf::from(&program),
             args: args.clone(),
-            cwd: cwd.clone(),
+            cwd: Some(cwd.clone()),
             payload: init_payload,
             timeout_ms,
         }) {
             Ok(result) => result,
             Err(error) => return mcp_bridge_error_response(request_id, error),
         };
-        let tools_result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:tools"),
-            program: std::path::PathBuf::from(&program),
-            args: args.clone(),
-            cwd: cwd.clone(),
-            payload: json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-            timeout_ms,
-        }) {
-            Ok(result) => result,
-            Err(error) => return mcp_bridge_error_response(request_id, error),
-        };
-        let tools = tools_result["response"]["result"]["tools"]
+        let tools = start_result.tools_response["result"]["tools"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -6864,9 +6925,9 @@ impl CommandRouter {
             "server_id": server_id,
             "program": program,
             "args": args,
-            "cwd": cwd.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "cwd": cwd.to_string_lossy().to_string(),
             "tools": tools,
-            "initialized": init_result["response"].clone(),
+            "initialized": start_result.initialized,
             "timeout_ms": timeout_ms,
         });
         self.persist_mcp_server_state(
@@ -6939,24 +7000,15 @@ impl CommandRouter {
                 )
             }
         };
-        let program = state["program"].as_str().unwrap_or("").to_string();
-        let args = state["args"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let cwd = state["cwd"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(
+            &self.db,
+            &session_id,
+            state["cwd"].as_str().map(str::to_string),
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -6969,19 +7021,16 @@ impl CommandRouter {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let timeout_ms = state["timeout_ms"].as_u64().unwrap_or(10_000);
-        let result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:call:{tool_name}"),
-            program: std::path::PathBuf::from(program),
-            args,
-            cwd,
-            payload: json!({
+        let result = match self.mcp_bridge.call_server(
+            &server_id,
+            json!({
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments}
             }),
             timeout_ms,
-        }) {
+        ) {
             Ok(result) => result,
             Err(error) => return mcp_bridge_error_response(request_id, error),
         };
@@ -6993,7 +7042,7 @@ impl CommandRouter {
             json!({
                 "server_id": server_id,
                 "tool_name": tool_name,
-                "response": result["response"].clone(),
+                "response": result,
             }),
         )
     }
@@ -7011,6 +7060,10 @@ impl CommandRouter {
         let key = format!("mcp_server:{server_id}");
         let occurred_at = now_ms();
         let actor = cmd.actor.clone();
+        let stop_result = match self.mcp_bridge.stop_server(&server_id) {
+            Ok(result) => result,
+            Err(error) => return mcp_bridge_error_response(request_id, error),
+        };
         let outcome: std::result::Result<CommandResponse, rusqlite::Error> =
             self.db.with_transaction(|tx| {
                 ensure_session_active(tx, &session_id, &request_id)?;
@@ -7025,7 +7078,7 @@ impl CommandRouter {
                     generation,
                     "mcp.server_stopped",
                     actor,
-                    json!({"server_id": server_id}),
+                    json!({"server_id": server_id, "exit_code": stop_result}),
                     occurred_at,
                     &request_id,
                 )?;
@@ -9035,7 +9088,8 @@ fn cache_idempotent_in_tx(
     response: &CommandResponse,
 ) -> Result<()> {
     prune_command_dedupe_in_tx(tx, now_ms() - COMMAND_DEDUPE_TTL_MS)?;
-    let json_str = serde_json::to_string(response)
+    let persistable_response = persistable_command_response(response);
+    let json_str = serde_json::to_string(&persistable_response)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     tx.execute(
         "INSERT OR REPLACE INTO command_dedupe \
@@ -9411,6 +9465,56 @@ fn workspace_scope_allows(workspace: &str, requested_scope: &str) -> bool {
     requested == root || requested.strip_prefix(root).is_ok()
 }
 
+fn default_workspace() -> String {
+    std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn validate_session_workspace(workspace: &str) -> std::result::Result<String, CoreError> {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(CoreError::permission_denied(
+            "Session workspace must be a non-empty filesystem path",
+        ));
+    }
+    let raw = std::path::Path::new(trimmed);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| CoreError::internal(format!("workspace cwd lookup failed: {error}")))?
+            .join(raw)
+    };
+    let normalized = normalize_permission_path(&absolute);
+    if is_filesystem_root(&normalized) {
+        return Err(CoreError::permission_denied(
+            "Session workspace cannot be a filesystem root",
+        ));
+    }
+    if let Ok(metadata) = std::fs::metadata(&normalized) {
+        if !metadata.is_dir() {
+            return Err(CoreError::permission_denied(
+                "Session workspace must be a directory",
+            ));
+        }
+    } else {
+        let parent = normalized
+            .parent()
+            .ok_or_else(|| CoreError::permission_denied("Session workspace parent is not valid"))?;
+        if !parent.exists() {
+            return Err(CoreError::permission_denied(
+                "Session workspace parent must exist",
+            ));
+        }
+    }
+    Ok(normalized.display().to_string())
+}
+
+fn is_filesystem_root(path: &std::path::Path) -> bool {
+    path.parent().is_none() || path.parent() == Some(path)
+}
+
 fn workspace_scoped_tool_args(
     db: &DbOwner,
     session_id: &str,
@@ -9514,6 +9618,43 @@ fn ensure_path_inside_session_workspace(
                 "workspace": workspace_root.display().to_string(),
             }),
             false,
+        ))
+    }
+}
+
+fn mcp_cwd_for_session(
+    db: &DbOwner,
+    session_id: &str,
+    requested_cwd: Option<String>,
+) -> std::result::Result<std::path::PathBuf, CoreError> {
+    let workspace = db
+        .conn()
+        .query_row(
+            "SELECT workspace FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| CoreError::internal(format!("workspace lookup failed: {error}")))?
+        .ok_or_else(|| CoreError::session_not_found(session_id.to_string()))?;
+    let workspace_root = normalize_permission_path(&workspace);
+    let raw_cwd = requested_cwd.unwrap_or_else(|| workspace_root.display().to_string());
+    if raw_cwd.chars().any(char::is_control) {
+        return Err(CoreError::permission_denied(
+            "MCP cwd contains control characters",
+        ));
+    }
+    let raw_path = std::path::Path::new(&raw_cwd);
+    let requested = if raw_path.is_absolute() {
+        normalize_permission_path(raw_path)
+    } else {
+        normalize_permission_path(workspace_root.join(raw_path))
+    };
+    if requested == workspace_root || requested.strip_prefix(&workspace_root).is_ok() {
+        Ok(requested)
+    } else {
+        Err(CoreError::permission_denied(
+            "MCP cwd is outside the session workspace",
         ))
     }
 }
@@ -10020,7 +10161,7 @@ fn append_leader_conversation_outside(
         params![
             session_id,
             role,
-            content,
+            persistable_conversation_content(role, content),
             tool_call_id,
             now_ms() as f64 / 1000.0,
         ],
@@ -10349,6 +10490,8 @@ fn persist_workflow_node_state(
     occurred_at: Timestamp,
 ) -> Result<()> {
     db.with_transaction(|tx| {
+        let persisted_output = redact_persistence_secrets(&result.output);
+        let persisted_error = result.error.as_deref().map(redact_secret_text);
         tx.execute(
             "INSERT INTO workflow_node_state \
              (execution_id, node_id, node_type, status, output_json, error, attempt, generation, started_at, completed_at, updated_at) \
@@ -10364,8 +10507,8 @@ fn persist_workflow_node_state(
                 result.node_id,
                 result.node_type,
                 result.status,
-                result.output.to_string(),
-                result.error,
+                persisted_output.to_string(),
+                persisted_error,
                 result.attempt,
                 occurred_at,
                 if result.success { Some(occurred_at) } else { None },
@@ -10388,13 +10531,15 @@ fn persist_agent_task_result(
         return Ok(());
     }
     let conn = db.conn();
+    let persisted_output = redact_persistence_secrets(output);
+    let persisted_error = error.map(redact_secret_text);
     conn.execute(
         "UPDATE tasks SET status = ?1, result = ?2, exit_reason = ?3, updated_at = ?4 \
          WHERE session_id = ?5 AND id = ?6",
         params![
             if success { "completed" } else { "failed" },
-            output.to_string(),
-            error,
+            persisted_output.to_string(),
+            persisted_error,
             now_ms() as f64 / 1000.0,
             session_id,
             task_id,
@@ -10999,7 +11144,7 @@ fn insert_agent_log(
             agent_role,
             task_id,
             event_type,
-            content,
+            persistable_log_content(content),
             occurred_at as f64 / 1000.0
         ],
     )?;
@@ -11397,6 +11542,71 @@ fn simple_event(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn persist_model_tool_requests_in_tx(
+    tx: &Transaction,
+    session_id: &str,
+    generation: Generation,
+    actor: Actor,
+    request_id: &str,
+    llm_call_id: &str,
+    model_tool_requests: &[ToolCall],
+    occurred_at: Timestamp,
+    events: &mut Vec<EventEnvelope>,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut event_payloads = Vec::new();
+    let mut response_payloads = Vec::new();
+    for call in model_tool_requests {
+        if call.id.is_empty() && call.name.is_empty() {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO tool_calls \
+             (id, session_id, tool_name, tool_type, status, args_json, started_at, resource_usage_json) \
+             VALUES (?1, ?2, ?3, 'model_tool_request', 'model_tool_request', ?4, ?5, ?6)",
+            params![
+                call.id,
+                session_id,
+                call.name,
+                sanitized_persistence_value(&call.arguments).to_string(),
+                occurred_at,
+                json!({"llm_call_id": llm_call_id}).to_string()
+            ],
+        )?;
+        let payload = json!({
+            "llm_call_id": llm_call_id,
+            "tool_call_id": call.id,
+            "tool_name": call.name,
+            "args": sanitized_persistence_value(&call.arguments),
+            "status": "model_tool_request",
+        });
+        response_payloads.push(json!({
+            "llm_call_id": llm_call_id,
+            "tool_call_id": call.id,
+            "tool_name": call.name,
+            "args": call.arguments,
+            "status": "model_tool_request",
+        }));
+        events.push(append_event_in_tx(
+            tx,
+            Some(session_id.to_string()),
+            generation,
+            "llm.model_tool_request",
+            actor.clone(),
+            payload.clone(),
+            occurred_at,
+            Some(request_id.to_string()),
+            Some(request_id.to_string()),
+            format!(
+                "llm_model_tool_request_{}_{}_{}",
+                session_id, llm_call_id, call.id
+            ),
+        )?);
+        event_payloads.push(payload);
+    }
+    Ok((event_payloads, response_payloads))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn begin_tool_call_in_tx(
     tx: &Transaction,
     session_id: &str,
@@ -11479,6 +11689,51 @@ fn sanitized_persistence_value(value: &Value) -> Value {
         "shape": shape,
         "serialized_bytes": serialized_len,
     })
+}
+
+fn persistable_conversation_content(role: &str, content: &str) -> String {
+    let redacted = redact_secret_text(content);
+    if role == "tool" {
+        bounded_persisted_text(&redacted)
+    } else {
+        redacted
+    }
+}
+
+fn persistable_log_content(content: &str) -> String {
+    let redacted = redact_secret_text(content);
+    bounded_persisted_text(&redacted)
+}
+
+fn bounded_persisted_text(text: &str) -> String {
+    if text.len() <= PERSISTED_TEXT_LIMIT {
+        return text.to_string();
+    }
+    json!({
+        "redaction": "omitted",
+        "reason": "persisted_text_limit",
+        "bytes": text.len(),
+        "fingerprint": stable_fingerprint(text),
+    })
+    .to_string()
+}
+
+fn persistable_command_response(response: &CommandResponse) -> CommandResponse {
+    let mut sanitized = response.clone();
+    sanitized.result = sanitized.result.as_ref().map(redact_persistence_secrets);
+    sanitized.events = sanitized
+        .events
+        .iter()
+        .map(|event| EventEnvelope {
+            payload: redact_persistence_secrets(&event.payload),
+            ..event.clone()
+        })
+        .collect();
+    if let Some(error) = sanitized.error.as_mut() {
+        error.message = redact_secret_text(&error.message);
+        error.details = error.details.as_ref().map(redact_persistence_secrets);
+    }
+    sanitized
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11576,7 +11831,13 @@ fn redact_persistence_secrets(value: &Value) -> Value {
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .map(|(key, value)| (key.clone(), redact_persistence_secrets(value)))
+                .map(|(key, value)| {
+                    if is_secret_field_name(key) {
+                        (key.clone(), json!("[redacted]"))
+                    } else {
+                        (key.clone(), redact_persistence_secrets(value))
+                    }
+                })
                 .collect(),
         ),
         other => other.clone(),
@@ -11584,9 +11845,30 @@ fn redact_persistence_secrets(value: &Value) -> Value {
 }
 
 fn redact_secret_text(text: &str) -> String {
-    let mut redacted = redact_prefixed_secret(text, "sk-");
+    let mut redacted = redact_bearer_tokens(text);
+    redacted = redact_prefixed_secret(&redacted, "sk-");
     redacted = redact_prefixed_secret(&redacted, "AKIA");
     redact_prefixed_secret(&redacted, "ASIA")
+}
+
+fn is_secret_field_name(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "api_key"
+            | "apikey"
+            | "access_token"
+            | "refresh_token"
+            | "bearer_token"
+            | "authorization"
+            | "auth_context"
+            | "password"
+            | "secret"
+            | "credential"
+            | "credentials"
+    ) || lower.ends_with("_secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("_key")
 }
 
 fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
@@ -11601,6 +11883,29 @@ fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
                     || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '<' | '>')
             })
             .map(|relative_end| start + relative_end)
+            .unwrap_or(text.len());
+        output.push_str("[redacted]");
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn redact_bearer_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let lower = text.to_ascii_lowercase();
+    const PREFIX: &str = "bearer ";
+    while let Some(relative_start) = lower[cursor..].find(PREFIX) {
+        let start = cursor + relative_start;
+        let token_start = start + PREFIX.len();
+        output.push_str(&text[cursor..token_start]);
+        let end = text[token_start..]
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '<' | '>')
+            })
+            .map(|relative_end| token_start + relative_end)
             .unwrap_or(text.len());
         output.push_str("[redacted]");
         cursor = end;
@@ -11887,6 +12192,58 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct DeltaThenToolCallProvider;
+
+    impl LlmProvider for DeltaThenToolCallProvider {
+        fn provider_id(&self) -> &'static str {
+            "delta-tool"
+        }
+
+        fn supports_model(&self, model_id: &str) -> bool {
+            model_id == "delta-tool/model"
+        }
+
+        fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<GenerateResponse, ProviderError> {
+            Ok(GenerateResponse {
+                content: String::new(),
+                finish_reason: "toolcalls".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<Vec<std::result::Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            Ok(vec![
+                Ok(StreamEvent::ToolCallDelta(crate::llm::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_read_live".into()),
+                    name: Some("file_read".into()),
+                    partial_json: Some(r#"{"path":"live-evidence.txt"}"#.into()),
+                })),
+                Ok(StreamEvent::ToolCall(crate::llm::ToolCall {
+                    id: "call_read_live".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path": "live-evidence.txt"}),
+                })),
+                Ok(StreamEvent::Finished(crate::llm::FinishReason::ToolCalls)),
+            ])
+        }
+    }
+
+    #[derive(Debug)]
     struct ToolReadThenFinalProvider {
         path: String,
         calls: AtomicUsize,
@@ -12107,45 +12464,58 @@ $response | ConvertTo-Json -Depth 8 -Compress
         write_script(
             "mcp_bridge.ps1",
             r#"
-$line = [Console]::In.ReadLine()
-$req = $line | ConvertFrom-Json
-if ($req.method -eq 'initialize') {
+$count = 0
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  $count = $count + 1
+  $req = $line | ConvertFrom-Json
+  if ($req.method -eq 'initialize') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $req.id
+      result = @{
+        protocolVersion = '2024-11-05'
+        serverInfo = @{ name = 'fake-mcp'; version = '1.0.0' }
+        capabilities = @{ tools = @{} }
+      }
+    }
+    $response | ConvertTo-Json -Depth 8 -Compress
+    continue
+  }
+  if ($req.method -eq 'tools/call') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $req.id
+      result = @{
+        content = @(@{ type = 'text'; text = "echo:$($req.params.arguments.value):count=$count" })
+        isError = $false
+      }
+    }
+    $response | ConvertTo-Json -Depth 8 -Compress
+    continue
+  }
   $response = @{
     jsonrpc = '2.0'
     id = $req.id
     result = @{
-      protocolVersion = '2024-11-05'
-      serverInfo = @{ name = 'fake-mcp'; version = '1.0.0' }
-      capabilities = @{ tools = @{} }
+      tools = @(@{
+        name = 'echo'
+        description = 'test tool'
+        inputSchema = @{ type = 'object' }
+      })
     }
   }
   $response | ConvertTo-Json -Depth 8 -Compress
-  exit 0
 }
-if ($req.method -eq 'tools/call') {
-  $response = @{
-    jsonrpc = '2.0'
-    id = $req.id
-    result = @{
-      content = @(@{ type = 'text'; text = "echo:$($req.params.arguments.value)" })
-      isError = $false
+"#,
+        )
     }
-  }
-  $response | ConvertTo-Json -Depth 8 -Compress
-  exit 0
-}
-$response = @{
-  jsonrpc = '2.0'
-  id = $req.id
-  result = @{
-    tools = @(@{
-      name = 'echo'
-      description = 'test tool'
-      inputSchema = @{ type = 'object' }
-    })
-  }
-}
-$response | ConvertTo-Json -Depth 8 -Compress
+
+    fn write_mcp_sleep_script() -> PathBuf {
+        write_script(
+            "mcp_sleep.ps1",
+            r#"
+$null = [Console]::In.ReadLine()
+Start-Sleep -Seconds 3
 "#,
         )
     }
@@ -12804,11 +13174,12 @@ $response | ConvertTo-Json -Depth 8 -Compress
     #[test]
     fn test_mcp_bridge_invokes_stdio_json_without_leaking_params() {
         let script = write_mcp_bridge_script();
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
         assert_success(&router.dispatch(make_cmd(
             "session.create",
             None,
-            json!({"session_id": "sess-mcp", "workspace": "/tmp/ws"}),
+            json!({"session_id": "sess-mcp", "workspace": workspace.path().display().to_string()}),
             None,
         )));
         grant_tool(&router, "sess-mcp", "mcp", "perm-mcp");
@@ -12847,13 +13218,54 @@ $response | ConvertTo-Json -Depth 8 -Compress
     }
 
     #[test]
-    fn test_mcp_server_lifecycle_lists_calls_and_stops_fake_stdio_server() {
-        let script = write_mcp_bridge_script();
+    fn test_mcp_bridge_timeout_marks_owned_process_failed() {
+        let script = write_mcp_sleep_script();
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
         assert_success(&router.dispatch(make_cmd(
             "session.create",
             None,
-            json!({"session_id": "sess-mcp-life", "workspace": "/tmp/ws"}),
+            json!({
+                "session_id": "sess-mcp-timeout",
+                "workspace": workspace.path().display().to_string()
+            }),
+            None,
+        )));
+        grant_tool(&router, "sess-mcp-timeout", "mcp", "perm-mcp-timeout");
+        let response = router.dispatch(make_cmd(
+            "mcp.bridge",
+            Some("sess-mcp-timeout"),
+            json!({
+                "bridge_id": "mcp-timeout",
+                "program": powershell().display().to_string(),
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script.display().to_string()],
+                "payload": {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                "timeout_ms": 50
+            }),
+            None,
+        ));
+        assert_error_code(&response, ErrorCode::InvalidTransition);
+        assert!(response.error.as_ref().unwrap().retryable);
+        let conn = router.db.conn();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM owned_processes WHERE id = 'mcp:mcp-timeout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn test_mcp_server_lifecycle_lists_calls_and_stops_fake_stdio_server() {
+        let script = write_mcp_bridge_script();
+        let workspace = tempfile::tempdir().unwrap();
+        let router = setup_router();
+        assert_success(&router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"session_id": "sess-mcp-life", "workspace": workspace.path().display().to_string()}),
             None,
         )));
         grant_tool(&router, "sess-mcp-life", "mcp", "perm-mcp-life");
@@ -12895,7 +13307,7 @@ $response | ConvertTo-Json -Depth 8 -Compress
         assert_eq!(called.events[0].event_type, "mcp.tool_called");
         assert_eq!(
             called.result.as_ref().unwrap()["response"]["result"]["content"][0]["text"],
-            "echo:hello"
+            "echo:hello:count=3"
         );
         assert!(!called.events[0].payload.to_string().contains("hello"));
 
@@ -12923,10 +13335,11 @@ $response | ConvertTo-Json -Depth 8 -Compress
     #[test]
     fn test_session_create_generates_sessions_row_and_event() {
         let router = setup_router();
+        let workspace = tempfile::tempdir().unwrap();
         let cmd = make_cmd(
             "session.create",
             None,
-            json!({"workspace": "/tmp/test-ws"}),
+            json!({"workspace": workspace.path().display().to_string()}),
             None,
         );
 
@@ -12942,7 +13355,15 @@ $response | ConvertTo-Json -Depth 8 -Compress
             .as_str()
             .unwrap()
             .starts_with("sess_"));
-        assert_eq!(event.payload["workspace"], "/tmp/test-ws");
+        assert_eq!(
+            event.payload["workspace"],
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
 
         let sid = event.payload["session_id"].as_str().unwrap().to_string();
         drop(resp);
@@ -12960,6 +13381,25 @@ $response | ConvertTo-Json -Depth 8 -Compress
 
         let latest = router.event_log.latest_seq(&sid).unwrap();
         assert_eq!(latest, 1);
+    }
+
+    #[test]
+    fn test_session_create_rejects_filesystem_root_workspace() {
+        let router = setup_router();
+        let cwd = std::env::current_dir().unwrap();
+        let root = cwd
+            .ancestors()
+            .find(|path| is_filesystem_root(path))
+            .unwrap()
+            .display()
+            .to_string();
+        let resp = router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"session_id": "sess-root-workspace", "workspace": root}),
+            None,
+        ));
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
     }
 
     #[test]
@@ -15871,6 +16311,141 @@ $response | ConvertTo-Json -Depth 8 -Compress
     }
 
     #[test]
+    fn test_session_run_task_records_model_tool_request_and_does_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("live-evidence.txt"), "evidence").unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(DeltaThenToolCallProvider));
+        let router = setup_router().with_llm_router(LlmRouter::new(registry));
+
+        let resp = router.dispatch(make_cmd(
+            "session.run_task",
+            None,
+            json!({
+                "content": "read live-evidence.txt",
+                "task_id": "run-task-tool-request",
+                "workspace": dir.path().display().to_string(),
+                "model": "delta-tool/model"
+            }),
+            None,
+        ));
+
+        assert_success(&resp);
+        let result = resp.result.as_ref().unwrap();
+        let sid = result["session_id"].as_str().unwrap().to_string();
+        assert_eq!(result["status"], "waiting_for_tool");
+        assert_eq!(result["answer"], "");
+        assert_eq!(result["finish_reason"], "toolcalls");
+        assert_eq!(
+            result["model_tool_requests"][0]["tool_call_id"],
+            "call_read_live"
+        );
+        assert!(resp
+            .events
+            .iter()
+            .any(|event| event.event_type == "llm.model_tool_request"));
+        assert!(!resp
+            .events
+            .iter()
+            .any(|event| event.event_type == "tool.call_completed"));
+        assert!(!resp
+            .events
+            .iter()
+            .any(|event| event.event_type == "task.completed"));
+        assert!(!resp
+            .events
+            .iter()
+            .any(|event| event.event_type == "session.completed"));
+
+        let conn = router.db.conn();
+        let session_status: String = conn
+            .query_row(
+                "SELECT status FROM sessions WHERE id = ?1",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_status, "active");
+        let task_status: String = conn
+            .query_row(
+                "SELECT status FROM tasks WHERE id = 'run-task-tool-request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_status, "running");
+        let tool_status: String = conn
+            .query_row(
+                "SELECT status FROM tool_calls WHERE id = 'call_read_live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_status, "model_tool_request");
+        let completed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE event_type IN ('task.completed', 'session.completed', 'tool.call_completed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_count, 0);
+    }
+
+    #[test]
+    fn test_router_agent_llm_executor_records_model_tool_request_rows() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(DeltaThenToolCallProvider));
+        let router = setup_router().with_llm_router(LlmRouter::new(registry));
+        let sid = create_session(&router);
+        let executor = RouterAgentLlmExecutor::new(
+            router.db.clone(),
+            router.llm_router.as_ref().unwrap().clone(),
+            Arc::clone(&router.runtime_manager),
+        );
+        let request = GenerateRequest {
+            model: "delta-tool/model".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: "read file".into(),
+                ..Default::default()
+            }],
+            tools: vec![],
+            stream: true,
+            auth_context: AuthContext::None,
+            options: RequestOptions::default(),
+        };
+        let mut emitted = Vec::new();
+        executor
+            .stream_llm(&sid, "agent-audit", "Audit Agent", request, &mut |event| {
+                emitted.push(event);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(emitted
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::ToolCall(_)))));
+        let conn = router.db.conn();
+        let tool_status: String = conn
+            .query_row(
+                "SELECT status FROM tool_calls WHERE id = 'call_read_live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_status, "model_tool_request");
+        let model_request_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log WHERE event_type = 'llm.model_tool_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(model_request_events, 1);
+    }
+
+    #[test]
     fn test_session_run_task_without_router_rejects_in_production_mode() {
         let router = setup_router().without_mock_llm_fallback();
         let resp = router.dispatch(make_cmd(
@@ -17301,6 +17876,112 @@ $response | ConvertTo-Json -Depth 8 -Compress
         };
         assert!(!event_payloads.contains("sk-test-secret"));
         assert!(event_payloads.contains("\"redaction\":\"omitted\""));
+    }
+
+    #[test]
+    fn test_sensitive_sqlite_tables_redact_obvious_secrets() {
+        let ws = tempfile::tempdir().unwrap();
+        let secret_file = ws.path().join("agent-secret.txt");
+        std::fs::write(&secret_file, "sk-test-secret\nBearer live-token").unwrap();
+
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ToolReadThenFinalProvider {
+            path: secret_file.display().to_string(),
+            calls: AtomicUsize::new(0),
+        }));
+        let router = setup_router().with_llm_router(LlmRouter::new(registry));
+        let sid = create_session_with_workspace(&router, ws.path());
+
+        assert_success(&router.dispatch(make_cmd(
+            "session.input",
+            Some(&sid),
+            json!({"content": "user provided sk-test-secret and Bearer live-token"}),
+            Some("secret-input-idem"),
+        )));
+
+        assert_success(&router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-secret-cache",
+                "tool_name": "file_read",
+                "tool_type": "native",
+                "args": {
+                    "path": "agent-secret.txt",
+                    "api_key": "sk-test-secret"
+                }
+            }),
+            Some("secret-tool-idem"),
+        )));
+
+        assert_success(&router.dispatch(make_cmd(
+            "workflow.execute",
+            Some(&sid),
+            json!({
+                "workflow_id": "wf-secret-agent",
+                "execution_id": "we-secret-agent",
+                "nodes": [{
+                    "id": "agent-secret",
+                    "type": "agent",
+                    "agent_id": "agent-secret",
+                    "agent_name": "Secret Agent",
+                    "model": "tool-read/model",
+                    "task": "Read the secret file.",
+                    "max_rounds": 3
+                }]
+            }),
+            None,
+        )));
+
+        router
+            .db
+            .with_transaction(|tx| {
+                insert_agent_log(
+                    tx,
+                    &sid,
+                    "agent-secret",
+                    "Secret Agent",
+                    "worker",
+                    "task-secret",
+                    "agent.test_secret",
+                    "agent log sk-test-secret Bearer live-token",
+                    now_ms(),
+                )
+            })
+            .unwrap();
+
+        let conn = router.db.conn();
+        for (table, column) in [
+            ("leader_conversation", "content"),
+            ("agent_conversation", "content"),
+            ("agent_logs", "content"),
+            ("tool_calls", "args_json"),
+            ("tool_calls", "result_json"),
+            ("event_log", "payload"),
+            ("command_dedupe", "response_json"),
+            ("workflow_node_state", "output_json"),
+            ("tasks", "result"),
+        ] {
+            let text = sqlite_column_texts(&conn, table, column);
+            assert!(
+                !text.contains("sk-test-secret"),
+                "{table}.{column} leaked sk-test-secret: {text}"
+            );
+            assert!(
+                !text.contains("live-token"),
+                "{table}.{column} leaked bearer token body: {text}"
+            );
+        }
+    }
+
+    fn sqlite_column_texts(conn: &rusqlite::Connection, table: &str, column: &str) -> String {
+        let sql = format!("SELECT COALESCE({column}, '') FROM {table}");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
     }
 
     #[test]
