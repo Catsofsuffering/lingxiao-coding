@@ -615,13 +615,26 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
         return;
     }
 
+    let model = std::env::var("OPENAI_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_kind = std::env::var("OPENAI_API_KIND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "chat".to_string());
+
     let config_path = dir.path().join("real_openai_runtime.json");
     let config = serde_json::json!({
         "llm_providers": [{
             "provider_id": "openai",
             "program": provider,
             "args": [],
-            "models": ["gpt-4o-mini"],
+            "models": [model],
             "timeout_ms": 120000
         }]
     });
@@ -646,7 +659,7 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
             "content": "Reply with exactly: TASK_DONE_REAL_PROVIDER",
             "task_id": "real-openai-task",
             "workspace": db,
-            "model": "gpt-4o-mini",
+            "model": model,
             "provider": "openai",
             "auth_context": {
                 "type": "ApiKey",
@@ -655,7 +668,11 @@ fn test_stdio_user_task_completes_with_real_openai_provider_when_key_is_present(
             },
             "options": {
                 "max_tokens": 16,
-                "temperature": 0.0
+                "temperature": 0.0,
+                "metadata": {
+                    "base_url": base_url,
+                    "api": api_kind
+                }
             }
         },
         "actor": {"kind": "user"},

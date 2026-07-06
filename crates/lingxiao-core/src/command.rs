@@ -3415,14 +3415,18 @@ impl CommandRouter {
 
             let mut assistant_text = String::new();
             let mut tool_calls = Vec::new();
+            let mut tool_call_accumulator = ToolCallAccumulator::new();
             for event in stream {
                 match event {
                     Ok(StreamEvent::TextDelta(text)) => assistant_text.push_str(&text),
                     Ok(StreamEvent::ToolCall(tool_call)) => tool_calls.push(tool_call),
-                    Ok(StreamEvent::Finished(_))
-                    | Ok(StreamEvent::ThinkingDelta(_))
-                    | Ok(StreamEvent::ToolCallDelta(_))
-                    | Ok(StreamEvent::Usage(_)) => {}
+                    Ok(StreamEvent::ToolCallDelta(delta)) => tool_call_accumulator.append(delta),
+                    Ok(StreamEvent::Finished(reason)) => {
+                        if matches!(reason, crate::llm::FinishReason::ToolCalls) {
+                            tool_calls.extend(tool_call_accumulator.finalize());
+                        }
+                    }
+                    Ok(StreamEvent::ThinkingDelta(_)) | Ok(StreamEvent::Usage(_)) => {}
                     Ok(StreamEvent::Error(error)) | Err(error) => {
                         return CommandResponse::err(
                             request_id,
@@ -3436,6 +3440,8 @@ impl CommandRouter {
                     }
                 }
             }
+            tool_calls.extend(tool_call_accumulator.finalize());
+            dedupe_tool_calls_by_id(&mut tool_calls);
             append_leader_conversation_outside(
                 &self.db,
                 &session_id,
@@ -10053,6 +10059,11 @@ fn leader_tool_observation(tool_call: &ToolCall, response: &CommandResponse) -> 
     })
 }
 
+fn dedupe_tool_calls_by_id(tool_calls: &mut Vec<ToolCall>) {
+    let mut seen = std::collections::HashSet::new();
+    tool_calls.retain(|call| seen.insert(call.id.clone()));
+}
+
 fn session_status_from_str(s: &str) -> SessionStatus {
     match s {
         "created" => SessionStatus::Created,
@@ -11938,6 +11949,74 @@ mod tests {
             Ok(vec![
                 Ok(StreamEvent::TextDelta(
                     "final answer verified from file".into(),
+                )),
+                Ok(StreamEvent::Finished(crate::llm::FinishReason::Stop)),
+            ])
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeltaToolReadThenFinalProvider {
+        path: String,
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for DeltaToolReadThenFinalProvider {
+        fn provider_id(&self) -> &'static str {
+            "delta-tool-read-final"
+        }
+
+        fn supports_model(&self, model_id: &str) -> bool {
+            model_id == "delta-tool-read/model"
+        }
+
+        fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<GenerateResponse, ProviderError> {
+            Ok(GenerateResponse {
+                content: "verified".into(),
+                finish_reason: "stop".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<Vec<std::result::Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if call == 0 {
+                return Ok(vec![
+                    Ok(StreamEvent::ToolCallDelta(crate::llm::ToolCallDelta {
+                        index: 0,
+                        id: Some("delta-read-verification-file".into()),
+                        name: Some("file_read".into()),
+                        partial_json: Some(format!(
+                            r#"{{"path":{}"#,
+                            serde_json::to_string(&self.path).unwrap()
+                        )),
+                    })),
+                    Ok(StreamEvent::ToolCallDelta(crate::llm::ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        name: None,
+                        partial_json: Some("}".into()),
+                    })),
+                    Ok(StreamEvent::Finished(crate::llm::FinishReason::ToolCalls)),
+                ]);
+            }
+            Ok(vec![
+                Ok(StreamEvent::TextDelta(
+                    "final answer verified from delta tool".into(),
                 )),
                 Ok(StreamEvent::Finished(crate::llm::FinishReason::Stop)),
             ])
@@ -14513,6 +14592,46 @@ $response | ConvertTo-Json -Depth 8 -Compress
             .events
             .iter()
             .any(|event| event.event_type == "tool.call_completed"));
+    }
+
+    #[test]
+    fn test_leader_run_accumulates_delta_only_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("leader-delta-read.txt");
+        fs::write(&file_path, "leader delta observed evidence").unwrap();
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(DeltaToolReadThenFinalProvider {
+            path: file_path.display().to_string(),
+            calls: AtomicUsize::new(0),
+        }));
+        let router = CommandRouter::new(db).with_llm_router(LlmRouter::new(registry));
+        let sid = create_session_with_workspace(&router, dir.path());
+
+        let ran = router.dispatch(make_cmd(
+            "leader.run",
+            Some(&sid),
+            json!({
+                "model": "delta-tool-read/model",
+                "objective": "Read the file from delta-only tool stream and finalize.",
+                "max_rounds": 3
+            }),
+            None,
+        ));
+
+        assert_success(&ran);
+        let result = ran.result.as_ref().unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["answer"], "final answer verified from delta tool");
+        assert_eq!(
+            result["observations"][0]["result"]["content"],
+            "leader delta observed evidence"
+        );
+        assert!(ran.events.iter().any(|event| {
+            event.event_type == "tool.call_completed"
+                && event.payload["tool_call_id"] == "delta-read-verification-file"
+        }));
     }
 
     #[test]
