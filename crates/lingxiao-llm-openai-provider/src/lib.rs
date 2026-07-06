@@ -1533,7 +1533,7 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
                 },
                 Message {
                     role: "assistant".into(),
-                    content: String::new(),
+                    content: "I will read the file.".into(),
                     tool_calls: vec![ProtocolToolCall {
                         id: "call_xyz".into(),
                         name: "file_read".into(),
@@ -1596,12 +1596,28 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         // Message[0] = user, [1] = assistant with tool_calls, [2] = tool result.
         let assistant = &msgs[1];
         assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "I will read the file.");
         let tool_calls = assistant["tool_calls"]
             .as_array()
             .expect("assistant must have tool_calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["id"], "call_xyz");
         assert_eq!(tool_calls[0]["function"]["name"], "file_read");
+    }
+
+    #[test]
+    fn test_responses_input_preserves_assistant_content_with_tool_calls() {
+        let request = sample_history_request("http://localhost:1234/v1");
+        let input = responses_input(&request);
+        let items = input.as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["type"] == "function_call"
+                && item["call_id"] == "call_xyz"
+                && item["name"] == "file_read"
+        }));
+        assert!(items.iter().any(|item| {
+            item["role"] == "assistant" && item["content"] == "I will read the file."
+        }));
     }
 
     #[test]

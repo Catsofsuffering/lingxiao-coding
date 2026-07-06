@@ -160,6 +160,7 @@ where
         Err(error) => return sink(StreamEvent::Error(provider_error_from_anthropic(error))),
     };
     let mut tool_blocks: Vec<Option<(String, String, String)>> = Vec::new();
+    let mut finished_emitted = false;
     while let Some(event) = stream.next().await {
         let event = match event {
             Ok(event) => event,
@@ -168,9 +169,28 @@ where
                 continue;
             }
         };
-        for protocol_event in anthropic_stream_event_to_events(event, &mut tool_blocks) {
-            sink(protocol_event)?;
+        emit_anthropic_stream_events(event, &mut tool_blocks, &mut finished_emitted, sink)?;
+    }
+    Ok(())
+}
+
+fn emit_anthropic_stream_events<F>(
+    event: MessageStreamEvent,
+    tool_blocks: &mut Vec<Option<(String, String, String)>>,
+    finished_emitted: &mut bool,
+    sink: &mut F,
+) -> Result<(), AnthropicProviderError>
+where
+    F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
+{
+    for protocol_event in anthropic_stream_event_to_events(event, tool_blocks) {
+        if matches!(protocol_event, StreamEvent::Finished(_)) {
+            if *finished_emitted {
+                continue;
+            }
+            *finished_emitted = true;
         }
+        sink(protocol_event)?;
     }
     Ok(())
 }
@@ -844,6 +864,7 @@ fn redact_error_message(message: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anthropic_sdk::{MessageDelta, MessageDeltaUsage};
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1057,6 +1078,55 @@ mod tests {
                 if call.id == "toolu_1"
                     && call.name == "file_read"
                     && call.arguments["path"] == "README.md"
+        ));
+    }
+
+    #[test]
+    fn test_anthropic_stream_does_not_emit_double_finished() {
+        let mut tool_blocks = Vec::new();
+        let mut finished_emitted = false;
+        let mut events = Vec::new();
+        emit_anthropic_stream_events(
+            MessageStreamEvent::MessageDelta {
+                delta: MessageDelta {
+                    stop_reason: Some(StopReason::ToolUse),
+                    stop_sequence: None,
+                },
+                usage: MessageDeltaUsage {
+                    input_tokens: Some(3),
+                    output_tokens: 4,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    server_tool_use: None,
+                },
+            },
+            &mut tool_blocks,
+            &mut finished_emitted,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        emit_anthropic_stream_events(
+            MessageStreamEvent::MessageStop,
+            &mut tool_blocks,
+            &mut finished_emitted,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Finished(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1, "events: {events:?}");
+        assert!(matches!(
+            finished[0],
+            StreamEvent::Finished(FinishReason::ToolCalls)
         ));
     }
 

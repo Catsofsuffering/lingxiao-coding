@@ -219,6 +219,7 @@ impl crate::agent::AgentContextStore for SqliteAgentContextStore {
         message: &crate::agent::AgentContextMessage,
     ) {
         let conn = self.db.conn();
+        let redacted_content = redact_secret_text(&message.content);
         let _ = conn.execute(
             "INSERT INTO agent_conversation \
              (session_id, agent_id, agent_name, role, content, tool_call_id, timestamp) \
@@ -228,7 +229,7 @@ impl crate::agent::AgentContextStore for SqliteAgentContextStore {
                 agent_id,
                 agent_name,
                 &message.role,
-                &message.content,
+                redacted_content,
                 &message.tool_call_id,
                 now_ms() as f64 / 1000.0,
             ],
@@ -1196,6 +1197,10 @@ impl CommandRouter {
             .and_then(|v| v.as_str())
             .unwrap_or("/default")
             .to_string();
+        let workspace = match validate_session_workspace(&workspace) {
+            Ok(workspace) => workspace,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
         let session_id = cmd
             .params
             .get("session_id")
@@ -1287,7 +1292,11 @@ impl CommandRouter {
                     correlation_id: Some(cmd.request_id),
                 };
                 event.seq = next_seq;
-                insert_event(tx, &event)?;
+                let persisted_event = EventEnvelope {
+                    payload: redact_persistence_secrets(&event.payload),
+                    ..event.clone()
+                };
+                insert_event(tx, &persisted_event)?;
                 update_meta_seq(tx, &Some(session_id.clone()), next_seq)?;
 
                 let response = CommandResponse::with_event(
@@ -1425,7 +1434,7 @@ impl CommandRouter {
                 tx.execute(
                     "INSERT INTO leader_conversation (session_id, role, content, timestamp) \
                      VALUES (?1, 'user', ?2, ?3)",
-                    params![session_id, content, insert_ts],
+                    params![session_id, redact_secret_text(&content), insert_ts],
                 )?;
 
                 let response = CommandResponse::with_event(
@@ -1466,6 +1475,10 @@ impl CommandRouter {
             );
         }
         let workspace = string_param(&cmd, &["workspace"]).unwrap_or_else(|| "/default".into());
+        let workspace = match validate_session_workspace(&workspace) {
+            Ok(workspace) => workspace,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
         let model = string_param(&cmd, &["model"]).unwrap_or_else(|| "mock/model".into());
         let provider_id = string_param(&cmd, &["provider", "provider_id"]).unwrap_or_else(|| {
             if self.llm_router.is_some() {
@@ -1551,7 +1564,7 @@ impl CommandRouter {
                 tx.execute(
                     "INSERT INTO leader_conversation (session_id, role, content, timestamp) \
                      VALUES (?1, 'user', ?2, ?3)",
-                    params![session_id, content, occurred_at as f64 / 1000.0],
+                    params![session_id, redact_secret_text(&content), occurred_at as f64 / 1000.0],
                 )?;
                 tx.execute(
                     "INSERT INTO tasks \
@@ -6839,11 +6852,11 @@ impl CommandRouter {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let args = string_array_param(&cmd, "args");
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(&self.db, &session_id, string_param(&cmd, &["cwd"])) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -6863,7 +6876,7 @@ impl CommandRouter {
             bridge_id: bridge_id.clone(),
             program: std::path::PathBuf::from(program),
             args,
-            cwd,
+            cwd: Some(cwd),
             payload,
             timeout_ms,
         }) {
@@ -6925,11 +6938,11 @@ impl CommandRouter {
             );
         };
         let args = string_array_param(&cmd, "args");
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(&self.db, &session_id, string_param(&cmd, &["cwd"])) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -6941,29 +6954,18 @@ impl CommandRouter {
             .and_then(Value::as_u64)
             .unwrap_or(10_000);
         let init_payload = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
-        let init_result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:initialize"),
+        let start_result = match self.mcp_bridge.start_server(McpBridgeRequest {
+            bridge_id: server_id.clone(),
             program: std::path::PathBuf::from(&program),
             args: args.clone(),
-            cwd: cwd.clone(),
+            cwd: Some(cwd.clone()),
             payload: init_payload,
             timeout_ms,
         }) {
             Ok(result) => result,
             Err(error) => return mcp_bridge_error_response(request_id, error),
         };
-        let tools_result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:tools"),
-            program: std::path::PathBuf::from(&program),
-            args: args.clone(),
-            cwd: cwd.clone(),
-            payload: json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-            timeout_ms,
-        }) {
-            Ok(result) => result,
-            Err(error) => return mcp_bridge_error_response(request_id, error),
-        };
-        let tools = tools_result["response"]["result"]["tools"]
+        let tools = start_result.tools_response["result"]["tools"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -6971,9 +6973,9 @@ impl CommandRouter {
             "server_id": server_id,
             "program": program,
             "args": args,
-            "cwd": cwd.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "cwd": cwd.to_string_lossy().to_string(),
             "tools": tools,
-            "initialized": init_result["response"].clone(),
+            "initialized": start_result.initialized,
             "timeout_ms": timeout_ms,
         });
         self.persist_mcp_server_state(
@@ -7046,24 +7048,15 @@ impl CommandRouter {
                 )
             }
         };
-        let program = state["program"].as_str().unwrap_or("").to_string();
-        let args = state["args"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let cwd = state["cwd"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from);
-        let scope_string = cwd
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| program.clone());
+        let cwd = match mcp_cwd_for_session(
+            &self.db,
+            &session_id,
+            state["cwd"].as_str().map(str::to_string),
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let scope_string = cwd.to_string_lossy().to_string();
         if let Err(error) =
             require_scoped_permission_grant(&self.db, &session_id, "mcp", Some(&scope_string))
         {
@@ -7076,19 +7069,16 @@ impl CommandRouter {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let timeout_ms = state["timeout_ms"].as_u64().unwrap_or(10_000);
-        let result = match self.mcp_bridge.invoke(McpBridgeRequest {
-            bridge_id: format!("{server_id}:call:{tool_name}"),
-            program: std::path::PathBuf::from(program),
-            args,
-            cwd,
-            payload: json!({
+        let result = match self.mcp_bridge.call_server(
+            &server_id,
+            json!({
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
                 "params": {"name": tool_name, "arguments": arguments}
             }),
             timeout_ms,
-        }) {
+        ) {
             Ok(result) => result,
             Err(error) => return mcp_bridge_error_response(request_id, error),
         };
@@ -7100,7 +7090,7 @@ impl CommandRouter {
             json!({
                 "server_id": server_id,
                 "tool_name": tool_name,
-                "response": result["response"].clone(),
+                "response": result,
             }),
         )
     }
@@ -7118,6 +7108,10 @@ impl CommandRouter {
         let key = format!("mcp_server:{server_id}");
         let occurred_at = now_ms();
         let actor = cmd.actor.clone();
+        let stop_result = match self.mcp_bridge.stop_server(&server_id) {
+            Ok(result) => result,
+            Err(error) => return mcp_bridge_error_response(request_id, error),
+        };
         let outcome: std::result::Result<CommandResponse, rusqlite::Error> =
             self.db.with_transaction(|tx| {
                 ensure_session_active(tx, &session_id, &request_id)?;
@@ -7132,7 +7126,7 @@ impl CommandRouter {
                     generation,
                     "mcp.server_stopped",
                     actor,
-                    json!({"server_id": server_id}),
+                    json!({"server_id": server_id, "exit_code": stop_result}),
                     occurred_at,
                     &request_id,
                 )?;
@@ -9518,6 +9512,41 @@ fn workspace_scope_allows(workspace: &str, requested_scope: &str) -> bool {
     requested == root || requested.strip_prefix(root).is_ok()
 }
 
+fn validate_session_workspace(workspace: &str) -> std::result::Result<String, CoreError> {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(CoreError::permission_denied(
+            "Session workspace must be a non-empty filesystem path",
+        ));
+    }
+    let raw = std::path::Path::new(trimmed);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| CoreError::internal(format!("workspace cwd lookup failed: {error}")))?
+            .join(raw)
+    };
+    let normalized = normalize_permission_path(&absolute);
+    if is_filesystem_root(&normalized) {
+        return Err(CoreError::permission_denied(
+            "Session workspace cannot be a filesystem root",
+        ));
+    }
+    if let Ok(metadata) = std::fs::metadata(&normalized) {
+        if !metadata.is_dir() {
+            return Err(CoreError::permission_denied(
+                "Session workspace must be a directory",
+            ));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+fn is_filesystem_root(path: &std::path::Path) -> bool {
+    path.parent().is_none() || path.parent() == Some(path)
+}
+
 fn workspace_scoped_tool_args(
     db: &DbOwner,
     session_id: &str,
@@ -9621,6 +9650,43 @@ fn ensure_path_inside_session_workspace(
                 "workspace": workspace_root.display().to_string(),
             }),
             false,
+        ))
+    }
+}
+
+fn mcp_cwd_for_session(
+    db: &DbOwner,
+    session_id: &str,
+    requested_cwd: Option<String>,
+) -> std::result::Result<std::path::PathBuf, CoreError> {
+    let workspace = db
+        .conn()
+        .query_row(
+            "SELECT workspace FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| CoreError::internal(format!("workspace lookup failed: {error}")))?
+        .ok_or_else(|| CoreError::session_not_found(session_id.to_string()))?;
+    let workspace_root = normalize_permission_path(&workspace);
+    let raw_cwd = requested_cwd.unwrap_or_else(|| workspace_root.display().to_string());
+    if raw_cwd.chars().any(char::is_control) {
+        return Err(CoreError::permission_denied(
+            "MCP cwd contains control characters",
+        ));
+    }
+    let raw_path = std::path::Path::new(&raw_cwd);
+    let requested = if raw_path.is_absolute() {
+        normalize_permission_path(raw_path)
+    } else {
+        normalize_permission_path(workspace_root.join(raw_path))
+    };
+    if requested == workspace_root || requested.strip_prefix(&workspace_root).is_ok() {
+        Ok(requested)
+    } else {
+        Err(CoreError::permission_denied(
+            "MCP cwd is outside the session workspace",
         ))
     }
 }
@@ -10127,7 +10193,7 @@ fn append_leader_conversation_outside(
         params![
             session_id,
             role,
-            content,
+            redact_secret_text(content),
             tool_call_id,
             now_ms() as f64 / 1000.0,
         ],
@@ -11697,8 +11763,50 @@ fn redact_persistence_secrets(value: &Value) -> Value {
 
 fn redact_secret_text(text: &str) -> String {
     let mut redacted = redact_prefixed_secret(text, "sk-");
+    redacted = redact_prefixed_secret(&redacted, "sk-ant-");
     redacted = redact_prefixed_secret(&redacted, "AKIA");
-    redact_prefixed_secret(&redacted, "ASIA")
+    redacted = redact_prefixed_secret(&redacted, "ASIA");
+    redact_bearer_token(&redacted)
+}
+
+fn redact_bearer_token(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find("bearer") {
+        let start = cursor + relative_start;
+        let boundary_before = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        if !boundary_before {
+            output.push_str(&text[cursor..start + 6]);
+            cursor = start + 6;
+            continue;
+        }
+        output.push_str(&text[cursor..start]);
+        output.push_str("Bearer");
+        let after = start + 6;
+        let mut token_start = after;
+        while token_start < text.len() && text.as_bytes()[token_start] == b' ' {
+            token_start += 1;
+        }
+        if token_start > after {
+            output.push_str(&text[after..token_start]);
+        }
+        let token_end = text[token_start..]
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '<' | '>')
+            })
+            .map(|relative_end| token_start + relative_end)
+            .unwrap_or(text.len());
+        if token_end > token_start {
+            output.push_str("[redacted]");
+            cursor = token_end;
+        } else {
+            cursor = token_start;
+        }
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
@@ -11728,6 +11836,7 @@ fn redact_prefixed_secret(text: &str, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentContextStore;
     use crate::llm::{
         FinishReason, GenerateResponse, LlmProvider, ProviderError, ProviderErrorCode, TokenUsage,
     };
@@ -12367,45 +12476,47 @@ $response | ConvertTo-Json -Depth 8 -Compress
         write_script(
             "mcp_bridge.ps1",
             r#"
-$line = [Console]::In.ReadLine()
-$req = $line | ConvertFrom-Json
-if ($req.method -eq 'initialize') {
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  if ($line.Trim().Length -eq 0) { continue }
+  $req = $line | ConvertFrom-Json
+  if ($req.method -eq 'initialize') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $req.id
+      result = @{
+        protocolVersion = '2024-11-05'
+        serverInfo = @{ name = 'fake-mcp'; version = '1.0.0' }
+        capabilities = @{ tools = @{} }
+      }
+    }
+    $response | ConvertTo-Json -Depth 8 -Compress
+    continue
+  }
+  if ($req.method -eq 'tools/call') {
+    $response = @{
+      jsonrpc = '2.0'
+      id = $req.id
+      result = @{
+        content = @(@{ type = 'text'; text = "echo:$($req.params.arguments.value)" })
+        isError = $false
+      }
+    }
+    $response | ConvertTo-Json -Depth 8 -Compress
+    continue
+  }
   $response = @{
     jsonrpc = '2.0'
     id = $req.id
     result = @{
-      protocolVersion = '2024-11-05'
-      serverInfo = @{ name = 'fake-mcp'; version = '1.0.0' }
-      capabilities = @{ tools = @{} }
+      tools = @(@{
+        name = 'echo'
+        description = 'test tool'
+        inputSchema = @{ type = 'object' }
+      })
     }
   }
   $response | ConvertTo-Json -Depth 8 -Compress
-  exit 0
 }
-if ($req.method -eq 'tools/call') {
-  $response = @{
-    jsonrpc = '2.0'
-    id = $req.id
-    result = @{
-      content = @(@{ type = 'text'; text = "echo:$($req.params.arguments.value)" })
-      isError = $false
-    }
-  }
-  $response | ConvertTo-Json -Depth 8 -Compress
-  exit 0
-}
-$response = @{
-  jsonrpc = '2.0'
-  id = $req.id
-  result = @{
-    tools = @(@{
-      name = 'echo'
-      description = 'test tool'
-      inputSchema = @{ type = 'object' }
-    })
-  }
-}
-$response | ConvertTo-Json -Depth 8 -Compress
 "#,
         )
     }
@@ -13064,11 +13175,12 @@ $response | ConvertTo-Json -Depth 8 -Compress
     #[test]
     fn test_mcp_bridge_invokes_stdio_json_without_leaking_params() {
         let script = write_mcp_bridge_script();
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
         assert_success(&router.dispatch(make_cmd(
             "session.create",
             None,
-            json!({"session_id": "sess-mcp", "workspace": "/tmp/ws"}),
+            json!({"session_id": "sess-mcp", "workspace": workspace.path().display().to_string()}),
             None,
         )));
         grant_tool(&router, "sess-mcp", "mcp", "perm-mcp");
@@ -13109,11 +13221,12 @@ $response | ConvertTo-Json -Depth 8 -Compress
     #[test]
     fn test_mcp_server_lifecycle_lists_calls_and_stops_fake_stdio_server() {
         let script = write_mcp_bridge_script();
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
         assert_success(&router.dispatch(make_cmd(
             "session.create",
             None,
-            json!({"session_id": "sess-mcp-life", "workspace": "/tmp/ws"}),
+            json!({"session_id": "sess-mcp-life", "workspace": workspace.path().display().to_string()}),
             None,
         )));
         grant_tool(&router, "sess-mcp-life", "mcp", "perm-mcp-life");
@@ -13220,6 +13333,19 @@ $response | ConvertTo-Json -Depth 8 -Compress
 
         let latest = router.event_log.latest_seq(&sid).unwrap();
         assert_eq!(latest, 1);
+    }
+
+    #[test]
+    fn test_session_create_rejects_filesystem_root_workspace() {
+        let router = setup_router();
+        let root_workspace = if cfg!(windows) { "C:\\" } else { "/" };
+        let resp = router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"workspace": root_workspace}),
+            None,
+        ));
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
     }
 
     #[test]
@@ -17517,6 +17643,59 @@ $response | ConvertTo-Json -Depth 8 -Compress
             context.contains("omitted"),
             "expected 'omitted' redaction marker in context, got: {context}"
         );
+    }
+
+    #[test]
+    fn test_conversation_tables_redact_secret_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = setup_router();
+        let session_id = "sess-conversation-redaction";
+        assert_success(&router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"session_id": session_id, "workspace": dir.path().display().to_string()}),
+            None,
+        )));
+        assert_success(&router.dispatch(make_cmd(
+            "session.input",
+            Some(session_id),
+            json!({"content": "Authorization: Bearer secret-token and sk-test-secret"}),
+            None,
+        )));
+
+        let store = SqliteAgentContextStore::new(router.db.clone());
+        store.append_message(
+            session_id,
+            "agent-1",
+            "agent-one",
+            &crate::agent::AgentContextMessage {
+                role: "tool".into(),
+                content: "tool output sk-test-tool-secret Bearer tool-token".into(),
+                tool_call_id: Some("call-1".into()),
+            },
+        );
+
+        let conn = router.db.conn();
+        let leader_content: String = conn
+            .query_row(
+                "SELECT content FROM leader_conversation WHERE session_id = ?1 ORDER BY timestamp DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let agent_content: String = conn
+            .query_row(
+                "SELECT content FROM agent_conversation WHERE session_id = ?1 ORDER BY timestamp DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for content in [leader_content, agent_content] {
+            assert!(!content.contains("sk-test"));
+            assert!(!content.contains("secret-token"));
+            assert!(!content.contains("tool-token"));
+            assert!(content.contains("[redacted]"));
+        }
     }
 
     // -----------------------------------------------------------------------
