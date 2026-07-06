@@ -1426,7 +1426,11 @@ impl CommandRouter {
                     correlation_id: Some(cmd.request_id),
                 };
                 event.seq = next_seq;
-                insert_event(tx, &event)?;
+                let persisted_event = EventEnvelope {
+                    payload: redact_persistence_secrets(&event.payload),
+                    ..event.clone()
+                };
+                insert_event(tx, &persisted_event)?;
                 update_meta_seq(tx, &Some(session_id.clone()), next_seq)?;
 
                 // Write conversation record (same transaction)
@@ -12521,6 +12525,39 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
         )
     }
 
+    fn write_mcp_bridge_large_stderr_script() -> PathBuf {
+        write_script(
+            "mcp_bridge_large_stderr.ps1",
+            r#"
+$line = [Console]::In.ReadLine()
+[Console]::Error.Write(('E' * 262144))
+$req = $line | ConvertFrom-Json
+$response = @{
+  jsonrpc = '2.0'
+  id = $req.id
+  result = @{
+    tools = @(@{
+      name = 'echo'
+      description = 'test tool'
+      inputSchema = @{ type = 'object' }
+    })
+  }
+}
+$response | ConvertTo-Json -Depth 8 -Compress
+"#,
+        )
+    }
+
+    fn write_mcp_bridge_timeout_script() -> PathBuf {
+        write_script(
+            "mcp_bridge_timeout.ps1",
+            r#"
+$null = [Console]::In.ReadLine()
+Start-Sleep -Seconds 5
+"#,
+        )
+    }
+
     fn write_script(name: &str, body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lingxiao_router_{}", now_ms()));
         fs::create_dir_all(&dir).unwrap();
@@ -13216,6 +13253,83 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             )
             .unwrap();
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn test_mcp_bridge_large_stderr_does_not_deadlock() {
+        let script = write_mcp_bridge_large_stderr_script();
+        let workspace = tempfile::tempdir().unwrap();
+        let router = setup_router();
+        assert_success(&router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"session_id": "sess-mcp-stderr", "workspace": workspace.path().display().to_string()}),
+            None,
+        )));
+        grant_tool(&router, "sess-mcp-stderr", "mcp", "perm-mcp-stderr");
+        let started = std::time::Instant::now();
+        let response = router.dispatch(make_cmd(
+            "mcp.bridge",
+            Some("sess-mcp-stderr"),
+            json!({
+                "bridge_id": "mcp-stderr",
+                "program": powershell().display().to_string(),
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script.display().to_string()],
+                "timeout_ms": 10_000,
+                "payload": {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            }),
+            None,
+        ));
+        assert_success(&response);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "mcp.bridge likely blocked on stderr pipe"
+        );
+        let conn = router.db.conn();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM owned_processes WHERE id = 'mcp:mcp-stderr'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn test_mcp_bridge_timeout_marks_process_failed() {
+        let script = write_mcp_bridge_timeout_script();
+        let workspace = tempfile::tempdir().unwrap();
+        let router = setup_router();
+        assert_success(&router.dispatch(make_cmd(
+            "session.create",
+            None,
+            json!({"session_id": "sess-mcp-timeout", "workspace": workspace.path().display().to_string()}),
+            None,
+        )));
+        grant_tool(&router, "sess-mcp-timeout", "mcp", "perm-mcp-timeout");
+        let response = router.dispatch(make_cmd(
+            "mcp.bridge",
+            Some("sess-mcp-timeout"),
+            json!({
+                "bridge_id": "mcp-timeout",
+                "program": powershell().display().to_string(),
+                "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script.display().to_string()],
+                "timeout_ms": 100,
+                "payload": {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            }),
+            None,
+        ));
+        assert_error_code(&response, ErrorCode::InvalidTransition);
+        let conn = router.db.conn();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM owned_processes WHERE id = 'mcp:mcp-timeout'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 
     #[test]
@@ -17690,12 +17804,22 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
                 |row| row.get(0),
             )
             .unwrap();
+        let event_payload: String = conn
+            .query_row(
+                "SELECT payload FROM event_log WHERE session_id = ?1 AND event_type = 'session.input_received'",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
         for content in [leader_content, agent_content] {
             assert!(!content.contains("sk-test"));
             assert!(!content.contains("secret-token"));
             assert!(!content.contains("tool-token"));
             assert!(content.contains("[redacted]"));
         }
+        assert!(!event_payload.contains("sk-test"));
+        assert!(!event_payload.contains("secret-token"));
+        assert!(event_payload.contains("[redacted]"));
     }
 
     // -----------------------------------------------------------------------

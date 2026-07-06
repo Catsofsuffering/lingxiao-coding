@@ -356,8 +356,50 @@ fn redact_event_payload(value: &serde_json::Value) -> serde_json::Value {
 
 fn redact_secret_text(text: &str) -> String {
     let mut redacted = redact_prefixed_secret(text, "sk-");
+    redacted = redact_prefixed_secret(&redacted, "sk-ant-");
     redacted = redact_prefixed_secret(&redacted, "AKIA");
-    redact_prefixed_secret(&redacted, "ASIA")
+    redacted = redact_prefixed_secret(&redacted, "ASIA");
+    redact_bearer_token(&redacted)
+}
+
+fn redact_bearer_token(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find("bearer") {
+        let start = cursor + relative_start;
+        let boundary_before = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        if !boundary_before {
+            output.push_str(&text[cursor..start + 6]);
+            cursor = start + 6;
+            continue;
+        }
+        output.push_str(&text[cursor..start]);
+        output.push_str("Bearer");
+        let after = start + 6;
+        let mut token_start = after;
+        while token_start < text.len() && text.as_bytes()[token_start] == b' ' {
+            token_start += 1;
+        }
+        if token_start > after {
+            output.push_str(&text[after..token_start]);
+        }
+        let token_end = text[token_start..]
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '"' | '\'' | ',' | ';' | ')' | ']' | '}' | '<' | '>')
+            })
+            .map(|relative_end| token_start + relative_end)
+            .unwrap_or(text.len());
+        if token_end > token_start {
+            output.push_str("[redacted]");
+            cursor = token_end;
+        } else {
+            cursor = token_start;
+        }
+    }
+    output.push_str(&text[cursor..]);
+    output
 }
 
 fn redact_prefixed_secret(text: &str, prefix: &str) -> String {

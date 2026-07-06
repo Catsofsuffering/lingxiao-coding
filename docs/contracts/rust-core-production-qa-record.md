@@ -32,6 +32,11 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
   registry state.
 - DeepSeek reliability items reviewed for retention, command dedupe cleanup,
   orphan cleanup, total retry/fallback deadline, and streaming sink latency.
+- Final Fable/GPT 5.5 re-audit findings on commit `a5c0c86`: `Bearer` token
+  persistence through `session.input_received`, non-green Windows shell drain
+  test, raw Anthropic SSE duplicate `Finished`, one-shot `mcp.bridge` stderr
+  drain coverage, and Anthropic SDK response decode incompatibility with the
+  live gateway.
 
 ## Fix Summary
 
@@ -43,7 +48,11 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
 - External process LLM and native shell paths drain stdout/stderr concurrently
   with bounded buffers, preventing pipe-buffer deadlocks.
 - Anthropic streaming suppresses duplicate `Finished` events so `MessageDelta`
-  finish reasons are not overwritten by `MessageStop`.
+  finish reasons are not overwritten by `MessageStop`; both SDK streaming and
+  raw SSE extended-thinking paths have regression coverage.
+- Anthropic non-streaming requests use raw HTTP response parsing to avoid
+  SDK/gateway response decode incompatibilities while preserving Anthropic
+  status-code mapping and auth headers.
 - OpenAI provider has contract coverage for preserving assistant content when
   tool calls are present.
 - `RouterAgentLlmExecutor` and `llm.call` accumulate `ToolCallDelta`, persist
@@ -57,10 +66,16 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
 - Conversation persistence redacts likely secrets and bounds persisted tool
   output content before writing `agent_conversation`, `leader_conversation`,
   events, and sensitive SQLite projections.
+- Event-log redaction now covers `Bearer` tokens and `sk-ant-` style keys, and
+  `session.input_received` persists a redacted payload while returning the
+  original in the command response.
 - MCP server lifecycle now keeps a persistent stdio process for
   `mcp.server_start` -> `tools/list` -> `mcp.call_tool` -> `mcp.server_stop`,
   enforces session workspace-scoped cwd, and marks owned process rows failed on
   timeout/error.
+- One-shot `mcp.bridge` drains stdout/stderr concurrently with bounded buffers
+  and has regression coverage for large stderr plus timeout -> failed process
+  registry state.
 - `session.create` and `session.run_task` canonicalize/validate workspace roots
   and reject filesystem roots or invalid workspaces.
 - Real OpenAI live E2E now proves real provider -> model tool request ->
@@ -72,19 +87,28 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
 - `cargo fmt --check`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `cargo test --workspace --quiet`: passed.
-  The workspace run included `lingxiao-core`, provider contract tests, daemon
-  tests, and all crate test suites reported by Cargo.
+  The workspace run included `lingxiao-core` 287 tests, provider contract
+  tests, daemon tests, and all crate test suites reported by Cargo.
 - `npx tsx --test src/llm/customModelName.test.ts`: passed.
   The equivalent `node node_modules/tsx/dist/cli.mjs --test
   src/llm/customModelName.test.ts` command also passed.
 - Targeted live OpenAI Responses tool-call E2E:
   `cargo test -p lingxiao-core-daemon test_stdio_real_openai_responses_tool_call_executes_canonical_tool_when_key_is_present -- --nocapture`
-  passed with `.env` loaded from the sibling worktree. The test asserts
+  passed with `.env` loaded from the current worktree. The test asserts
   `tool.call_initiated`, `tool.call_completed`, one completed `tool_calls` row,
   final answer `OPENAI_TOOL_E2E_FINAL canonical-file-read-ok`, and durable
   replay containing the tool events.
 - Anthropic live smoke used `.env` without printing secrets and passed through
-  the provider binary with event summary `TextDelta,Usage,Finished:Stop`.
+  the provider binary with event summary `TextDelta,Usage,Finished` and
+  expected text `ANTHROPIC_SMOKE_OK`.
+- Targeted regressions passed for:
+  `test_conversation_tables_redact_secret_content`,
+  `test_shell_large_stdout_drain_does_not_deadlock`,
+  `test_mcp_bridge_large_stderr_does_not_deadlock`,
+  `test_mcp_bridge_timeout_marks_process_failed`,
+  `test_raw_anthropic_sse_does_not_emit_double_finished`,
+  `test_execute_messages_against_mock_http_server`, and
+  `test_auth_error_maps_to_provider_error`.
 
 ## Remaining Risks
 

@@ -113,10 +113,10 @@ where
             ))),
         };
     }
-    let config = resolved_config(request)?;
-    let client = Anthropic::with_config(config)
-        .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
     if request.stream {
+        let config = resolved_config(request)?;
+        let client = Anthropic::with_config(config)
+            .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
         let timeout = Duration::from_millis(request.options.timeout_ms_hint.unwrap_or(600_000));
         return match tokio::time::timeout(timeout, execute_messages_stream(&client, request, sink))
             .await
@@ -131,16 +131,85 @@ where
             ))),
         };
     }
-    let response = match client.messages().create(to_message_params(request)).await {
+    let timeout = Duration::from_millis(request.options.timeout_ms_hint.unwrap_or(600_000));
+    let response = match tokio::time::timeout(timeout, execute_raw_messages(request)).await {
+        Ok(result) => result,
+        Err(_) => Err(ProviderError::new(
+            ProviderErrorCode::Timeout,
+            format!(
+                "Anthropic request timed out after {} ms",
+                timeout.as_millis()
+            ),
+        )),
+    };
+    let response = match response {
         Ok(response) => response,
         Err(error) => {
-            return sink(StreamEvent::Error(provider_error_from_anthropic(error)));
+            return sink(StreamEvent::Error(error));
         }
     };
-    for event in message_to_stream_events(response) {
+    for event in raw_anthropic_message_to_events(&response) {
         sink(event)?;
     }
     Ok(())
+}
+
+async fn execute_raw_messages(request: &GenerateRequest) -> Result<Value, ProviderError> {
+    let (key, auth_method) = anthropic_auth(request).map_err(|error| {
+        ProviderError::new(
+            ProviderErrorCode::Unknown,
+            redact_error_message(error.to_string()),
+        )
+    })?;
+    let metadata = request.options.metadata.as_ref();
+    let base_url = metadata
+        .and_then(|value| value.get("base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_URL);
+    let timeout = request.options.timeout_ms_hint.unwrap_or(600_000);
+    let mut headers = HeaderMap::new();
+    insert_anthropic_auth_headers(&mut headers, &key, &auth_method).map_err(|error| {
+        ProviderError::new(
+            ProviderErrorCode::Unknown,
+            redact_error_message(error.to_string()),
+        )
+    })?;
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout))
+        .build()
+        .map_err(|e| ProviderError::new(ProviderErrorCode::Unknown, e.to_string()))?
+        .post(format!("{}/v1/messages", base_url.trim_end_matches('/')))
+        .headers(headers)
+        .json(&anthropic_request_body(request, false).map_err(|error| {
+            ProviderError::new(
+                ProviderErrorCode::BadRequest,
+                redact_error_message(error.to_string()),
+            )
+        })?)
+        .send()
+        .await
+        .map_err(|e| ProviderError::new(ProviderErrorCode::Unknown, e.to_string()))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let message = if body.trim().is_empty() {
+            format!("Anthropic request failed with status {status}")
+        } else {
+            body
+        };
+        return Err(ProviderError::new(
+            map_response_status(status.as_u16()),
+            redact_error_message(message),
+        ));
+    }
+    serde_json::from_str(&body).map_err(|e| {
+        ProviderError::new(
+            ProviderErrorCode::Unknown,
+            format!("Anthropic response decode failed: {e}"),
+        )
+    })
 }
 
 async fn execute_messages_stream<F>(
@@ -202,7 +271,7 @@ async fn execute_raw_messages_stream<F>(
 where
     F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
 {
-    let (key, _) = anthropic_auth(request)?;
+    let (key, auth_method) = anthropic_auth(request)?;
     let metadata = request.options.metadata.as_ref();
     let base_url = metadata
         .and_then(|value| value.get("base_url"))
@@ -210,11 +279,7 @@ where
         .unwrap_or(DEFAULT_BASE_URL);
     let timeout = request.options.timeout_ms_hint.unwrap_or(600_000);
     let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
-    );
+    insert_anthropic_auth_headers(&mut headers, &key, &auth_method)?;
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     if let Some(beta) = metadata
@@ -264,6 +329,7 @@ where
     let mut buffer = String::new();
     let mut tool_blocks: Vec<Option<(String, String, String)>> = Vec::new();
     let mut saw_event = false;
+    let mut finished_emitted = false;
     while let Some(chunk) = FuturesStreamExt::next(&mut stream).await {
         let chunk = chunk.map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
         let text = std::str::from_utf8(&chunk)
@@ -272,14 +338,19 @@ where
         while let Some(index) = buffer.find("\n\n") {
             let frame = buffer[..index].to_string();
             buffer = buffer[index + 2..].to_string();
-            if process_raw_anthropic_sse_frame(&frame, &mut tool_blocks, sink)? {
+            if process_raw_anthropic_sse_frame(
+                &frame,
+                &mut tool_blocks,
+                &mut finished_emitted,
+                sink,
+            )? {
                 return Ok(());
             }
             saw_event = true;
         }
     }
     if !buffer.trim().is_empty() {
-        process_raw_anthropic_sse_frame(&buffer, &mut tool_blocks, sink)?;
+        process_raw_anthropic_sse_frame(&buffer, &mut tool_blocks, &mut finished_emitted, sink)?;
         saw_event = true;
     }
     if !saw_event {
@@ -293,6 +364,7 @@ where
 fn process_raw_anthropic_sse_frame<F>(
     frame: &str,
     tool_blocks: &mut Vec<Option<(String, String, String)>>,
+    finished_emitted: &mut bool,
     sink: &mut F,
 ) -> Result<bool, AnthropicProviderError>
 where
@@ -318,6 +390,12 @@ where
         AnthropicProviderError::Provider(format!("Anthropic SSE decode failed: {e}"))
     })?;
     for event in raw_anthropic_sse_value_to_events(&value, tool_blocks) {
+        if matches!(event, StreamEvent::Finished(_)) {
+            if *finished_emitted {
+                continue;
+            }
+            *finished_emitted = true;
+        }
         sink(event)?;
     }
     Ok(false)
@@ -753,6 +831,122 @@ fn initial_tool_input_json(input: &Value) -> String {
     }
 }
 
+fn insert_anthropic_auth_headers(
+    headers: &mut HeaderMap,
+    key: &str,
+    auth_method: &AuthMethod,
+) -> Result<(), AnthropicProviderError> {
+    match auth_method {
+        AuthMethod::Anthropic => {
+            headers.insert(
+                "x-api-key",
+                HeaderValue::from_str(key)
+                    .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
+            );
+        }
+        AuthMethod::Bearer => {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
+            );
+        }
+        AuthMethod::Token => {
+            headers.insert(
+                "token",
+                HeaderValue::from_str(key)
+                    .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn raw_anthropic_message_to_events(value: &Value) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        for (index, block) in content.iter().enumerate() {
+            match block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            events.push(StreamEvent::TextDelta(text.to_string()));
+                        }
+                    }
+                }
+                "tool_use" => {
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("toolu_{index}"));
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = block.get("input").cloned().unwrap_or(Value::Null);
+                    events.push(StreamEvent::ToolCall(
+                        lingxiao_llm_host_protocol::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(usage) = value.get("usage") {
+        let prompt_tokens = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        let completion_tokens = usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        events.push(StreamEvent::Usage(TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.saturating_add(completion_tokens),
+            cache_creation_input_tokens: usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32),
+            cache_read_input_tokens: usage
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_u64)
+                .map(|value| value.min(u32::MAX as u64) as u32),
+            reasoning_tokens: None,
+        }));
+    }
+    let finish_reason = value
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(map_stop_reason_str)
+        .unwrap_or_else(|| {
+            if events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCall(_)))
+            {
+                FinishReason::ToolCalls
+            } else {
+                FinishReason::Stop
+            }
+        });
+    events.push(StreamEvent::Finished(finish_reason));
+    events
+}
+
+#[cfg(test)]
 fn message_to_stream_events(message: anthropic_sdk::Message) -> Vec<StreamEvent> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -953,6 +1147,43 @@ mod tests {
         assert!(
             matches!(&done[0], StreamEvent::ToolCall(call) if call.name == "get_weather" && call.arguments == json!({"city": "Shanghai"}))
         );
+    }
+
+    #[test]
+    fn test_raw_anthropic_sse_does_not_emit_double_finished() {
+        let mut tool_blocks = Vec::new();
+        let mut finished_emitted = false;
+        let mut events = Vec::new();
+        process_raw_anthropic_sse_frame(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":3,"output_tokens":4}}"#,
+            &mut tool_blocks,
+            &mut finished_emitted,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        process_raw_anthropic_sse_frame(
+            r#"data: {"type":"message_stop"}"#,
+            &mut tool_blocks,
+            &mut finished_emitted,
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Finished(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1, "events: {events:?}");
+        assert!(matches!(
+            finished[0],
+            StreamEvent::Finished(FinishReason::ToolCalls)
+        ));
     }
 
     #[test]

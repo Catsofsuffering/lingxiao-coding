@@ -1452,7 +1452,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     fn large_stdout_command() -> String {
-        "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand JABzAD0AJwBYACcAKgA4ADAAMAAwADAAOwAgAGYAbwByACAAKAAkAGkAPQAwADsAIAAkAGkAIAAtAGwAdAAgADMAMAA7ACAAJABpACsAKwApACAAewAgAFcAcgBpAHQAZQAtAE8AdQB0AHAAdQB0ACAAJABzACAAfQA=".into()
+        "for /L %i in (1,1,30000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".into()
     }
 
     #[cfg(not(target_os = "windows"))]

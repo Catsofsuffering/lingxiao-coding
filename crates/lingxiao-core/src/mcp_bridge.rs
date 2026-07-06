@@ -74,6 +74,8 @@ impl McpBridgeRunner {
                 request.program.display().to_string(),
             )
             .map_err(|error| McpBridgeError::SpawnFailed(error.to_string()))?;
+        let stdout_drain = child.stdout.take().map(spawn_one_shot_output_drain);
+        let stderr_drain = child.stderr.take().map(spawn_one_shot_output_drain);
 
         if let Some(stdin) = child.stdin.as_mut() {
             let mut line = serde_json::to_vec(&request.payload)
@@ -84,19 +86,23 @@ impl McpBridgeRunner {
                 .map_err(|error| McpBridgeError::WriteFailed(error.to_string()))?;
         }
         drop(child.stdin.take());
-        if let Err(error) = wait_child(&mut child, request.timeout_ms) {
-            let _ = self
-                .process_registry
-                .mark_failed(&process_id, &mcp_error_message_local(&error));
-            return Err(error);
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| McpBridgeError::Failed(error.to_string()))?;
-        let exit_code = output.status.code().unwrap_or(-1);
-        if output.status.success() {
+        let status = match wait_child(&mut child, request.timeout_ms) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = collect_one_shot_output(stdout_drain);
+                let _ = collect_one_shot_output(stderr_drain);
+                let _ = self
+                    .process_registry
+                    .mark_failed(&process_id, &mcp_error_message_local(&error));
+                return Err(error);
+            }
+        };
+        let stdout = collect_one_shot_output(stdout_drain);
+        let stderr = collect_one_shot_output(stderr_drain);
+        let exit_code = status.code().unwrap_or(-1);
+        if status.success() {
             let _ = self.process_registry.complete(&process_id, Some(exit_code));
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&stdout);
             let response = serde_json::from_str::<Value>(stdout.trim())
                 .map_err(|error| McpBridgeError::InvalidJson(error.to_string()))?;
             Ok(json!({
@@ -105,7 +111,7 @@ impl McpBridgeRunner {
                 "response": response,
             }))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr)
+            let stderr = String::from_utf8_lossy(&stderr)
                 .lines()
                 .next()
                 .unwrap_or("mcp bridge failed")
@@ -318,18 +324,50 @@ impl PersistentMcpServer {
     }
 }
 
-fn wait_child(child: &mut Child, timeout_ms: u64) -> Result<(), McpBridgeError> {
+fn wait_child(
+    child: &mut Child,
+    timeout_ms: u64,
+) -> Result<std::process::ExitStatus, McpBridgeError> {
     match child
         .wait_timeout(Duration::from_millis(timeout_ms))
         .map_err(|error| McpBridgeError::Failed(error.to_string()))?
     {
-        Some(_) => Ok(()),
+        Some(status) => Ok(status),
         None => {
             let _ = child.kill();
             let _ = child.wait();
             Err(McpBridgeError::Timeout)
         }
     }
+}
+
+fn spawn_one_shot_output_drain<R>(mut reader: R) -> JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+                    if remaining > 0 {
+                        output.extend_from_slice(&buffer[..n.min(remaining)]);
+                    }
+                }
+            }
+        }
+        output
+    })
+}
+
+fn collect_one_shot_output(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
 }
 
 fn mcp_error_message_local(error: &McpBridgeError) -> String {
