@@ -1484,90 +1484,15 @@ impl CommandRouter {
             }
         }
 
-        let llm_request = GenerateRequest {
-            model: model.clone(),
-            messages: vec![Message {
-                role: "user".into(),
-                content: content.clone(),
-                ..Default::default()
-            }],
-            tools: self.tool_registry.llm_tool_definitions(),
-            stream: true,
-            auth_context: auth_context_from_cmd(&cmd).unwrap_or(AuthContext::None),
-            options: request_options_from_cmd(&cmd),
-        };
-        let stream = match self.route_llm_stream(llm_request) {
-            Ok(stream) => stream,
-            Err(err) => {
-                return CommandResponse::err(
-                    request_id,
-                    CoreError::with_details(
-                        ErrorCode::Internal,
-                        "LLM provider routing failed",
-                        provider_error_json(&err),
-                        err.retryable,
-                    ),
-                );
-            }
-        };
+        let auth_context = auth_context_from_cmd(&cmd).unwrap_or(AuthContext::None);
+        let request_options = request_options_from_cmd(&cmd);
+        let mut response_events = Vec::new();
 
-        let mut answer = String::new();
-        let mut realtime = Vec::new();
-        let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
-        let mut finish_reason = "unknown".to_string();
-        for item in stream {
-            match item {
-                Ok(StreamEvent::ThinkingDelta(text)) => realtime.push(json!({
-                    "event_type": "realtime.llm.thinking_delta",
-                    "payload": {"text": text},
-                })),
-                Ok(StreamEvent::TextDelta(text)) => {
-                    answer.push_str(&text);
-                    realtime.push(json!({
-                        "event_type": "realtime.llm.text_delta",
-                        "payload": {"text": text},
-                    }));
-                }
-                Ok(StreamEvent::ToolCallDelta(delta)) => realtime.push(json!({
-                    "event_type": "realtime.llm.tool_call_delta",
-                    "payload": {
-                        "index": delta.index,
-                        "tool_call_id": delta.id,
-                        "name": delta.name,
-                        "args_delta": delta.partial_json,
-                    },
-                })),
-                Ok(StreamEvent::Usage(token_usage)) => {
-                    usage = json!({
-                        "prompt_tokens": token_usage.prompt_tokens,
-                        "completion_tokens": token_usage.completion_tokens,
-                        "total_tokens": token_usage.total_tokens,
-                        "reasoning_tokens": token_usage.reasoning_tokens,
-                    });
-                }
-                Ok(StreamEvent::Finished(reason)) => {
-                    finish_reason = format!("{:?}", reason).to_lowercase();
-                }
-                Ok(StreamEvent::ToolCall(_)) => {}
-                Ok(StreamEvent::Error(err)) | Err(err) => {
-                    return CommandResponse::err(
-                        request_id,
-                        CoreError::with_details(
-                            ErrorCode::Internal,
-                            "LLM provider stream failed",
-                            provider_error_json(&err),
-                            err.retryable,
-                        ),
-                    );
-                }
-            }
-        }
-
-        let outcome: std::result::Result<CommandResponse, rusqlite::Error> =
+        let started: std::result::Result<Option<CommandResponse>, rusqlite::Error> =
             self.db.with_transaction(|tx| {
                 if let Some(ref key) = idempotency_key {
                     if let Some(cached) = lookup_idempotent_in_tx(tx, key, SESSION_RUN_TASK)? {
-                        return Ok(cached);
+                        return Ok(Some(cached));
                     }
                 }
 
@@ -1582,10 +1507,10 @@ impl CommandRouter {
                     existing_session.as_deref().map(session_status_from_str),
                     Some(status) if status.is_terminal()
                 ) {
-                    return Ok(CommandResponse::err(
+                    return Ok(Some(CommandResponse::err(
                         request_id.clone(),
                         CoreError::session_already_terminal(&session_id),
-                    ));
+                    )));
                 }
                 if existing_session.is_none() {
                     tx.execute(
@@ -1597,9 +1522,8 @@ impl CommandRouter {
 
                 ensure_meta(tx, &Some(session_id.clone()))?;
                 let generation = get_current_generation(tx, &Some(session_id.clone()))?.max(1);
-                let mut events = Vec::new();
                 if existing_session.is_none() {
-                    events.push(append_event_in_tx(
+                    response_events.push(append_event_in_tx(
                         tx,
                         Some(session_id.clone()),
                         generation,
@@ -1612,7 +1536,7 @@ impl CommandRouter {
                         format!("session_run_task_created_{session_id}_{request_id}"),
                     )?);
                 }
-                events.push(append_event_in_tx(
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1633,16 +1557,15 @@ impl CommandRouter {
                     "INSERT INTO tasks \
                      (id, session_id, subject, description, status, run_generation, agent_type, \
                       assigned_agent, result, created_at, updated_at) \
-                     VALUES (?1, ?2, ?3, '', 'terminal', 1, 'core', 'core-runtime', ?4, ?5, ?5)",
+                     VALUES (?1, ?2, ?3, '', 'running', 1, 'core', 'core-runtime', NULL, ?4, ?4)",
                     params![
                         task_id,
                         session_id,
                         content,
-                        json!({"answer": answer, "finish_reason": finish_reason}).to_string(),
                         occurred_at as f64 / 1000.0
                     ],
                 )?;
-                events.push(append_event_in_tx(
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1657,9 +1580,9 @@ impl CommandRouter {
                     occurred_at,
                     Some(request_id.clone()),
                     Some(request_id.clone()),
-                    format!("session_run_task_task_created_{session_id}_{task_id}"),
-                )?);
-                events.push(append_event_in_tx(
+                        format!("session_run_task_task_created_{session_id}_{task_id}"),
+                    )?);
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1675,9 +1598,9 @@ impl CommandRouter {
                     occurred_at,
                     Some(request_id.clone()),
                     Some(request_id.clone()),
-                    format!("session_run_task_task_assigned_{session_id}_{task_id}"),
-                )?);
-                events.push(append_event_in_tx(
+                        format!("session_run_task_task_assigned_{session_id}_{task_id}"),
+                    )?);
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1688,8 +1611,176 @@ impl CommandRouter {
                     Some(request_id.clone()),
                     Some(request_id.clone()),
                     format!("session_run_task_llm_started_{session_id}_{task_id}"),
-                )?);
-                events.push(append_event_in_tx(
+                    )?);
+                Ok(None)
+            });
+
+        match started {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(e) => {
+                return CommandResponse::err(
+                    request_id,
+                    CoreError::internal(format!("session.run_task start failed: {e}")),
+                );
+            }
+        }
+
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: content.clone(),
+            ..Default::default()
+        }];
+        let max_rounds = cmd
+            .params
+            .get("max_rounds")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(4);
+        let tool_executor = RouterAgentToolExecutor::new(
+            self.db.clone(),
+            self.tool_registry.clone(),
+            self.runtime_manager.clone(),
+        );
+        let mut answer = String::new();
+        let mut realtime = Vec::new();
+        let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+        let mut finish_reason = "unknown".to_string();
+
+        for _round in 0..max_rounds {
+            let llm_request = GenerateRequest {
+                model: model.clone(),
+                messages: messages.clone(),
+                tools: self.tool_registry.llm_tool_definitions(),
+                stream: true,
+                auth_context: auth_context.clone(),
+                options: request_options.clone(),
+            };
+            let stream = match self.route_llm_stream(llm_request) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    return CommandResponse::err(
+                        request_id,
+                        CoreError::with_details(
+                            ErrorCode::Internal,
+                            "LLM provider routing failed",
+                            provider_error_json(&err),
+                            err.retryable,
+                        ),
+                    );
+                }
+            };
+
+            let mut assistant_text = String::new();
+            let mut tool_calls = Vec::new();
+            let mut tool_call_accumulator = ToolCallAccumulator::new();
+            for item in stream {
+                match item {
+                    Ok(StreamEvent::ThinkingDelta(text)) => realtime.push(json!({
+                        "event_type": "realtime.llm.thinking_delta",
+                        "payload": {"text": text},
+                    })),
+                    Ok(StreamEvent::TextDelta(text)) => {
+                        assistant_text.push_str(&text);
+                        realtime.push(json!({
+                            "event_type": "realtime.llm.text_delta",
+                            "payload": {"text": text},
+                        }));
+                    }
+                    Ok(StreamEvent::ToolCallDelta(delta)) => {
+                        realtime.push(json!({
+                            "event_type": "realtime.llm.tool_call_delta",
+                            "payload": {
+                                "index": delta.index,
+                                "tool_call_id": delta.id,
+                                "name": delta.name,
+                                "args_delta": delta.partial_json,
+                            },
+                        }));
+                        tool_call_accumulator.append(delta);
+                    }
+                    Ok(StreamEvent::ToolCall(call)) => tool_calls.push(call),
+                    Ok(StreamEvent::Usage(token_usage)) => {
+                        usage = json!({
+                            "prompt_tokens": token_usage.prompt_tokens,
+                            "completion_tokens": token_usage.completion_tokens,
+                            "total_tokens": token_usage.total_tokens,
+                            "reasoning_tokens": token_usage.reasoning_tokens,
+                        });
+                    }
+                    Ok(StreamEvent::Finished(reason)) => {
+                        finish_reason = format!("{:?}", reason).to_lowercase();
+                        if matches!(reason, crate::llm::FinishReason::ToolCalls) {
+                            tool_calls.extend(tool_call_accumulator.finalize());
+                        }
+                    }
+                    Ok(StreamEvent::Error(err)) | Err(err) => {
+                        return CommandResponse::err(
+                            request_id,
+                            CoreError::with_details(
+                                ErrorCode::Internal,
+                                "LLM provider stream failed",
+                                provider_error_json(&err),
+                                err.retryable,
+                            ),
+                        );
+                    }
+                }
+            }
+            tool_calls.extend(tool_call_accumulator.finalize());
+            dedupe_tool_calls_by_id(&mut tool_calls);
+            messages.push(Message {
+                role: "assistant".into(),
+                content: assistant_text.clone(),
+                tool_calls: tool_calls.clone(),
+                ..Default::default()
+            });
+
+            if tool_calls.is_empty() {
+                answer = assistant_text;
+                break;
+            }
+
+            let mut completed_by_tool = false;
+            for tool_call in tool_calls {
+                if tool_call.name == "attempt_completion" {
+                    answer = tool_call
+                        .arguments
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&assistant_text)
+                        .to_string();
+                    completed_by_tool = true;
+                    break;
+                }
+                let tool_result =
+                    tool_executor.execute_tool(&session_id, "core-runtime", &tool_call);
+                let tool_observation = if tool_result.success {
+                    tool_result.output
+                } else {
+                    json!({"error": tool_result.error})
+                };
+                messages.push(Message {
+                    role: "tool".into(),
+                    content: tool_observation.to_string(),
+                    tool_call_id: Some(tool_call.id),
+                    name: Some(tool_call.name),
+                    ..Default::default()
+                });
+            }
+            if completed_by_tool {
+                break;
+            }
+        }
+
+        if answer.is_empty() && finish_reason == "toolcalls" {
+            answer = "max tool-call rounds exhausted".into();
+        }
+
+        let outcome: std::result::Result<CommandResponse, rusqlite::Error> =
+            self.db.with_transaction(|tx| {
+                let generation = get_current_generation(tx, &Some(session_id.clone()))?.max(1);
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1707,7 +1798,17 @@ impl CommandRouter {
                     Some(request_id.clone()),
                     format!("session_run_task_llm_finished_{session_id}_{task_id}"),
                 )?);
-                events.push(append_event_in_tx(
+                tx.execute(
+                    "UPDATE tasks SET status = 'terminal', result = ?1, updated_at = ?2 \
+                     WHERE id = ?3 AND session_id = ?4",
+                    params![
+                        json!({"answer": answer, "finish_reason": finish_reason}).to_string(),
+                        now_ms() as f64 / 1000.0,
+                        task_id,
+                        session_id
+                    ],
+                )?;
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1724,13 +1825,13 @@ impl CommandRouter {
                     occurred_at,
                     Some(request_id.clone()),
                     Some(request_id.clone()),
-                    format!("session_run_task_task_completed_{session_id}_{task_id}"),
-                )?);
+                        format!("session_run_task_task_completed_{session_id}_{task_id}"),
+                    )?);
                 tx.execute(
                     "UPDATE sessions SET status = 'completed', summary = ?1 WHERE id = ?2",
                     params![answer, session_id],
                 )?;
-                events.push(append_event_in_tx(
+                response_events.push(append_event_in_tx(
                     tx,
                     Some(session_id.clone()),
                     generation,
@@ -1760,7 +1861,7 @@ impl CommandRouter {
 
                 let response = response_with_events(
                     request_id.clone(),
-                    events,
+                    response_events,
                     json!({
                         "session_id": session_id,
                         "task_id": task_id,
@@ -11757,6 +11858,86 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct TaskToolRoundProvider {
+        target_path: String,
+        calls: AtomicUsize,
+    }
+
+    impl LlmProvider for TaskToolRoundProvider {
+        fn provider_id(&self) -> &'static str {
+            "task_tool"
+        }
+
+        fn supports_model(&self, model_id: &str) -> bool {
+            model_id == "task-tool/model"
+        }
+
+        fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<GenerateResponse, ProviderError> {
+            Ok(GenerateResponse {
+                content: "unused".into(),
+                finish_reason: "stop".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            request: GenerateRequest,
+        ) -> std::result::Result<Vec<std::result::Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let saw_tool_observation = request.messages.iter().any(|message| {
+                message.role == "tool" && message.tool_call_id.as_deref() == Some("task-read")
+            });
+            if saw_tool_observation {
+                return Ok(vec![
+                    Ok(StreamEvent::TextDelta(
+                        "TASK_TOOL_DONE after canonical observation".into(),
+                    )),
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                        reasoning_tokens: None,
+                    })),
+                    Ok(StreamEvent::Finished(FinishReason::Stop)),
+                ]);
+            }
+            Ok(vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "task-read".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path": self.target_path}),
+                })),
+                Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+            ])
+        }
+    }
+
+    fn setup_router_with_task_tool_provider(target_path: String) -> CommandRouter {
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(TaskToolRoundProvider {
+            target_path,
+            calls: AtomicUsize::new(0),
+        }));
+        CommandRouter::new(db).with_llm_router(LlmRouter::new(registry))
+    }
+
+    #[derive(Debug)]
     struct CapturingReplayProvider {
         calls: AtomicUsize,
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -17154,6 +17335,63 @@ $response | ConvertTo-Json -Depth 8 -Compress
             )
             .unwrap();
         assert!(compacted_seq >= 3);
+    }
+
+    #[test]
+    fn test_session_run_task_executes_provider_tool_call_before_final_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("task-evidence.txt");
+        fs::write(&file_path, "provider requested evidence").unwrap();
+        let sid = "sess_run_task_tool_loop";
+        let router = setup_router_with_task_tool_provider(file_path.display().to_string());
+
+        let response = router.dispatch(make_cmd(
+            "session.run_task",
+            Some(sid),
+            json!({
+                "content": "read the evidence before finalizing",
+                "task_id": "task-tool-loop",
+                "workspace": dir.path().display().to_string(),
+                "model": "task-tool/model",
+                "provider": "task_tool",
+            }),
+            None,
+        ));
+        assert_success(&response);
+        assert_eq!(response.result.as_ref().unwrap()["status"], "completed");
+        assert_eq!(
+            response.result.as_ref().unwrap()["answer"],
+            "TASK_TOOL_DONE after canonical observation"
+        );
+
+        let event_types: Vec<String> = router
+            .db
+            .conn()
+            .prepare("SELECT event_type FROM event_log WHERE session_id = ?1 ORDER BY seq")
+            .unwrap()
+            .query_map(params![sid], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            event_types.contains(&"tool.call_initiated".to_string()),
+            "session.run_task must turn provider tool requests into canonical tool starts: {event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"tool.call_completed".to_string()),
+            "session.run_task must complete provider-requested tools through the ledger: {event_types:?}"
+        );
+
+        let status: String = router
+            .db
+            .conn()
+            .query_row(
+                "SELECT status FROM tool_calls WHERE session_id = ?1 AND id = 'task-read'",
+                params![sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
     }
 
     // -----------------------------------------------------------------------

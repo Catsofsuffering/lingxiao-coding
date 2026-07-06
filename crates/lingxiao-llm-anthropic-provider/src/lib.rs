@@ -4,10 +4,13 @@ use anthropic_sdk::{
     LogLevel, MessageContent, MessageCreateBuilder, MessageStreamEvent, Role, StopReason, Tool,
 };
 use futures::StreamExt;
+use futures_util::StreamExt as FuturesStreamExt;
 use lingxiao_llm_host_protocol::{
     AuthContext, FinishReason, GenerateRequest, Message, ProviderError, ProviderErrorCode,
     StreamEvent, TokenUsage,
 };
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde_json::json;
 use serde_json::{Map, Value};
 use std::io::{self, BufRead, Write};
 use std::time::Duration;
@@ -96,6 +99,20 @@ async fn execute_messages_streaming<F>(
 where
     F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
 {
+    if requires_raw_anthropic_stream(request) {
+        let timeout = Duration::from_millis(request.options.timeout_ms_hint.unwrap_or(600_000));
+        return match tokio::time::timeout(timeout, execute_raw_messages_stream(request, sink)).await
+        {
+            Ok(result) => result,
+            Err(_) => sink(StreamEvent::Error(ProviderError::new(
+                ProviderErrorCode::Timeout,
+                format!(
+                    "Anthropic streaming request timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            ))),
+        };
+    }
     let config = resolved_config(request)?;
     let client = Anthropic::with_config(config)
         .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
@@ -158,14 +175,136 @@ where
     Ok(())
 }
 
-fn resolved_config(request: &GenerateRequest) -> Result<ClientConfig, AnthropicProviderError> {
-    let (key, auth_method) = match &request.auth_context {
-        AuthContext::ApiKey { key, .. } => (key.clone(), AuthMethod::Anthropic),
-        AuthContext::BearerToken { token, .. } => (token.clone(), AuthMethod::Bearer),
-        AuthContext::AwsSignature { .. } | AuthContext::AzureToken { .. } | AuthContext::None => {
-            return Err(AnthropicProviderError::UnsupportedAuth);
+async fn execute_raw_messages_stream<F>(
+    request: &GenerateRequest,
+    sink: &mut F,
+) -> Result<(), AnthropicProviderError>
+where
+    F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
+{
+    let (key, _) = anthropic_auth(request)?;
+    let metadata = request.options.metadata.as_ref();
+    let base_url = metadata
+        .and_then(|value| value.get("base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_URL);
+    let timeout = request.options.timeout_ms_hint.unwrap_or(600_000);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    if let Some(beta) = metadata
+        .and_then(|value| value.get("anthropic_beta"))
+        .and_then(Value::as_str)
+    {
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_str(beta)
+                .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?,
+        );
+    }
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout))
+        .build()
+        .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?
+        .post(format!("{}/v1/messages", base_url.trim_end_matches('/')))
+        .headers(headers)
+        .json(&anthropic_request_body(request, true)?)
+        .send()
+        .await
+        .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return sink(StreamEvent::Error(ProviderError::new(
+            map_response_status(status.as_u16()),
+            redact_error_message(if body.trim().is_empty() {
+                format!("Anthropic request failed with status {status}")
+            } else {
+                body
+            }),
+        )));
+    }
+    consume_raw_anthropic_sse(response, sink).await
+}
+
+async fn consume_raw_anthropic_sse<F>(
+    response: reqwest::Response,
+    sink: &mut F,
+) -> Result<(), AnthropicProviderError>
+where
+    F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
+{
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut tool_blocks: Vec<Option<(String, String, String)>> = Vec::new();
+    let mut saw_event = false;
+    while let Some(chunk) = FuturesStreamExt::next(&mut stream).await {
+        let chunk = chunk.map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
+        let text = std::str::from_utf8(&chunk)
+            .map_err(|e| AnthropicProviderError::Provider(format!("non-utf8 SSE chunk: {e}")))?;
+        buffer.push_str(text);
+        while let Some(index) = buffer.find("\n\n") {
+            let frame = buffer[..index].to_string();
+            buffer = buffer[index + 2..].to_string();
+            if process_raw_anthropic_sse_frame(&frame, &mut tool_blocks, sink)? {
+                return Ok(());
+            }
+            saw_event = true;
         }
-    };
+    }
+    if !buffer.trim().is_empty() {
+        process_raw_anthropic_sse_frame(&buffer, &mut tool_blocks, sink)?;
+        saw_event = true;
+    }
+    if !saw_event {
+        return Err(AnthropicProviderError::Provider(
+            "Anthropic stream ended without events".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn process_raw_anthropic_sse_frame<F>(
+    frame: &str,
+    tool_blocks: &mut Vec<Option<(String, String, String)>>,
+    sink: &mut F,
+) -> Result<bool, AnthropicProviderError>
+where
+    F: FnMut(StreamEvent) -> Result<(), AnthropicProviderError>,
+{
+    let mut data = String::new();
+    for line in frame.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim_start());
+        }
+    }
+    if data.trim().is_empty() {
+        return Ok(false);
+    }
+    if data.trim() == "[DONE]" {
+        return Ok(true);
+    }
+    let value: Value = serde_json::from_str(&data).map_err(|e| {
+        AnthropicProviderError::Provider(format!("Anthropic SSE decode failed: {e}"))
+    })?;
+    for event in raw_anthropic_sse_value_to_events(&value, tool_blocks) {
+        sink(event)?;
+    }
+    Ok(false)
+}
+
+fn resolved_config(request: &GenerateRequest) -> Result<ClientConfig, AnthropicProviderError> {
+    let (key, auth_method) = anthropic_auth(request)?;
     let metadata = request.options.metadata.as_ref();
     let base_url = metadata
         .and_then(|value| value.get("base_url"))
@@ -178,6 +317,18 @@ fn resolved_config(request: &GenerateRequest) -> Result<ClientConfig, AnthropicP
         .with_max_retries(0)
         .with_log_level(LogLevel::Off)
         .with_auth_method(auth_method))
+}
+
+fn anthropic_auth(
+    request: &GenerateRequest,
+) -> Result<(String, AuthMethod), AnthropicProviderError> {
+    match &request.auth_context {
+        AuthContext::ApiKey { key, .. } => Ok((key.clone(), AuthMethod::Anthropic)),
+        AuthContext::BearerToken { token, .. } => Ok((token.clone(), AuthMethod::Bearer)),
+        AuthContext::AwsSignature { .. } | AuthContext::AzureToken { .. } | AuthContext::None => {
+            Err(AnthropicProviderError::UnsupportedAuth)
+        }
+    }
 }
 
 fn to_message_params(request: &GenerateRequest) -> anthropic_sdk::MessageCreateParams {
@@ -203,6 +354,35 @@ fn to_message_params(request: &GenerateRequest) -> anthropic_sdk::MessageCreateP
         builder = builder.tools(anthropic_tools(request));
     }
     builder.build()
+}
+
+fn requires_raw_anthropic_stream(request: &GenerateRequest) -> bool {
+    request.stream
+        && request.options.metadata.as_ref().is_some_and(|metadata| {
+            metadata.get("thinking").is_some()
+                || metadata.get("output_config").is_some()
+                || metadata.get("anthropic_beta").is_some()
+        })
+}
+
+fn anthropic_request_body(
+    request: &GenerateRequest,
+    stream: bool,
+) -> Result<Value, AnthropicProviderError> {
+    let mut body = serde_json::to_value(to_message_params(request))
+        .map_err(|e| AnthropicProviderError::Provider(e.to_string()))?;
+    if stream {
+        body["stream"] = json!(true);
+    }
+    if let Some(metadata) = &request.options.metadata {
+        if let Some(thinking) = metadata.get("thinking") {
+            body["thinking"] = thinking.clone();
+        }
+        if let Some(output_config) = metadata.get("output_config") {
+            body["output_config"] = output_config.clone();
+        }
+    }
+    Ok(body)
 }
 
 fn add_message(builder: MessageCreateBuilder, message: &Message) -> MessageCreateBuilder {
@@ -300,11 +480,7 @@ fn anthropic_stream_event_to_events(
                 tool_blocks.resize_with(index + 1, || None);
             }
             if let ContentBlock::ToolUse { id, name, input } = content_block {
-                let partial_json = if input.is_null() {
-                    String::new()
-                } else {
-                    input.to_string()
-                };
+                let partial_json = initial_tool_input_json(&input);
                 tool_blocks[index] = Some((id.clone(), name.clone(), partial_json.clone()));
                 return vec![StreamEvent::ToolCallDelta(
                     lingxiao_llm_host_protocol::ToolCallDelta {
@@ -382,6 +558,181 @@ fn anthropic_stream_event_to_events(
     }
 }
 
+fn raw_anthropic_sse_value_to_events(
+    value: &Value,
+    tool_blocks: &mut Vec<Option<(String, String, String)>>,
+) -> Vec<StreamEvent> {
+    match value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "content_block_start" => {
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as usize;
+            if tool_blocks.len() <= index {
+                tool_blocks.resize_with(index + 1, || None);
+            }
+            let Some(content_block) = value.get("content_block") else {
+                return Vec::new();
+            };
+            if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                return Vec::new();
+            }
+            let id = content_block
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = content_block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let partial_json = content_block
+                .get("input")
+                .map(initial_tool_input_json)
+                .unwrap_or_default();
+            tool_blocks[index] = Some((id.clone(), name.clone(), partial_json.clone()));
+            vec![StreamEvent::ToolCallDelta(
+                lingxiao_llm_host_protocol::ToolCallDelta {
+                    index: index.min(u32::MAX as usize) as u32,
+                    id: Some(id),
+                    name: Some(name),
+                    partial_json: if partial_json.is_empty() {
+                        None
+                    } else {
+                        Some(partial_json)
+                    },
+                },
+            )]
+        }
+        "content_block_delta" => {
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as usize;
+            let Some(delta) = value.get("delta") else {
+                return Vec::new();
+            };
+            match delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "text_delta" => delta
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| vec![StreamEvent::TextDelta(text.to_string())])
+                    .unwrap_or_default(),
+                "thinking_delta" => delta
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .map(|thinking| vec![StreamEvent::ThinkingDelta(thinking.to_string())])
+                    .unwrap_or_default(),
+                "input_json_delta" => {
+                    if tool_blocks.len() <= index {
+                        tool_blocks.resize_with(index + 1, || None);
+                    }
+                    let partial_json = delta
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some((_, _, accumulated)) = tool_blocks[index].as_mut() {
+                        accumulated.push_str(&partial_json);
+                    }
+                    vec![StreamEvent::ToolCallDelta(
+                        lingxiao_llm_host_protocol::ToolCallDelta {
+                            index: index.min(u32::MAX as usize) as u32,
+                            id: tool_blocks[index].as_ref().map(|(id, _, _)| id.clone()),
+                            name: tool_blocks[index].as_ref().map(|(_, name, _)| name.clone()),
+                            partial_json: Some(partial_json),
+                        },
+                    )]
+                }
+                _ => Vec::new(),
+            }
+        }
+        "content_block_stop" => {
+            let index = value
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as usize;
+            let Some(Some((id, name, arguments))) = tool_blocks.get_mut(index).map(Option::take)
+            else {
+                return Vec::new();
+            };
+            let parsed_arguments = serde_json::from_str(&arguments).unwrap_or(Value::Null);
+            vec![StreamEvent::ToolCall(
+                lingxiao_llm_host_protocol::ToolCall {
+                    id,
+                    name,
+                    arguments: parsed_arguments,
+                },
+            )]
+        }
+        "message_delta" => {
+            let usage = value.get("usage");
+            let prompt_tokens = usage
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let completion_tokens = usage
+                .and_then(|usage| usage.get("output_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32;
+            let mut events = vec![StreamEvent::Usage(TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens.saturating_add(completion_tokens),
+                cache_creation_input_tokens: usage
+                    .and_then(|usage| usage.get("cache_creation_input_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                cache_read_input_tokens: usage
+                    .and_then(|usage| usage.get("cache_read_input_tokens"))
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                reasoning_tokens: None,
+            })];
+            if let Some(reason) = value
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                events.push(StreamEvent::Finished(map_stop_reason_str(reason)));
+            }
+            events
+        }
+        "message_stop" => vec![StreamEvent::Finished(FinishReason::Stop)],
+        "error" => vec![StreamEvent::Error(ProviderError::new(
+            ProviderErrorCode::ServerError,
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Anthropic stream error"),
+        ))],
+        _ => Vec::new(),
+    }
+}
+
+fn initial_tool_input_json(input: &Value) -> String {
+    if input.is_null() || input.as_object().is_some_and(Map::is_empty) {
+        String::new()
+    } else {
+        input.to_string()
+    }
+}
+
 fn message_to_stream_events(message: anthropic_sdk::Message) -> Vec<StreamEvent> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
@@ -442,6 +793,26 @@ fn map_stop_reason(reason: StopReason) -> FinishReason {
     }
 }
 
+fn map_stop_reason_str(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "max_tokens" => FinishReason::Length,
+        "tool_use" => FinishReason::ToolCalls,
+        _ => FinishReason::Unknown,
+    }
+}
+
+fn map_response_status(status: u16) -> ProviderErrorCode {
+    match status {
+        401 | 403 => ProviderErrorCode::Authentication,
+        400 | 404 | 422 => ProviderErrorCode::BadRequest,
+        408 => ProviderErrorCode::Timeout,
+        429 => ProviderErrorCode::RateLimited,
+        500..=599 => ProviderErrorCode::ServerError,
+        _ => ProviderErrorCode::Unknown,
+    }
+}
+
 fn provider_error_from_anthropic(error: anthropic_sdk::AnthropicError) -> ProviderError {
     let code = match error {
         anthropic_sdk::AnthropicError::Authentication { .. }
@@ -489,6 +860,78 @@ mod tests {
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"], "hello");
         assert_eq!(json["stream"], false);
+    }
+
+    #[test]
+    fn test_raw_anthropic_request_body_preserves_thinking_and_effort_metadata() {
+        let mut request = sample_request("http://localhost:1234");
+        request.stream = true;
+        request.options.metadata = Some(json!({
+            "base_url": "http://localhost:1234",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "output_config": {"effort": "high"},
+            "anthropic_beta": "interleaved-thinking-2025-05-14"
+        }));
+        request.tools = vec![lingxiao_llm_host_protocol::ToolDefinition {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+        }];
+        let body = anthropic_request_body(&request, true).unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert!(requires_raw_anthropic_stream(&request));
+    }
+
+    #[test]
+    fn test_raw_anthropic_sse_maps_thinking_and_tool_use() {
+        let mut tool_blocks = Vec::new();
+        let thinking = raw_anthropic_sse_value_to_events(
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "reasoning"}
+            }),
+            &mut tool_blocks,
+        );
+        assert!(matches!(&thinking[0], StreamEvent::ThinkingDelta(text) if text == "reasoning"));
+
+        let start = raw_anthropic_sse_value_to_events(
+            &json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}}
+            }),
+            &mut tool_blocks,
+        );
+        assert!(
+            matches!(&start[0], StreamEvent::ToolCallDelta(delta) if delta.name.as_deref() == Some("get_weather"))
+        );
+        let delta = raw_anthropic_sse_value_to_events(
+            &json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"city\":\"Shanghai\"}"}
+            }),
+            &mut tool_blocks,
+        );
+        assert!(
+            matches!(&delta[0], StreamEvent::ToolCallDelta(delta) if delta.partial_json.as_deref() == Some("{\"city\":\"Shanghai\"}"))
+        );
+        let done = raw_anthropic_sse_value_to_events(
+            &json!({"type": "content_block_stop", "index": 1}),
+            &mut tool_blocks,
+        );
+        assert!(
+            matches!(&done[0], StreamEvent::ToolCall(call) if call.name == "get_weather" && call.arguments == json!({"city": "Shanghai"}))
+        );
     }
 
     #[test]
