@@ -1,13 +1,15 @@
 use anthropic_sdk::types::ToolInputSchema;
 use anthropic_sdk::{
     Anthropic, AuthMethod, ClientConfig, ContentBlock, ContentBlockDelta, ContentBlockParam,
-    LogLevel, MessageContent, MessageCreateBuilder, MessageStreamEvent, Role, StopReason, Tool,
+    ImageSource, LogLevel, MessageContent, MessageCreateBuilder, MessageStreamEvent, Role,
+    StopReason, Tool,
 };
 use futures::StreamExt;
 use futures_util::StreamExt as FuturesStreamExt;
 use lingxiao_llm_host_protocol::{
-    AuthContext, FinishReason, GenerateRequest, Message, ProviderError, ProviderErrorCode,
-    StreamEvent, TokenUsage,
+    message_rehydrates_blob_at, rehydrate_image_blob_ref_if, retain_rounds_from_metadata,
+    AuthContext, FinishReason, GenerateRequest, Message, MessageContentPart, ProviderError,
+    ProviderErrorCode, StreamEvent, TokenUsage,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
@@ -430,14 +432,16 @@ fn anthropic_auth(
 }
 
 fn to_message_params(request: &GenerateRequest) -> anthropic_sdk::MessageCreateParams {
+    let retain_rounds = retain_rounds_from_metadata(request.options.metadata.as_ref());
     let mut builder = MessageCreateBuilder::new(
         request.model.clone(),
         request.options.max_tokens.unwrap_or(1024),
     )
     .stream(false);
 
-    for message in &request.messages {
-        builder = add_message(builder, message);
+    for (index, message) in request.messages.iter().enumerate() {
+        let rehydrate = message_rehydrates_blob_at(&request.messages, index, retain_rounds);
+        builder = add_message(builder, message, rehydrate);
     }
     if let Some(temperature) = request.options.temperature {
         builder = builder.temperature(temperature);
@@ -483,21 +487,21 @@ fn anthropic_request_body(
     Ok(body)
 }
 
-fn add_message(builder: MessageCreateBuilder, message: &Message) -> MessageCreateBuilder {
+fn add_message(
+    builder: MessageCreateBuilder,
+    message: &Message,
+    rehydrate: bool,
+) -> MessageCreateBuilder {
     match message.role.as_str() {
-        "system" => builder.system(message.content.clone()),
+        "system" => builder.system(message.plain_text_content()),
         "assistant" => {
+            let content = message.plain_text_content();
             if message.tool_calls.is_empty() {
-                builder.message(
-                    Role::Assistant,
-                    MessageContent::Text(message.content.clone()),
-                )
+                builder.message(Role::Assistant, MessageContent::Text(content))
             } else {
                 let mut blocks = Vec::new();
-                if !message.content.is_empty() {
-                    blocks.push(ContentBlockParam::Text {
-                        text: message.content.clone(),
-                    });
+                if !content.is_empty() {
+                    blocks.push(ContentBlockParam::Text { text: content });
                 }
                 for tool_call in &message.tool_calls {
                     blocks.push(ContentBlockParam::ToolUse {
@@ -513,12 +517,109 @@ fn add_message(builder: MessageCreateBuilder, message: &Message) -> MessageCreat
             Role::User,
             MessageContent::Blocks(vec![ContentBlockParam::ToolResult {
                 tool_use_id: message.tool_call_id.clone().unwrap_or_default(),
-                content: Some(message.content.clone()),
+                content: Some(message.plain_text_content()),
                 is_error: None,
             }]),
         ),
-        _ => builder.message(Role::User, MessageContent::Text(message.content.clone())),
+        _ => builder.message(
+            Role::User,
+            anthropic_user_message_content(message, rehydrate),
+        ),
     }
+}
+
+/// Build the Anthropic `MessageContent` for a user-role message.
+///
+/// Plain-text messages (no structured `content_parts`) stay a single
+/// `MessageContent::Text` so existing text-only behavior is byte-for-byte
+/// unchanged. When the message carries typed `content_parts`, the parts are
+/// projected into Anthropic content blocks: `text` → text block,
+/// `image_url` data URI → `image` block with a base64 source, and
+/// `image_blob_ref` → rehydrated from disk into an `image` block. A blob whose
+/// backing file is missing or unreadable, or that falls outside the retain
+/// window (`rehydrate == false`), degrades to a safe text placeholder (never a
+/// panic, never a `blob_path` leak) — matching the OpenAI provider and TS
+/// `toAnthropicContent`'s degrading semantics, and TS
+/// `rehydrateRecentImageBlobRefs`'s retain-rounds cutoff. Mirrors TS
+/// `AnthropicContentGenerator.toAnthropicContent`.
+fn anthropic_user_message_content(message: &Message, rehydrate: bool) -> MessageContent {
+    if message.content_parts.is_empty() {
+        return MessageContent::Text(message.plain_text_content());
+    }
+    let mut blocks = Vec::with_capacity(message.content_parts.len());
+    for part in &message.content_parts {
+        match part {
+            MessageContentPart::Text { text } => {
+                blocks.push(ContentBlockParam::Text { text: text.clone() });
+            }
+            MessageContentPart::Thinking { text, .. } => {
+                if !text.is_empty() {
+                    blocks.push(ContentBlockParam::Text { text: text.clone() });
+                }
+            }
+            MessageContentPart::RedactedThinking { .. } => {
+                blocks.push(ContentBlockParam::Text {
+                    text: "[redacted thinking]".to_string(),
+                });
+            }
+            MessageContentPart::ImageUrl { image_url } => {
+                if let Some(image) = anthropic_image_block_from_url(&image_url.url) {
+                    blocks.push(image);
+                } else {
+                    // Non data-URI image_url (e.g. a remote http URL) cannot be
+                    // expressed as an Anthropic base64 image block; degrade to
+                    // a textual marker the way TS does.
+                    blocks.push(ContentBlockParam::Text {
+                        text: format!("[image] {}", image_url.url),
+                    });
+                }
+            }
+            MessageContentPart::ImageBlobRef { image } => {
+                match rehydrate_image_blob_ref_if(image, rehydrate) {
+                    Some(url) => {
+                        if let Some(image_block) = anthropic_image_block_from_url(&url) {
+                            blocks.push(image_block);
+                        } else {
+                            blocks.push(ContentBlockParam::Text {
+                                text: part.plain_text(),
+                            });
+                        }
+                    }
+                    // Missing/unreadable blob file, or a blob outside the
+                    // retain window: degrade to the safe placeholder (short
+                    // blob id only; no path leak) instead of panicking or
+                    // dropping the part silently.
+                    None => blocks.push(ContentBlockParam::Text {
+                        text: part.plain_text(),
+                    }),
+                }
+            }
+        }
+    }
+    // Defensive: if structured parts produced no blocks (e.g. only empty
+    // thinking parts, all skipped), fall back to the plain-text projection so
+    // we never emit an empty content array — Anthropic rejects empty content.
+    if blocks.is_empty() {
+        return MessageContent::Text(message.plain_text_content());
+    }
+    MessageContent::Blocks(blocks)
+}
+
+/// Parse a `data:<media>;base64,<data>` URI into an Anthropic base64 image
+/// block. Returns `None` for any non-data URI so callers can degrade to a text
+/// marker. Mirrors TS `parseDataUrl`.
+fn anthropic_image_block_from_url(url: &str) -> Option<ContentBlockParam> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some(ContentBlockParam::Image {
+        source: ImageSource::Base64 {
+            media_type: media_type.to_string(),
+            data: data.to_string(),
+        },
+    })
 }
 
 fn anthropic_tools(request: &GenerateRequest) -> Vec<Tool> {
@@ -878,6 +979,13 @@ fn raw_anthropic_message_to_events(value: &Value) -> Vec<StreamEvent> {
                         }
                     }
                 }
+                "thinking" => {
+                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                        if !thinking.is_empty() {
+                            events.push(StreamEvent::ThinkingDelta(thinking.to_string()));
+                        }
+                    }
+                }
                 "tool_use" => {
                     let id = block
                         .get("id")
@@ -1065,6 +1173,308 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    // ─── R-1: Anthropic native multimodal (image blocks) ───────────────────
+    //
+    // These cover `anthropic_user_message_content` / `anthropic_image_block_from_url`
+    // directly plus an end-to-end `add_message` → serialized params check, so the
+    // wire shape is asserted without needing a live Anthropic endpoint.
+
+    #[test]
+    fn test_anthropic_user_message_emits_image_block_for_data_uri_image_url() {
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                MessageContentPart::Text {
+                    text: "describe this".into(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: lingxiao_llm_host_protocol::ImageUrlContentPart {
+                        url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                        detail: Some("high".into()),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let MessageContent::Blocks(blocks) = anthropic_user_message_content(&message, true) else {
+            panic!(
+                "expected Blocks for multimodal user message, got {:?}",
+                anthropic_user_message_content(&message, true)
+            );
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlockParam::Text { text } if text == "describe this"));
+        match &blocks[1] {
+            ContentBlockParam::Image { source } => match source {
+                ImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "iVBORw0KGgo=");
+                }
+                other => panic!("expected Base64 image source, got {other:?}"),
+            },
+            other => panic!("expected Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_user_message_rehydrates_blob_ref_into_image_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("shot.png");
+        // "iVBOR" PNG header bytes → base64 "iVBORw==" (matches TS/OpenAI tests).
+        std::fs::write(&blob_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![MessageContentPart::ImageBlobRef {
+                image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                    blob_id: "blob_rehydrate_anthropic".into(),
+                    mime: "image/png".into(),
+                    size: 4,
+                    blob_path: blob_path.display().to_string(),
+                    source: None,
+                },
+            }],
+            ..Default::default()
+        };
+        let MessageContent::Blocks(blocks) = anthropic_user_message_content(&message, true) else {
+            panic!("expected Blocks for blob-ref user message");
+        };
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlockParam::Image { source } => match source {
+                ImageSource::Base64 { media_type, data } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "iVBORw==");
+                }
+                other => panic!("expected rehydrated Base64 source, got {other:?}"),
+            },
+            other => panic!("expected rehydrated Image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_user_message_missing_blob_falls_back_to_safe_text_placeholder() {
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![MessageContentPart::ImageBlobRef {
+                image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                    blob_id: "blob_missing_anthropic".into(),
+                    mime: "image/png".into(),
+                    size: 2048,
+                    blob_path: "/definitely/does/not/exist/blob_missing_anthropic.png".into(),
+                    source: None,
+                },
+            }],
+            ..Default::default()
+        };
+        let MessageContent::Blocks(blocks) = anthropic_user_message_content(&message, true) else {
+            panic!("expected Blocks even when blob is missing (graceful degradation)");
+        };
+        assert_eq!(blocks.len(), 1, "missing blob must degrade, not vanish");
+        let ContentBlockParam::Text { text } = &blocks[0] else {
+            panic!("expected text fallback block, got {:?}", blocks[0]);
+        };
+        // Safe placeholder carries the SHORT blob id (first 12 chars, matching
+        // the TS/OpenAI projection) but NEVER the blob_path.
+        assert!(
+            text.contains("blob_missing"),
+            "placeholder should carry the short blob id: {text}"
+        );
+        assert!(
+            !text.contains("/definitely/does/not/exist"),
+            "blob_path must not leak into the placeholder: {text}"
+        );
+        assert!(
+            text.contains("[image"),
+            "placeholder should read as an image marker: {text}"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_user_message_pure_text_stays_compatible() {
+        // No content_parts → single MessageContent::Text, byte-for-byte the
+        // legacy behavior (regression guard for text-only requests).
+        let message = Message {
+            role: "user".into(),
+            content: "just text".into(),
+            content_parts: Vec::new(),
+            ..Default::default()
+        };
+        let MessageContent::Text(text) = anthropic_user_message_content(&message, true) else {
+            panic!("expected plain Text for text-only message");
+        };
+        assert_eq!(text, "just text");
+    }
+
+    #[test]
+    fn test_anthropic_add_message_preserves_assistant_text_and_tool_use() {
+        // Assistant tool-call history must still carry its text block + tool_use
+        // blocks (R-1 must not regress tool-use replay).
+        let message = Message {
+            role: "assistant".into(),
+            content: String::new(),
+            content_parts: Vec::new(),
+            tool_calls: vec![lingxiao_llm_host_protocol::ToolCall {
+                id: "toolu_1".into(),
+                name: "get_weather".into(),
+                arguments: json!({"city": "Shanghai"}),
+            }],
+            ..Default::default()
+        };
+        // We assert via the serialized builder so the full add_message path runs.
+        let request = sample_request_with_message(message, "http://localhost:1234");
+        let params = to_message_params(&request);
+        let serialized = serde_json::to_value(&params).unwrap();
+        let assistant = &serialized["messages"][0];
+        assert_eq!(assistant["role"], "assistant");
+        let blocks = assistant["content"].as_array().unwrap();
+        // No text content (content was empty) → only the tool_use block.
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "toolu_1");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"]["city"], "Shanghai");
+    }
+
+    #[test]
+    fn test_anthropic_add_message_emits_image_block_in_serialized_params() {
+        // End-to-end through add_message → to_message_params → JSON, asserting
+        // the Anthropic wire shape carries an image block for a data-URI image_url.
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                MessageContentPart::Text {
+                    text: "look".into(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: lingxiao_llm_host_protocol::ImageUrlContentPart {
+                        url: "data:image/jpeg;base64,/9j/4AAQ".into(),
+                        detail: None,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let request = sample_request_with_message(message, "http://localhost:1234");
+        let params = to_message_params(&request);
+        let serialized = serde_json::to_value(&params).unwrap();
+        let user = &serialized["messages"][0];
+        assert_eq!(user["role"], "user");
+        let blocks = user["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "look");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
+        assert_eq!(blocks[1]["source"]["data"], "/9j/4AAQ");
+    }
+
+    #[test]
+    fn test_anthropic_retain_window_degrades_old_blob_to_text_on_wire() {
+        // Two user rounds each carrying a rehydratable blob. With retain=1
+        // only the most recent round rehydrates; the older round's blob
+        // degrades to a text block on the wire (never an image block, never a
+        // blob_path leak). The recent round still rehydrates a real image block.
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.png");
+        let new_path = dir.path().join("new.png");
+        std::fs::write(&old_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        std::fs::write(&new_path, [0xFF, 0xD8, 0xFF]).unwrap();
+        let old_path_str = old_path.display().to_string();
+        let new_path_str = new_path.display().to_string();
+
+        let blob_ref = |path: &str, id: &str| MessageContentPart::ImageBlobRef {
+            image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                blob_id: id.into(),
+                mime: "image/png".into(),
+                size: 4,
+                blob_path: path.into(),
+                source: None,
+            },
+        };
+        let request = GenerateRequest {
+            model: "claude-test".into(),
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: String::new(),
+                    content_parts: vec![blob_ref(&old_path_str, "blob_old_anth")],
+                    ..Default::default()
+                }, // round 1 (index 0)
+                Message {
+                    role: "assistant".into(),
+                    content: "ack".into(),
+                    ..Default::default()
+                }, // index 1
+                Message {
+                    role: "user".into(),
+                    content: String::new(),
+                    content_parts: vec![blob_ref(&new_path_str, "blob_new_anth")],
+                    ..Default::default()
+                }, // round 2 (index 2)
+            ],
+            tools: Vec::new(),
+            stream: true,
+            auth_context: AuthContext::ApiKey {
+                provider: "anthropic".into(),
+                key: "sk-ant-test".into(),
+            },
+            options: lingxiao_llm_host_protocol::RequestOptions {
+                max_tokens: Some(12),
+                metadata: Some(json!({
+                    "image_history_retain_rounds": 1
+                })),
+                ..Default::default()
+            },
+        };
+
+        let params = to_message_params(&request);
+        let serialized = serde_json::to_value(&params).unwrap();
+
+        // Old round (messages[0]): blob degrades to a text block.
+        let old_blocks = serialized["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(old_blocks.len(), 1);
+        assert_eq!(old_blocks[0]["type"], "text");
+        let old_placeholder = old_blocks[0]["text"].as_str().unwrap();
+        assert!(
+            old_placeholder.contains("blob_old_ant"),
+            "placeholder should carry the short blob id: {old_placeholder}"
+        );
+        assert!(
+            !old_placeholder.contains(&old_path_str),
+            "blob_path must not leak: {old_placeholder}"
+        );
+
+        // Recent round (messages[2]): blob rehydrates into a real image block.
+        let new_blocks = serialized["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(new_blocks.len(), 1);
+        assert_eq!(new_blocks[0]["type"], "image");
+        assert_eq!(new_blocks[0]["source"]["type"], "base64");
+        assert_eq!(new_blocks[0]["source"]["media_type"], "image/png");
+    }
+
+    fn sample_request_with_message(message: Message, base_url: &str) -> GenerateRequest {
+        GenerateRequest {
+            model: "claude-test".into(),
+            messages: vec![message],
+            tools: Vec::new(),
+            stream: true,
+            auth_context: AuthContext::ApiKey {
+                provider: "anthropic".into(),
+                key: "sk-ant-test".into(),
+            },
+            options: lingxiao_llm_host_protocol::RequestOptions {
+                max_tokens: Some(12),
+                metadata: Some(json!({"base_url": base_url})),
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn test_request_shape_uses_anthropic_sdk_types() {
         let request = sample_request("http://localhost:1234");
@@ -1210,6 +1620,39 @@ mod tests {
         assert!(matches!(
             &events[2],
             StreamEvent::Finished(FinishReason::Stop)
+        ));
+    }
+
+    #[test]
+    fn test_raw_anthropic_message_to_events_maps_thinking_and_tool_use() {
+        let events = raw_anthropic_message_to_events(&json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "plan the call", "signature": "sig"},
+                {"type": "text", "text": "I'll read it."},
+                {"type": "tool_use", "id": "toolu_1", "name": "file_read", "input": {"path": "README.md"}}
+            ],
+            "model": "claude-test",
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 2, "output_tokens": 3}
+        }));
+
+        assert!(matches!(&events[0], StreamEvent::ThinkingDelta(text) if text == "plan the call"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(text) if text == "I'll read it."));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::ToolCall(call)
+                if call.id == "toolu_1"
+                    && call.name == "file_read"
+                    && call.arguments["path"] == "README.md"
+        ));
+        assert!(matches!(&events[3], StreamEvent::Usage(usage) if usage.total_tokens == 5));
+        assert!(matches!(
+            &events[4],
+            StreamEvent::Finished(FinishReason::ToolCalls)
         ));
     }
 

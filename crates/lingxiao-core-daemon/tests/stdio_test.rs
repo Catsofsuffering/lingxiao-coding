@@ -794,8 +794,9 @@ fn write_task_llm_script(dir: &std::path::Path) -> PathBuf {
 $line = [Console]::In.ReadLine()
 $req = $line | ConvertFrom-Json
 if ($req.auth_context.key -ne 'sk-task-e2e') { exit 2 }
+$task = ($req.messages | Where-Object { $_.role -eq 'user' } | Select-Object -Last 1).content
 @{ ThinkingDelta = 'planning the task' } | ConvertTo-Json -Compress
-@{ TextDelta = "TASK_DONE: $($req.messages[0].content)" } | ConvertTo-Json -Compress
+@{ TextDelta = "TASK_DONE: $task" } | ConvertTo-Json -Compress
 @{ Usage = @{
     prompt_tokens = 7
     completion_tokens = 11

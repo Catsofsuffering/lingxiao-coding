@@ -1,6 +1,7 @@
 use lingxiao_core::command::CommandRouter;
 use lingxiao_core::llm::{
-    ExternalProcessProvider, LlmRouter, ModelRoutingMetadata, ProviderRegistry,
+    CapabilityRegistry, ExternalProcessProvider, LlmRouter, ModelRoutingMetadata,
+    ModelsDevRegistry, ProviderRegistry,
 };
 use lingxiao_core::persistence::DbOwner;
 use lingxiao_core::process::ProcessRegistry;
@@ -71,12 +72,22 @@ pub fn serve_with_runtime_config(db_path: &str, config_path: Option<&str>) -> Re
         Some(path) => RuntimeConfig::load(path)?,
         None => RuntimeConfig::default(),
     };
-    let router = configure_router(CommandRouter::new(db), &config)?;
+    let router = configure_router(CommandRouter::new(db.clone()), &config)?;
     let router = Arc::new(router);
     let _schedule_ticker = config
         .background_schedule_tick_ms
         .filter(|interval| *interval > 0)
         .map(|interval| ScheduleTicker::start(Arc::clone(&router), interval));
+    // Periodic, non-killing process-orphan reconcile sweep. The daemon owns a
+    // fresh `ProcessRegistry` over the shared `DbOwner`; the ticker probes each
+    // `active` owned-process row for liveness and marks dead-PID rows
+    // `reconciled_dead` without ever killing a live managed process. Disabled
+    // by default (`background_process_reconcile_ms` unset/0) to preserve the
+    // prior boot-only behavior.
+    let _process_reconcile_ticker = config
+        .background_process_reconcile_ms
+        .filter(|interval| *interval > 0)
+        .map(|interval| ProcessReconcileTicker::start(db, interval));
     serve_with_router_arc(router)
 }
 
@@ -87,7 +98,13 @@ fn configure_router(
     let mut router = router;
 
     if !config.llm_providers.is_empty() {
-        let mut registry = ProviderRegistry::new();
+        // Attach the offline models.dev capability registry so `supports_vision`
+        // is auto-derived for models the operator did not explicitly declare.
+        // Explicit `supports_vision` in runtime.json still takes precedence
+        // (see `ProviderRegistry::provider_supports_vision`). No network fetch:
+        // the registry is the build-time-embedded models.dev snapshot.
+        let capability_registry: Arc<dyn CapabilityRegistry> = Arc::new(ModelsDevRegistry::new());
+        let mut registry = ProviderRegistry::new().with_capability_registry(capability_registry);
         for provider in config.llm_providers.clone() {
             let provider_id = provider.provider_id.clone();
             let mut external = ExternalProcessProvider::new(
@@ -120,6 +137,9 @@ fn configure_router(
                 if let Some(supports_streaming) = provider.supports_streaming {
                     metadata = metadata.with_streaming_support(supports_streaming);
                 }
+                if let Some(supports_vision) = provider.supports_vision {
+                    metadata = metadata.with_vision_support(supports_vision);
+                }
                 registry.register_model_metadata(metadata);
             }
         }
@@ -148,6 +168,16 @@ struct RuntimeConfig {
     sidecars: Vec<SidecarConfig>,
     #[serde(default)]
     background_schedule_tick_ms: Option<u64>,
+    /// Interval (ms) for the periodic, non-killing process-orphan reconcile
+    /// sweep. When `Some(n > 0)`, the daemon spawns a background ticker that
+    /// calls `ProcessRegistry::reconcile_orphans` every `n` ms — marking
+    /// `owned_processes` rows whose PID has already exited as
+    /// `reconciled_dead` without ever killing a live managed process (unlike
+    /// the boot-time `cleanup_orphans`, which is unsafe to run periodically).
+    /// `None`/`0` keeps the daemon boot-only (no recurring sweep). Default
+    /// `None` preserves prior behavior.
+    #[serde(default)]
+    background_process_reconcile_ms: Option<u64>,
 }
 
 impl RuntimeConfig {
@@ -174,6 +204,7 @@ struct LlmProviderConfig {
     context_window: Option<u32>,
     supports_tools: Option<bool>,
     supports_streaming: Option<bool>,
+    supports_vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,6 +267,70 @@ impl ScheduleTicker {
 }
 
 impl Drop for ScheduleTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Periodic, **non-killing** process-orphan reconcile ticker.
+///
+/// Unlike `ScheduleTicker` (which dispatches commands through the router),
+/// this ticker owns a `ProcessRegistry` directly and calls
+/// [`ProcessRegistry::reconcile_orphans`] on each tick. That method probes each
+/// `active` owned-process row for liveness and marks dead-PID rows
+/// `reconciled_dead` **without ever killing a live process** — the safe
+/// recurring counterpart to the boot-time `cleanup_orphans` (which kills every
+/// active row and is therefore only correct at boot). A reconcile error on a
+/// single tick is logged to stderr and swallowed so a transient DB lock never
+/// tears down the sweep; the ticker keeps running until `shutdown`/drop.
+pub struct ProcessReconcileTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ProcessReconcileTicker {
+    pub fn start(db: DbOwner, interval_ms: u64) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("lingxiao-process-reconcile".into())
+            .spawn(move || {
+                let registry = ProcessRegistry::new(db);
+                while !stop_thread.load(Ordering::SeqCst) {
+                    match registry.reconcile_orphans() {
+                        Ok(report) if report.cleaned > 0 => {
+                            eprintln!(
+                                "Process reconcile: inspected={}, marked_dead={}",
+                                report.attempted, report.cleaned
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            eprintln!("Process reconcile sweep failed: {error}");
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(interval_ms.max(1)));
+                }
+            })
+            .expect("failed to spawn process reconcile ticker thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ProcessReconcileTicker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
@@ -421,9 +516,11 @@ mod tests {
                 context_window: Some(1024),
                 supports_tools: Some(false),
                 supports_streaming: Some(true),
+                supports_vision: None,
             }],
             sidecars: Vec::new(),
             background_schedule_tick_ms: None,
+            background_process_reconcile_ms: None,
         };
         let router = configure_router(CommandRouter::new(db), &config).unwrap();
         let sid = create_session(&router);
@@ -552,5 +649,126 @@ mod tests {
         }
         ticker.shutdown();
         panic!("schedule ticker did not fire due schedule");
+    }
+
+    #[test]
+    fn test_process_reconcile_ticker_marks_dead_pid_row_without_killing_live() {
+        // The periodic reconcile ticker must mark `owned_processes` rows whose
+        // PID has exited as `reconciled_dead`, while leaving a live row
+        // `active` (the boot-time `cleanup_orphans` kills every active row and
+        // is unsafe to run periodically — this test pins the non-killing
+        // contract of the recurring sweep).
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+
+        // Register a live managed process (a short sleep we keep alive) and a
+        // dead (already-exited) child.
+        let mut live = spawn_short_sleep_child();
+        let live_pid = live.id();
+        let registry = ProcessRegistry::new(db.clone());
+        registry
+            .register("live-managed", live_pid, "test", "owner", "live")
+            .unwrap();
+
+        let short = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        let mut cmd = short;
+        if cfg!(windows) {
+            cmd.args(["/C", "exit 0"]);
+        } else {
+            cmd.args(["-c", "true"]);
+        }
+        let mut exited = cmd.spawn().unwrap();
+        let dead_pid = exited.id();
+        exited.wait().unwrap();
+        // Wait until the OS reaped it so the liveness probe sees it as gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !lingxiao_core::process::pid_is_alive(dead_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        registry
+            .register("already-dead", dead_pid, "test", "owner", "dead")
+            .unwrap();
+
+        let ticker = ProcessReconcileTicker::start(db.clone(), 10);
+        let ok = std::sync::atomic::AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            let dead_status: Option<String> = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM owned_processes WHERE id = 'already-dead'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            let live_status: Option<String> = db
+                .conn()
+                .query_row(
+                    "SELECT status FROM owned_processes WHERE id = 'live-managed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok();
+            if dead_status.as_deref() == Some("reconciled_dead")
+                && live_status.as_deref() == Some("active")
+            {
+                ok.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        ticker.shutdown();
+
+        assert!(
+            ok.load(std::sync::atomic::Ordering::SeqCst),
+            "reconcile ticker did not mark dead row while keeping live row active"
+        );
+        // The live managed process is still alive — the sweep never killed it.
+        assert!(
+            lingxiao_core::process::pid_is_alive(live_pid),
+            "live managed process must survive the reconcile sweep"
+        );
+        let _ = lingxiao_core::process::kill_pid_tree(live_pid);
+        let _ = live.wait();
+    }
+
+    fn spawn_short_sleep_child() -> std::process::Child {
+        use std::process::{Command, Stdio};
+        let mut command = if cfg!(windows) {
+            let powershell = resolve_powershell();
+            let mut c = Command::new(powershell);
+            c.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        lingxiao_core::process::configure_command_for_process_tree(&mut command);
+        command.spawn().unwrap()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn resolve_powershell() -> std::path::PathBuf {
+        for key in ["SystemRoot", "windir", "SYSTEMROOT", "WINDIR"] {
+            if let Ok(root) = std::env::var(key) {
+                let candidate = std::path::Path::new(&root)
+                    .join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe");
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+        std::path::PathBuf::from("powershell.exe")
     }
 }

@@ -46,8 +46,10 @@ export const LLM = {
    * 首 token 超时 (秒) — 流式请求建连后等待第一个 token 的最长时间。
    * 超时后 abort 当前 attempt 并按 stream_timeout 重试（recycle 连接池）。
    * 非流式请求不使用此超时，由 request_timeout_s + hang watchdog 兜底。
-   */
+  */
   FIRST_TOKEN_TIMEOUT_S: 30,
+  /** Streaming inactivity timeout between chunks (seconds), retained for settings compatibility. */
+  STREAM_CHUNK_TIMEOUT_S: 120,
   /**
    * thinking 模型的首 token 超时 (秒) — reasoning 模型在输出前有内部思考阶段，
    * 正常可能 30-60s 才出第一个 token。90s 给足够余量，超时则大概率是排队/hang。

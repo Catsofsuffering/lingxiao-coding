@@ -43,8 +43,15 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
 - Gemini provider now maps `ToolDefinition.input_schema` into Gemini function
   parameters, supports `streamGenerateContent?alt=sse` when `request.stream` is
   true, and generates unique fallback tool-call IDs.
-- Bedrock provider no longer silently ignores `stream=true`; it emits an explicit
-  unsupported streaming capability error.
+- Bedrock provider now implements true streaming parity: `stream=true` calls
+  `InvokeModelWithResponseStream` and parses the Anthropic-on-Bedrock event
+  stream (each AWS event-stream `chunk`'s `PayloadPart.bytes` blob is one
+  complete Anthropic Messages SSE event JSON, parsed by the new pure
+  `bedrock_stream_chunk_to_events` mirroring the Anthropic provider's
+  `raw_anthropic_sse_value_to_events`), instead of the prior explicit
+  `UnsupportedModel` short-circuit. Non-streaming behavior and multimodal are
+  unchanged. 14 new tests cover the parser, routing, and a genuine
+  `aws-smithy-eventstream` framing round-trip (no real AWS calls).
 - External process LLM and native shell paths drain stdout/stderr concurrently
   with bounded buffers, preventing pipe-buffer deadlocks.
 - Anthropic streaming suppresses duplicate `Finished` events so `MessageDelta`
@@ -112,9 +119,14 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
 
 ## Remaining Risks
 
-- Bedrock streaming is explicitly unsupported in this branch rather than fully
-  implemented. The production contract now prevents silent streaming parity
-  claims, but true Bedrock streaming parity remains future work.
+- Bedrock streaming is now implemented (R-9): `stream=true` calls
+  `InvokeModelWithResponseStream` and parses the Anthropic-on-Bedrock event
+  stream into host `StreamEvent`s (text/thinking/tool-use deltas, usage,
+  finish, duplicate-`Finished` suppression, safe error handling). The prior
+  explicit `UnsupportedModel` short-circuit is removed. A real-provider Bedrock
+  streaming smoke against a live `anthropic.claude-*` model remains
+  operator-credential-gated future work (not a code gap); parser/framing
+  coverage is unit-tested without real AWS calls.
 - Anthropic live smoke passed for a minimal request. Tool-use and thinking
   variants should still be rechecked when the upstream gateway supports those
   response shapes consistently.
@@ -124,10 +136,27 @@ Worktree: `C:\Users\peony\.paseo\worktrees\30nx4bm8\rude-rat`
   design item.
 - Retry/fallback total wall-clock deadline remains bounded by per-attempt
   provider timeouts and retry counts, not by a single global deadline across the
-  whole fallback chain.
+  whole fallback chain. **Verified (2026-07-08, R-8 scoping) not a TS-parity
+  gap:** TS `LlmGuard.call()` (src/agents/LlmGuard.ts:247 `while(true)` loop)
+  likewise imposes no total/global deadline over the retry+fallback chain — it
+  bounds each attempt independently (SDK `request_timeout` 180s + hang watchdog
+  + first-token timeout, all per-attempt) and exits on retry-count exhaustion
+  (`maxRetries` default 3) / circuit-open (8 failures) / caller abort. The only
+  time-based outer bound is the Leader per-round 600s abort, which wraps the
+  whole `llmGuard.call()` as an outer safety net, not a deadline within the
+  chain. Both sides are per-attempt-bounded; this is a shared P3 design item,
+  not a Rust-vs-TS divergence.
 - Periodic orphan cleanup exists at daemon boot via `ProcessRegistry`, and
-  retention has a daemon ticker. A long-running periodic process-orphan sweep is
-  not separately scheduled in this patch.
+  retention has a daemon ticker. **A long-running periodic process-orphan
+  reconcile sweep is now scheduled** (2026-07-08, R-8): a default-off
+  `ProcessReconcileTicker` spawned when `background_process_reconcile_ms` is
+  `Some(n>0)` calls the new non-killing `ProcessRegistry::reconcile_orphans`
+  each tick, which probes each `active` `owned_processes` row for liveness via
+  `pid_is_alive` and flips dead-PID rows to `reconciled_dead` without ever
+  killing a live managed process (the boot-time `cleanup_orphans` kills every
+  active row and remains boot-only — safe at boot, unsafe periodically). This
+  closes the registry-leak where a row left `active` by a mid-session process
+  death stayed active forever.
 - MCP command execution is now permission-gated and workspace-cwd scoped, but
   executable program allowlisting is still policy-driven by the `mcp` grant
   rather than a separate static allowlist.

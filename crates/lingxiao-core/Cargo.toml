@@ -17,6 +17,28 @@ thiserror = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 fastrand = "2"
 wait-timeout = "0.2"
+# SHA-1 for the ToolFailureLoopGuard args fingerprint. TS `hashArgs` uses a
+# 16-char SHA-1 truncation of the stable-JSON args; Rust matches that semantics
+# so equal-args collapse to the same key regardless of key ordering. SHA-1 is
+# used as a fingerprint only (not for security) — but it is also *one-way*, so
+# the durable escalation payload (persisted to event_log) carries the hash
+# rather than the raw args, preventing args-secrets from leaking into the
+# durable record. Required by R-7 follow-up Leader-bus escalation.
+sha1 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `windows-sys` is used only for the periodic process-orphan reconcile sweep's
+# non-killing liveness probe (`pid_is_alive`): `OpenProcess` +
+# `GetExitCodeProcess` lets us detect that a managed process has exited without
+# spawning a `taskkill`/`powershell` subprocess per checked PID (and without
+# ever killing a live process, unlike the boot-time `cleanup_orphans`). 0.52 is
+# already resolved in the workspace lockfile (transitive via rusqlite/tokio),
+# so this adds no new download. Mirrors the TS `PidRegistry.isSamePidEntry`
+# `processExists` probe that TS uses for lazy reconciliation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

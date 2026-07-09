@@ -1,4 +1,4 @@
-use crate::process::ProcessRegistry;
+use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use lingxiao_tool_host_protocol::{
     PermissionLease, ResourceUsage, SidecarError, SidecarErrorCode, SidecarRequest, SidecarResponse,
 };
@@ -112,7 +112,8 @@ impl SidecarScheduler {
 
     pub fn execute(&self, invocation: SidecarInvocation) -> Result<SidecarExecution, SidecarError> {
         let cancel = self.register_cancel_token(invocation.request.cancel_token.token_id.clone());
-        let mut child = Command::new(&invocation.command.program)
+        let mut command = Command::new(&invocation.command.program);
+        command
             .args(&invocation.command.args)
             .current_dir(
                 invocation
@@ -123,7 +124,9 @@ impl SidecarScheduler {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_command_for_process_tree(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|e| sidecar_error(&invocation.request, SidecarErrorCode::TransportError, e))?;
         let stdout_drain = child.stdout.take().map(spawn_output_drain);
@@ -152,7 +155,7 @@ impl SidecarScheduler {
         let started = Instant::now();
         let status = loop {
             if cancel.is_cancelled() {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let stderr = collect_output(stderr_drain);
                 let _ = collect_output(stdout_drain);
@@ -169,7 +172,7 @@ impl SidecarScheduler {
                 });
             }
             if started.elapsed() > Duration::from_millis(invocation.timeout_ms) {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let stderr = collect_output(stderr_drain);
                 let _ = collect_output(stdout_drain);

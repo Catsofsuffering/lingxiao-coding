@@ -1,4 +1,4 @@
-use crate::process::ProcessRegistry;
+use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -54,6 +54,14 @@ impl TerminalManager {
     }
 
     pub fn create(&self, options: TerminalCreateOptions) -> Result<TerminalCreated, String> {
+        if let Some(mut existing) = self.sessions.lock().unwrap().remove(&options.terminal_id) {
+            let _ = kill_child_tree(&mut existing.child);
+            let _ = existing.child.wait();
+            let _ = self
+                .process_registry
+                .mark_failed(&format!("terminal:{}", options.terminal_id), "replaced");
+        }
+
         let (shell, args) = shell_command(options.shell, options.args);
         let mut command = Command::new(&shell);
         command
@@ -64,6 +72,7 @@ impl TerminalManager {
         if let Some(cwd) = options.cwd.as_deref() {
             command.current_dir(cwd);
         }
+        configure_command_for_process_tree(&mut command);
 
         let mut child = command
             .spawn()
@@ -94,7 +103,7 @@ impl TerminalManager {
             options.terminal_id.clone(),
             shell.clone(),
         ) {
-            let _ = child.kill();
+            let _ = kill_child_tree(&mut child);
             let _ = child.wait();
             return Err(format!("terminal process registration failed: {error}"));
         }
@@ -122,6 +131,11 @@ impl TerminalManager {
     }
 
     pub fn send(&self, terminal_id: &str, input: &str) -> Result<usize, String> {
+        if contains_terminal_escape(input) {
+            return Err(
+                "terminal input contains unsupported ANSI escape/control sequence".to_string(),
+            );
+        }
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get_mut(terminal_id)
@@ -190,9 +204,7 @@ impl TerminalManager {
         let exit_code = match status {
             Some(status) => status.code(),
             None => {
-                session
-                    .child
-                    .kill()
+                kill_child_tree(&mut session.child)
                     .map_err(|error| format!("terminal kill failed: {error}"))?;
                 session
                     .child
@@ -262,6 +274,12 @@ fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).to_string()
 }
 
+fn contains_terminal_escape(input: &str) -> bool {
+    input
+        .chars()
+        .any(|ch| matches!(ch, '\u{001b}' | '\u{009b}'))
+}
+
 #[allow(dead_code)]
 fn default_cwd() -> &'static Path {
     Path::new(".")
@@ -299,5 +317,54 @@ mod tests {
         assert!(seen);
         manager.kill("term-1").unwrap();
         assert!(manager.live_session_ids().is_empty());
+    }
+
+    #[test]
+    fn test_terminal_manager_rejects_ansi_escape_input() {
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let manager = TerminalManager::new(ProcessRegistry::new(db));
+        manager
+            .create(TerminalCreateOptions {
+                terminal_id: "term-ansi".to_string(),
+                shell: None,
+                args: Vec::new(),
+                cwd: None,
+            })
+            .unwrap();
+
+        let err = manager
+            .send("term-ansi", "\u{001b}]52;c;Zm9v\u{0007}\n")
+            .unwrap_err();
+
+        assert!(err.contains("ANSI escape"));
+        manager.kill("term-ansi").unwrap();
+    }
+
+    #[test]
+    fn test_terminal_manager_replacing_session_kills_old_process() {
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let manager = TerminalManager::new(ProcessRegistry::new(db));
+        manager
+            .create(TerminalCreateOptions {
+                terminal_id: "term-replace".to_string(),
+                shell: None,
+                args: Vec::new(),
+                cwd: None,
+            })
+            .unwrap();
+
+        manager
+            .create(TerminalCreateOptions {
+                terminal_id: "term-replace".to_string(),
+                shell: None,
+                args: Vec::new(),
+                cwd: None,
+            })
+            .unwrap();
+
+        assert_eq!(manager.live_session_ids(), vec!["term-replace".to_string()]);
+        manager.kill("term-replace").unwrap();
     }
 }

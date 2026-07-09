@@ -1,3 +1,4 @@
+use crate::process::{configure_command_for_process_tree, kill_child_tree};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Read;
@@ -194,6 +195,8 @@ fn schema_for_tool(name: &str) -> Value {
                                 "type": {"type": "string", "enum": ["replace", "line_replace"]},
                                 "old": {"type": "string"},
                                 "new": {"type": "string"},
+                                "content": {"type": "string"},
+                                "replace": {"type": "string"},
                                 "replace_all": {"type": "boolean"},
                                 "start_line": {"type": "integer", "minimum": 1},
                                 "end_line": {"type": "integer", "minimum": 1}
@@ -574,8 +577,16 @@ fn tool_structured_patch() -> ToolDefinition {
                         }
                         let replacement = operation
                             .get("content")
+                            .or_else(|| operation.get("new"))
+                            .or_else(|| operation.get("replace"))
                             .and_then(Value::as_str)
-                            .unwrap_or("");
+                            .ok_or_else(|| {
+                                "line_replace operation missing content/new/replace".to_string()
+                            });
+                        let replacement = match replacement {
+                            Ok(replacement) => replacement,
+                            Err(message) => return ToolResult::err(message),
+                        };
                         let had_trailing_newline = content.ends_with('\n');
                         let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
                         let start = (start_line - 1) as usize;
@@ -891,6 +902,9 @@ fn tool_shell() -> ToolDefinition {
                 Some(c) => c.to_string(),
                 None => return ToolResult::err("Missing required param: command"),
             };
+            if let Some(reason) = unsafe_shell_control_reason(&cmd_str) {
+                return ToolResult::err(format!("shell command rejected: {reason}"));
+            }
             let timeout_ms = args
                 .get("timeout_ms")
                 .and_then(|v| v.as_u64())
@@ -902,14 +916,15 @@ fn tool_shell() -> ToolDefinition {
             #[cfg(not(target_os = "windows"))]
             let (prog, shell_args) = ("sh", vec!["-c".to_string(), cmd_str.clone()]);
 
-            let mut child = match Command::new(prog)
+            let mut command = Command::new(prog);
+            command
                 .args(&shell_args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .current_dir(cwd.as_deref().unwrap_or_else(|| Path::new(".")))
-                .spawn()
-            {
+                .current_dir(cwd.as_deref().unwrap_or_else(|| Path::new(".")));
+            configure_command_for_process_tree(&mut command);
+            let mut child = match command.spawn() {
                 Ok(c) => c,
                 Err(e) => return ToolResult::err(format!("shell spawn failed: {e}")),
             };
@@ -919,7 +934,7 @@ fn tool_shell() -> ToolDefinition {
             let status = match child.wait_timeout(Duration::from_millis(timeout_ms)) {
                 Ok(Some(status)) => status,
                 Ok(None) => {
-                    let _ = child.kill();
+                    let _ = kill_child_tree(&mut child);
                     let _ = child.wait();
                     let _ = collect_output(stdout_drain);
                     let _ = collect_output(stderr_drain);
@@ -948,6 +963,18 @@ fn tool_shell() -> ToolDefinition {
             }))
         }),
     }
+}
+
+fn unsafe_shell_control_reason(command: &str) -> Option<&'static str> {
+    if command.contains('\n') || command.contains('\r') {
+        return Some("newlines are not allowed");
+    }
+    for token in ["&&", "||", "|", ";", "`", "$(", "<", ">", "&"] {
+        if command.contains(token) {
+            return Some("shell control operators and redirection are not allowed");
+        }
+    }
+    None
 }
 
 struct OutputDrain {
@@ -1327,6 +1354,50 @@ mod tests {
     }
 
     #[test]
+    fn test_p3_structured_patch_line_replace_accepts_schema_new_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patch-line-new.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let r = registry();
+        let result = r.execute(
+            "structured_patch",
+            &json!({
+                "path": path.display().to_string(),
+                "operations": [
+                    {"type": "line_replace", "start_line": 2, "end_line": 2, "new": "TWO"}
+                ]
+            }),
+        );
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn test_p3_structured_patch_line_replace_requires_replacement_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patch-line-missing.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let r = registry();
+        let result = r.execute(
+            "structured_patch",
+            &json!({
+                "path": path.display().to_string(),
+                "operations": [
+                    {"type": "line_replace", "start_line": 2, "end_line": 2}
+                ]
+            }),
+        );
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("missing content/new/replace"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "one\ntwo\nthree\n");
+    }
+
+    #[test]
     fn test_p3_list_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
@@ -1450,6 +1521,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_shell_rejects_control_operators_before_spawn() {
+        let r = registry();
+        for command in [
+            "echo ok && echo injected",
+            "echo ok | more",
+            "echo ok > out.txt",
+            "echo `whoami`",
+            "echo $(whoami)",
+            "echo ok\necho injected",
+        ] {
+            let result = r.execute("shell", &json!({"command": command}));
+            assert!(!result.success, "command should be rejected: {command}");
+            assert!(result
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("shell command rejected"));
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn large_stdout_command() -> String {
         "for /L %i in (1,1,30000) do @echo XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX".into()
@@ -1457,7 +1549,7 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     fn large_stdout_command() -> String {
-        "i=0; while [ $i -lt 30 ]; do printf '%080000d\\n' 0; i=$((i+1)); done".into()
+        "python3 -c \"print('X'*1200000)\"".into()
     }
 
     #[test]

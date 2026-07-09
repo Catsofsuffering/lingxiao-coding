@@ -1,4 +1,4 @@
-use crate::process::ProcessRegistry;
+use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -78,7 +78,7 @@ impl ReplRunner {
         match wait_status {
             Some(_) => {}
             None => {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let _ = self
                     .process_registry
@@ -142,6 +142,7 @@ fn spawn_eval(program: &str, args: &[String], cwd: Option<&PathBuf>) -> std::io:
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    configure_command_for_process_tree(&mut command);
     command.spawn()
 }
 

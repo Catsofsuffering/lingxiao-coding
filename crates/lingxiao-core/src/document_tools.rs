@@ -1,4 +1,4 @@
-use crate::process::ProcessRegistry;
+use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -92,12 +92,14 @@ impl DocumentToolRunner {
         timeout_ms: u64,
         kind: &str,
     ) -> Result<Value, DocumentToolError> {
-        let child = Command::new(dependency)
+        let mut command = Command::new(dependency);
+        command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        configure_command_for_process_tree(&mut command);
+        let child = command.spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -226,7 +228,7 @@ fn wait_child(
     {
         Some(_) => Ok(()),
         None => {
-            let _ = child.kill();
+            let _ = kill_child_tree(child);
             let _ = child.wait();
             Err(DocumentToolError::Timeout {
                 dependency: dependency.to_string(),

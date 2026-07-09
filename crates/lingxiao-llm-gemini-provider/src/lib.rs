@@ -1,12 +1,14 @@
 use futures_util::StreamExt;
 use gemini_rust::{
-    Content as GeminiContent, FinishReason as GeminiFinishReason,
+    Blob as GeminiBlob, Content as GeminiContent, FinishReason as GeminiFinishReason,
     FunctionCall as GeminiFunctionCall, FunctionCallingMode, FunctionDeclaration, Gemini,
-    GenerationResponse, Message as GeminiMessage, Model as GeminiModel, Role as GeminiRole,
+    GenerationResponse, Message as GeminiMessage, Model as GeminiModel, Part as GeminiPart,
+    Role as GeminiRole,
 };
 use lingxiao_llm_host_protocol::{
-    AuthContext, FinishReason, GenerateRequest, Message, ProviderError, ProviderErrorCode,
-    StreamEvent, TokenUsage, ToolCall, ToolCallDelta,
+    message_rehydrates_blob_at, rehydrate_image_blob_ref_if, retain_rounds_from_metadata,
+    AuthContext, FinishReason, GenerateRequest, Message, MessageContentPart, ProviderError,
+    ProviderErrorCode, StreamEvent, TokenUsage, ToolCall, ToolCallDelta,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -74,8 +76,10 @@ pub async fn execute_generate_content(
     .map_err(|e| GeminiProviderError::Provider(e.to_string()))?;
 
     let mut builder = client.generate_content();
-    for message in &request.messages {
-        builder = add_message(builder, message);
+    let retain_rounds = retain_rounds_from_metadata(request.options.metadata.as_ref());
+    for (index, message) in request.messages.iter().enumerate() {
+        let rehydrate = message_rehydrates_blob_at(&request.messages, index, retain_rounds);
+        builder = add_message(builder, message, rehydrate);
     }
     for tool in &request.tools {
         builder = builder.with_function(gemini_function_declaration(tool)?);
@@ -156,9 +160,11 @@ fn resolved_config(request: &GenerateRequest) -> Result<(String, String), Gemini
 fn add_message(
     builder: gemini_rust::ContentBuilder,
     message: &Message,
+    rehydrate: bool,
 ) -> gemini_rust::ContentBuilder {
+    let content = message.plain_text_content();
     match message.role.as_str() {
-        "system" => builder.with_system_instruction(message.content.clone()),
+        "system" => builder.with_system_instruction(content),
         "assistant" | "model" if !message.tool_calls.is_empty() => {
             message.tool_calls.iter().fold(builder, |builder, call| {
                 builder.with_message(GeminiMessage {
@@ -171,22 +177,123 @@ fn add_message(
                 })
             })
         }
-        "assistant" | "model" => builder.with_model_message(message.content.clone()),
+        "assistant" | "model" => builder.with_model_message(content),
         "tool" => {
             let name = message
                 .name
                 .clone()
                 .unwrap_or_else(|| message.tool_call_id.clone().unwrap_or_default());
-            let response = serde_json::from_str(&message.content)
-                .unwrap_or_else(|_| Value::String(message.content.clone()));
+            let response = serde_json::from_str(&content).unwrap_or(Value::String(content));
             builder.with_message(GeminiMessage {
                 content: GeminiContent::function_response_json(name, response)
                     .with_role(GeminiRole::User),
                 role: GeminiRole::User,
             })
         }
-        _ => builder.with_user_message(message.content.clone()),
+        "user" if message.has_structured_content() => builder.with_message(GeminiMessage {
+            content: gemini_user_content(message, rehydrate),
+            role: GeminiRole::User,
+        }),
+        _ => builder.with_user_message(content),
     }
+}
+
+/// Build the Gemini `Content` for a user-role message that carries typed
+/// `content_parts`.
+///
+/// Plain-text messages (no `content_parts`) stay a single text part via
+/// `plain_text_content()` so existing text-only behavior is byte-for-byte
+/// unchanged. When the message carries typed parts they are projected into
+/// Gemini content parts: `text` → text part, `image_url` data URI →
+/// `Part::InlineData` (Gemini's image-capable part), and `image_blob_ref` →
+/// rehydrated from disk into an `inlineData` part. A blob whose backing file is
+/// missing/unreadable, a blob outside the retain window (`rehydrate == false`),
+/// or a non-data-URI `image_url` (a remote http URL the Gemini inline-data path
+/// cannot express), degrades to a safe text placeholder (short blob id only;
+/// never a `blob_path` leak; never a panic) — mirroring the OpenAI/Anthropic
+/// providers and TS `convertUserContent`'s degrading semantics, and TS
+/// `rehydrateRecentImageBlobRefs`'s retain-rounds cutoff. Mirrors TS
+/// `VercelAIContentGenerator.convertUserContent`, which maps `image_url` to a
+/// Gemini image part; Rust additionally rehydrates `image_blob_ref` (a strict
+/// superset — TS skips blob refs entirely).
+fn gemini_user_content(message: &Message, rehydrate: bool) -> GeminiContent {
+    let mut parts: Vec<GeminiPart> = Vec::with_capacity(message.content_parts.len());
+    for part in &message.content_parts {
+        match part {
+            MessageContentPart::Text { text } => parts.push(text_part(text.clone())),
+            MessageContentPart::Thinking { text, .. } => {
+                if !text.is_empty() {
+                    parts.push(text_part(text.clone()));
+                }
+            }
+            MessageContentPart::RedactedThinking { .. } => {
+                parts.push(text_part("[redacted thinking]".to_string()))
+            }
+            MessageContentPart::ImageUrl { image_url } => {
+                if let Some((mime, data)) = gemini_inline_data_from_url(&image_url.url) {
+                    parts.push(GeminiPart::InlineData {
+                        inline_data: GeminiBlob::new(mime, data),
+                        media_resolution: None,
+                    });
+                } else {
+                    // Non data-URI image_url (e.g. a remote http URL) cannot be
+                    // expressed as Gemini inline_data without fetching the bytes;
+                    // degrade to a textual marker the way TS does.
+                    parts.push(text_part(format!("[image] {}", image_url.url)));
+                }
+            }
+            MessageContentPart::ImageBlobRef { image } => {
+                match rehydrate_image_blob_ref_if(image, rehydrate) {
+                    Some(url) => {
+                        if let Some((mime, data)) = gemini_inline_data_from_url(&url) {
+                            parts.push(GeminiPart::InlineData {
+                                inline_data: GeminiBlob::new(mime, data),
+                                media_resolution: None,
+                            });
+                        } else {
+                            parts.push(text_part(part.plain_text()));
+                        }
+                    }
+                    // Missing/unreadable blob file, or a blob outside the
+                    // retain window: degrade to the safe placeholder (short
+                    // blob id only; no path leak) instead of panicking or
+                    // dropping the part silently.
+                    None => parts.push(text_part(part.plain_text())),
+                }
+            }
+        }
+    }
+    // Defensive: if structured parts produced no usable parts (e.g. only empty
+    // thinking parts, all skipped), fall back to the plain-text projection so we
+    // never emit an empty parts array — Gemini rejects empty content.
+    if parts.is_empty() {
+        return GeminiContent::text(message.plain_text_content()).with_role(GeminiRole::User);
+    }
+    GeminiContent {
+        parts: Some(parts),
+        role: None,
+    }
+    .with_role(GeminiRole::User)
+}
+
+fn text_part(text: String) -> GeminiPart {
+    GeminiPart::Text {
+        text,
+        thought: None,
+        thought_signature: None,
+    }
+}
+
+/// Parse a `data:<mime>;base64,<data>` URI into `(mime_type, base64_data)` for
+/// a Gemini `inlineData` part. Returns `None` for any non-data URI so callers
+/// can degrade to a text marker. Mirrors TS `parseDataUrl`.
+fn gemini_inline_data_from_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime_type, data) = rest.split_once(";base64,")?;
+    if mime_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((mime_type.to_string(), data.to_string()))
 }
 
 fn response_to_stream_events(response: GenerationResponse) -> Vec<StreamEvent> {
@@ -642,7 +749,7 @@ mod tests {
         .unwrap();
         let mut builder = client.generate_content();
         for msg in &request.messages {
-            builder = add_message(builder, msg);
+            builder = add_message(builder, msg, true);
         }
         // If add_message panicked we would not reach here — mapping is correct.
         drop(builder);
@@ -695,5 +802,407 @@ mod tests {
         assert_ne!(tool_calls[0].id, tool_calls[1].id);
         assert_eq!(tool_calls[0].id, "gemini_call_0_0_file_read");
         assert_eq!(tool_calls[1].id, "gemini_call_0_1_file_read");
+    }
+
+    // -----------------------------------------------------------------------
+    // R-2: Gemini provider — native multimodal (inline_data) contract tests
+    // -----------------------------------------------------------------------
+
+    use lingxiao_llm_host_protocol::{ImageBlobRefContentPart, ImageUrlContentPart};
+
+    fn user_message_with_parts(parts: Vec<MessageContentPart>) -> Message {
+        Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: parts,
+            ..Default::default()
+        }
+    }
+
+    /// Extract `(mime, base64)` from the first `InlineData` part, panicking if
+    /// none exists.
+    fn first_inline_data(content: &GeminiContent) -> (String, String) {
+        let parts = content.parts.as_ref().expect("content has parts");
+        for part in parts {
+            if let GeminiPart::InlineData { inline_data, .. } = part {
+                return (inline_data.mime_type.clone(), inline_data.data.clone());
+            }
+        }
+        panic!("no InlineData part found in {content:?}");
+    }
+
+    #[test]
+    fn test_gemini_user_content_data_uri_image_url_emits_inline_data() {
+        let message = user_message_with_parts(vec![
+            MessageContentPart::Text {
+                text: "describe this".into(),
+            },
+            MessageContentPart::ImageUrl {
+                image_url: ImageUrlContentPart {
+                    // "foo" -> base64 "Zm9v"
+                    url: "data:image/png;base64,Zm9v".into(),
+                    detail: Some("high".into()),
+                },
+            },
+        ]);
+        let content = gemini_user_content(&message, true);
+        let parts = content.parts.as_ref().expect("content has parts");
+        // text part + inline_data part, in order.
+        assert!(
+            parts
+                .iter()
+                .any(|p| matches!(p, GeminiPart::Text { text, .. } if text == "describe this")),
+            "text part must be preserved"
+        );
+        let (mime, data) = first_inline_data(&content);
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, "Zm9v");
+        assert_eq!(content.role, Some(GeminiRole::User));
+    }
+
+    #[test]
+    fn test_gemini_user_content_rehydrates_blob_ref_into_inline_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        // "foobar" -> base64 "Zm9vYmFy"
+        std::fs::write(&path, b"foobar").unwrap();
+        let blob_path = path.display().to_string();
+        let message = user_message_with_parts(vec![
+            MessageContentPart::Text {
+                text: "look at the screenshot".into(),
+            },
+            MessageContentPart::ImageBlobRef {
+                image: ImageBlobRefContentPart {
+                    blob_id: "blob_abcdef012345".into(),
+                    mime: "image/png".into(),
+                    size: 6,
+                    blob_path: blob_path.clone(),
+                    source: Some("screenshot".into()),
+                },
+            },
+        ]);
+        let content = gemini_user_content(&message, true);
+        let (mime, data) = first_inline_data(&content);
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, "Zm9vYmFy");
+        // The real bytes were rehydrated; the on-disk path must never reach the
+        // wire content.
+        let serialized = serde_json::to_string(&content).unwrap();
+        assert!(!serialized.contains(&blob_path), "blob_path must not leak");
+    }
+
+    #[test]
+    fn test_gemini_user_content_missing_blob_falls_back_to_safe_text_placeholder() {
+        let message = user_message_with_parts(vec![MessageContentPart::ImageBlobRef {
+            image: ImageBlobRefContentPart {
+                blob_id: "blob_missing".into(),
+                mime: "image/png".into(),
+                size: 2048,
+                blob_path: "/definitely/does/not/exist/blob_missing.png".into(),
+                source: None,
+            },
+        }]);
+        // Must not panic.
+        let content = gemini_user_content(&message, true);
+        let parts = content.parts.as_ref().expect("content has parts");
+        // Missing blob → degrade to text placeholder (no InlineData emitted).
+        assert!(
+            parts.iter().all(|p| matches!(p, GeminiPart::Text { .. })),
+            "missing blob must degrade to text, got {parts:?}"
+        );
+        let serialized = serde_json::to_string(&content).unwrap();
+        assert!(
+            serialized.contains("blob_missing"),
+            "placeholder keeps short blob id"
+        );
+        assert!(
+            !serialized.contains("/definitely/does/not/exist"),
+            "blob_path must not leak into placeholder"
+        );
+    }
+
+    #[test]
+    fn test_gemini_user_content_remote_image_url_degrades_to_text_marker() {
+        let message = user_message_with_parts(vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrlContentPart {
+                url: "https://example.test/image.png".into(),
+                detail: None,
+            },
+        }]);
+        let content = gemini_user_content(&message, true);
+        let parts = content.parts.as_ref().expect("content has parts");
+        // Remote http URL cannot be expressed as inline_data without fetching
+        // the bytes → degrade to a text marker (no InlineData).
+        assert!(
+            parts.iter().all(|p| matches!(p, GeminiPart::Text { .. })),
+            "remote image_url must degrade to text, got {parts:?}"
+        );
+        let serialized = serde_json::to_string(&content).unwrap();
+        assert!(serialized.contains("https://example.test/image.png"));
+        assert!(
+            !serialized.contains("inlineData"),
+            "no inline_data should be emitted for a remote URL"
+        );
+    }
+
+    #[test]
+    fn test_gemini_user_content_pure_text_stays_text_only() {
+        // A user message with NO structured content_parts must keep using the
+        // legacy plain-text path (with_user_message), not the multimodal branch.
+        let message = Message {
+            role: "user".into(),
+            content: "just text".into(),
+            content_parts: Vec::new(),
+            ..Default::default()
+        };
+        // add_message routes a user message without content_parts to the `_`
+        // arm (with_user_message). Verify has_structured_content() is false so
+        // the multimodal branch is never taken for plain text.
+        assert!(!message.has_structured_content());
+
+        // And the structured build helper, if called on a parts-less message,
+        // still yields a single text part from plain_text_content().
+        let message_with_parts_only_text =
+            user_message_with_parts(vec![MessageContentPart::Text {
+                text: "only text part".into(),
+            }]);
+        let content = gemini_user_content(&message_with_parts_only_text, true);
+        let parts = content.parts.as_ref().expect("content has parts");
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(&parts[0], GeminiPart::Text { text, .. } if text == "only text part"));
+    }
+
+    #[test]
+    fn test_gemini_add_message_preserves_assistant_function_call_and_tool_response() {
+        // The multimodal change must not regress the assistant function_call
+        // path or the tool function_response path. Walk add_message across a
+        // full tool-use history and verify it maps without panic.
+        use lingxiao_llm_host_protocol::ToolCall as ProtocolToolCall;
+        let request_messages = vec![
+            Message {
+                role: "user".into(),
+                content: "read it".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![ProtocolToolCall {
+                    id: "call_g2".into(),
+                    name: "file_read".into(),
+                    arguments: json!({"path": "README.md"}),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                content: "the content".into(),
+                tool_call_id: Some("call_g2".into()),
+                name: Some("file_read".into()),
+                ..Default::default()
+            },
+        ];
+
+        let client = Gemini::with_model_and_base_url(
+            "AIza-test",
+            GeminiModel::from("models/gemini-test".to_string()),
+            url::Url::parse("http://localhost/v1beta/").unwrap(),
+        )
+        .unwrap();
+        let mut builder = client.generate_content();
+        for msg in &request_messages {
+            builder = add_message(builder, msg, true);
+        }
+        // Inspect the built contents: assistant tool_calls → FunctionCall part
+        // (role model); tool role → FunctionResponse part (role user).
+        let built = builder.build();
+        let function_call = built.contents.iter().find_map(|content| {
+            content.parts.as_ref()?.iter().find_map(|part| match part {
+                GeminiPart::FunctionCall { function_call, .. } => Some(function_call),
+                _ => None,
+            })
+        });
+        let fc = function_call.expect("assistant tool_calls must map to a FunctionCall part");
+        assert_eq!(fc.name, "file_read");
+        assert_eq!(fc.args["path"], "README.md");
+
+        let function_response = built.contents.iter().find_map(|content| {
+            content.parts.as_ref()?.iter().find_map(|part| match part {
+                GeminiPart::FunctionResponse { function_response } => Some(function_response),
+                _ => None,
+            })
+        });
+        let fr = function_response.expect("tool role must map to a FunctionResponse part");
+        assert_eq!(fr.name, "file_read");
+        // The tool-role content "the content" is not valid JSON, so add_message
+        // wraps it as Value::String("the content") and stores it verbatim.
+        assert_eq!(fr.response, Some(Value::String("the content".into())));
+    }
+
+    #[test]
+    fn test_gemini_inline_data_emitted_on_wire_for_image_request() {
+        // End-to-end: a user message carrying a data-URI image_url must reach
+        // the mock HTTP server with an inlineData part in the request body.
+        use std::sync::{Arc, Mutex};
+        let captured_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request_bytes = read_http_request(&mut stream);
+            let request_str = String::from_utf8_lossy(&request_bytes).to_string();
+            *captured_body_clone.lock().unwrap() = Some(http_body(&request_str).to_string());
+            let resp = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                resp.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let mut request = sample_request(&format!("http://{addr}/v1beta/"));
+        request.messages = vec![user_message_with_parts(vec![
+            MessageContentPart::Text {
+                text: "what is this".into(),
+            },
+            MessageContentPart::ImageUrl {
+                image_url: ImageUrlContentPart {
+                    // "foo" -> base64 "Zm9v"
+                    url: "data:image/png;base64,Zm9v".into(),
+                    detail: None,
+                },
+            },
+        ])];
+        let _events = execute_generate_content_blocking(&request).unwrap();
+        handle.join().unwrap();
+
+        let body_str = captured_body.lock().unwrap().clone().unwrap();
+        let body_json: Value = serde_json::from_str(&body_str).unwrap();
+        // Gemini camelCase wire shape: contents[].parts[] with {inlineData:{mimeType,data}}.
+        let parts = body_json["contents"][0]["parts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected parts array, got: {body_str}"));
+        let inline = parts.iter().find_map(|part| part.get("inlineData"));
+        let inline = inline
+            .unwrap_or_else(|| panic!("expected an inlineData part on the wire, got: {body_str}"));
+        assert_eq!(inline["mimeType"], "image/png");
+        assert_eq!(inline["data"], "Zm9v");
+        // The text part must also survive alongside the image part.
+        assert!(
+            parts
+                .iter()
+                .any(|p| p.get("text").and_then(Value::as_str) == Some("what is this")),
+            "text part must be preserved alongside inlineData, got: {body_str}"
+        );
+    }
+
+    #[test]
+    fn test_gemini_retain_window_degrades_old_blob_to_text_on_wire() {
+        // Two user rounds each carrying a rehydratable blob. With retain=1 only
+        // the most recent round rehydrates an inlineData part on the wire; the
+        // older round's blob degrades to a text part (never inlineData, never a
+        // blob_path leak).
+        use std::sync::{Arc, Mutex};
+        let captured_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request_bytes = read_http_request(&mut stream);
+            let request_str = String::from_utf8_lossy(&request_bytes).to_string();
+            *captured_body_clone.lock().unwrap() = Some(http_body(&request_str).to_string());
+            let resp = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
+                resp.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.png");
+        let new_path = dir.path().join("new.png");
+        std::fs::write(&old_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        std::fs::write(&new_path, [0xFF, 0xD8, 0xFF]).unwrap();
+        let old_path_str = old_path.display().to_string();
+        let new_path_str = new_path.display().to_string();
+
+        let blob_ref = |path: &str, id: &str| MessageContentPart::ImageBlobRef {
+            image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                blob_id: id.into(),
+                mime: "image/png".into(),
+                size: 4,
+                blob_path: path.into(),
+                source: None,
+            },
+        };
+
+        let mut request = sample_request(&format!("http://{addr}/v1beta/"));
+        request.messages = vec![
+            user_message_with_parts(vec![blob_ref(&old_path_str, "blob_old_gem")]), // round 1
+            Message {
+                role: "assistant".into(),
+                content: "ack".into(),
+                ..Default::default()
+            },
+            user_message_with_parts(vec![blob_ref(&new_path_str, "blob_new_gem")]), // round 2
+        ];
+        // retain=1 → only the most recent user round rehydrates.
+        request.options.metadata = Some(json!({
+            "base_url": format!("http://{addr}/v1beta/"),
+            "image_history_retain_rounds": 1
+        }));
+        let _events = execute_generate_content_blocking(&request).unwrap();
+        handle.join().unwrap();
+
+        let body_str = captured_body.lock().unwrap().clone().unwrap();
+        let body_json: Value = serde_json::from_str(&body_str).unwrap();
+        let contents = body_json["contents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected contents array, got: {body_str}"));
+
+        // contents[0] is the old user round → no inlineData, text placeholder only.
+        let old_parts = contents[0]["parts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected parts array for old round, got: {body_str}"));
+        assert!(
+            !old_parts.iter().any(|p| p.get("inlineData").is_some()),
+            "old-round blob must NOT rehydrate to inlineData, got: {body_str}"
+        );
+        let old_text = old_parts
+            .iter()
+            .find_map(|p| p.get("text").and_then(Value::as_str))
+            .unwrap_or_else(|| panic!("old round must carry a text placeholder, got: {body_str}"));
+        assert!(
+            old_text.contains("blob_old_gem"),
+            "placeholder should carry the short blob id: {old_text}"
+        );
+        assert!(
+            !old_text.contains(&old_path_str),
+            "blob_path must not leak: {old_text}"
+        );
+
+        // contents[2] is the recent user round → real inlineData part.
+        let new_parts = contents[2]["parts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected parts array for new round, got: {body_str}"));
+        let inline = new_parts
+            .iter()
+            .find_map(|p| p.get("inlineData"))
+            .unwrap_or_else(|| {
+                panic!("new-round blob must rehydrate to inlineData, got: {body_str}")
+            });
+        assert_eq!(inline["mimeType"], "image/png");
+        assert!(!inline["data"].as_str().unwrap().is_empty());
     }
 }

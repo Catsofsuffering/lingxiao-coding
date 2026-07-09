@@ -1522,15 +1522,18 @@ name = "lingxiao-core"
 version = "0.1.0"
 dependencies = [
  "fastrand",
+ "libc",
  "lingxiao-core-protocol",
  "lingxiao-llm-host-protocol",
  "lingxiao-tool-host-protocol",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 2.0.18",
  "wait-timeout",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1565,6 +1568,7 @@ dependencies = [
  "lingxiao-llm-host-protocol",
  "reqwest 0.12.28",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1584,8 +1588,10 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws-types",
+ "bytes",
  "lingxiao-llm-host-protocol",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1598,6 +1604,7 @@ dependencies = [
  "gemini-rust",
  "lingxiao-llm-host-protocol",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -1610,6 +1617,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -1624,6 +1632,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2606,6 +2615,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

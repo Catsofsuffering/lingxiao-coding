@@ -1,4 +1,4 @@
-use crate::process::ProcessRegistry;
+use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -61,6 +61,7 @@ impl McpBridgeRunner {
         if let Some(cwd) = request.cwd.as_deref() {
             command.current_dir(cwd);
         }
+        configure_command_for_process_tree(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| McpBridgeError::SpawnFailed(error.to_string()))?;
@@ -221,6 +222,7 @@ fn spawn_persistent_server(
     if let Some(cwd) = request.cwd.as_deref() {
         command.current_dir(cwd);
     }
+    configure_command_for_process_tree(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| McpBridgeError::SpawnFailed(error.to_string()))?;
@@ -298,7 +300,7 @@ impl PersistentMcpServer {
     }
 
     fn stop(&mut self, registry: &ProcessRegistry) -> i32 {
-        let _ = self.child.kill();
+        let _ = kill_child_tree(&mut self.child);
         let status = self.child.wait().ok();
         let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
         let _ = registry.complete(&self.process_id, Some(exit_code));
@@ -312,7 +314,7 @@ impl PersistentMcpServer {
     }
 
     fn fail(&mut self, registry: &ProcessRegistry, message: &str) {
-        let _ = self.child.kill();
+        let _ = kill_child_tree(&mut self.child);
         let _ = self.child.wait();
         let _ = registry.mark_failed(&self.process_id, message);
         if let Some(reader) = self.stdout_reader.take() {
@@ -334,7 +336,7 @@ fn wait_child(
     {
         Some(status) => Ok(status),
         None => {
-            let _ = child.kill();
+            let _ = kill_child_tree(child);
             let _ = child.wait();
             Err(McpBridgeError::Timeout)
         }

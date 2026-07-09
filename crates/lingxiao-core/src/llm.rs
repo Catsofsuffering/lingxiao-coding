@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
+use crate::process::{configure_command_for_process_tree, kill_child_tree};
 pub use lingxiao_llm_host_protocol::*;
 
 const EXTERNAL_PROCESS_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -240,19 +241,20 @@ impl ExternalProcessProvider {
             .options
             .timeout_ms_hint
             .unwrap_or(self.default_timeout_ms);
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .current_dir(self.cwd.as_deref().unwrap_or_else(|| Path::new(".")))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                ProviderError::new(
-                    ProviderErrorCode::ServerError,
-                    format!("provider executor spawn failed: {e}"),
-                )
-            })?;
+            .stderr(Stdio::piped());
+        configure_command_for_process_tree(&mut command);
+        let mut child = command.spawn().map_err(|e| {
+            ProviderError::new(
+                ProviderErrorCode::ServerError,
+                format!("provider executor spawn failed: {e}"),
+            )
+        })?;
 
         if let Some(stdin) = child.stdin.as_mut() {
             serde_json::to_writer(&mut *stdin, request).map_err(|e| {
@@ -283,7 +285,7 @@ impl ExternalProcessProvider {
             })? {
             Some(status) => status,
             None => {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let _ = collect_external_output(stdout_drain);
                 let _ = collect_external_output(stderr_drain.take());
@@ -348,19 +350,20 @@ impl LlmProvider for ExternalProcessProvider {
             .options
             .timeout_ms_hint
             .unwrap_or(self.default_timeout_ms);
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .current_dir(self.cwd.as_deref().unwrap_or_else(|| Path::new(".")))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                ProviderError::new(
-                    ProviderErrorCode::ServerError,
-                    format!("provider executor spawn failed: {e}"),
-                )
-            })?;
+            .stderr(Stdio::piped());
+        configure_command_for_process_tree(&mut command);
+        let mut child = command.spawn().map_err(|e| {
+            ProviderError::new(
+                ProviderErrorCode::ServerError,
+                format!("provider executor spawn failed: {e}"),
+            )
+        })?;
 
         if let Some(stdin) = child.stdin.as_mut() {
             serde_json::to_writer(&mut *stdin, &request).map_err(|e| {
@@ -421,7 +424,7 @@ impl LlmProvider for ExternalProcessProvider {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             if started.elapsed() > Duration::from_millis(timeout_ms) {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
                 let _ = collect_external_output(stderr_drain.take());
@@ -449,7 +452,7 @@ impl LlmProvider for ExternalProcessProvider {
                 }
             }
             None => {
-                let _ = child.kill();
+                let _ = kill_child_tree(&mut child);
                 let _ = child.wait();
                 let _ = collect_external_output(stderr_drain.take());
                 return Err(ProviderError::new(
@@ -622,10 +625,179 @@ impl LlmProvider for MockLlmProvider {
     }
 }
 
+/// A local, offline model-capability registry that can auto-derive
+/// per-model capability flags (vision today; tools/streaming reserved for a
+/// later slice) when operator `runtime.json` metadata does not declare them.
+///
+/// This is the Rust Core analog of the TS `models.dev` capability source
+/// (`src/llm/ModelsDevRegistry.ts` + `src/llm/model_capabilities.ts`).
+/// The single source of truth for the data is the build-time snapshot at
+/// `src/llm/models-snapshot.json` (fetched by `scripts/fetch-models-snapshot.mjs`
+/// from `https://models.dev/api.json`). The snapshot is embedded at compile
+/// time via `include_str!` so Rust Core never performs a network fetch — the
+/// registry is fully offline, matching the "no network pull" constraint.
+///
+/// Resolution precedence mirrors TS `ModelCapabilities.getInputModalities`:
+///   1. Explicit operator metadata (declared `supports_vision`) — handled by
+///      `resolve_for_request`, which only consults this registry when vision
+///      was *not* explicitly declared.
+///   2. This registry's auto-derived value.
+///   3. Optimistic default `true` when the registry has no entry (keeps
+///      unconfigured providers working, same policy as tools/streaming).
+pub trait CapabilityRegistry: Send + Sync {
+    /// Auto-derived vision capability for `model_id`, or `None` when the
+    /// registry has no entry. `None` means "unknown" — callers fall back to
+    /// the optimistic default rather than refusing the request.
+    fn vision_for(&self, model_id: &str) -> Option<bool>;
+}
+
+/// Entry parsed from the `models.dev` snapshot: just the fields the routing
+/// layer needs to auto-derive vision. We intentionally do not load the full
+/// 5 MB document into structured types at startup; only `vision` is extracted
+/// per model and indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapabilitySnapshotEntry {
+    vision: bool,
+}
+
+/// `models.dev` snapshot-backed capability registry.
+///
+/// The snapshot is parsed lazily on the first `vision_for` query (via a
+/// `OnceLock`) so a daemon that never serves an image request pays nothing.
+/// The index keys are lowercased model ids (the snapshot's per-provider model
+/// name, plus the model's `id` field when it differs), merged across all
+/// providers with the "richer capability wins" rule from TS `buildIndex`
+/// (vision=true wins over vision=false). Lookup is exact (lowercased) then
+/// longest-prefix — the same strategy as TS `getModelInfo`.
+pub struct ModelsDevRegistry {
+    index: std::sync::OnceLock<HashMap<String, CapabilitySnapshotEntry>>,
+}
+
+impl ModelsDevRegistry {
+    /// The build-time `models.dev` snapshot, embedded so the registry is
+    /// offline-only. The path is relative to this source file and points at
+    /// the shared TS/Rust snapshot under the repo `src/llm/` tree.
+    const SNAPSHOT: &'static str = include_str!("../../../src/llm/models-snapshot.json");
+
+    pub fn new() -> Self {
+        Self {
+            index: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Lazily parse the embedded snapshot into the lowercase-id → capability
+    /// index. Parse failures are non-fatal: a failed parse yields an empty
+    /// index, after which `vision_for` always returns `None` (callers fall
+    /// back to the optimistic default), mirroring the TS `loadSnapshot`
+    /// try/catch that degrades to "registry unavailable".
+    fn index(&self) -> &HashMap<String, CapabilitySnapshotEntry> {
+        self.index
+            .get_or_init(|| parse_models_dev_snapshot(Self::SNAPSHOT))
+    }
+}
+
+impl Default for ModelsDevRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CapabilityRegistry for ModelsDevRegistry {
+    fn vision_for(&self, model_id: &str) -> Option<bool> {
+        let index = self.index();
+        if index.is_empty() {
+            return None;
+        }
+        let id = model_id.trim().to_ascii_lowercase();
+        if id.is_empty() {
+            return None;
+        }
+        // 1. Exact (lowercased) match.
+        if let Some(entry) = index.get(&id) {
+            return Some(entry.vision);
+        }
+        // 2. Longest-prefix match (same strategy as TS `getModelInfo`).
+        let mut best: Option<(usize, bool)> = None;
+        for (key, entry) in index {
+            if id.starts_with(key.as_str()) {
+                match best {
+                    Some((len, _)) if len >= key.len() => {}
+                    _ => best = Some((key.len(), entry.vision)),
+                }
+            }
+        }
+        best.map(|(_, vision)| vision)
+    }
+}
+
+/// Shape of the `models.dev` snapshot fields we read. Only the per-model
+/// fields needed for vision derivation are typed; everything else is ignored
+/// (`#[serde(default)]` / skipped).
+#[derive(serde::Deserialize)]
+struct ModelsDevModelRaw {
+    #[serde(default)]
+    attachment: Option<bool>,
+    #[serde(default)]
+    modalities: Option<ModelsDevModalitiesRaw>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ModelsDevModalitiesRaw {
+    #[serde(default)]
+    input: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelsDevProviderRaw {
+    #[serde(default)]
+    models: HashMap<String, ModelsDevModelRaw>,
+}
+
+/// Parse the embedded `models.dev` snapshot into the lowercase-id → vision
+/// index, replicating TS `buildIndex` + `normalize`:
+///   - `vision = attachment.unwrap_or(false) || modalities.input contains "image"`
+///   - index under the lowercased model *key* and, when distinct, the lowercased
+///     model `id` field — but the snapshot key already equals the canonical id
+///     in practice, so we key on the entry key only (matching the data we see).
+///   - merge across providers: vision=true wins over vision=false ("richer
+///     capability wins", same as TS `setIfBetter`).
+fn parse_models_dev_snapshot(raw: &str) -> HashMap<String, CapabilitySnapshotEntry> {
+    let providers: HashMap<String, ModelsDevProviderRaw> = match serde_json::from_str(raw) {
+        Ok(p) => p,
+        Err(_) => return HashMap::new(),
+    };
+    let mut index: HashMap<String, CapabilitySnapshotEntry> = HashMap::new();
+    for provider in providers.values() {
+        for (model_key, model) in &provider.models {
+            let input = model
+                .modalities
+                .as_ref()
+                .map(|m| m.input.as_slice())
+                .unwrap_or(&[]);
+            let vision = model.attachment.unwrap_or(false)
+                || input.iter().any(|m| m.eq_ignore_ascii_case("image"));
+            let key = model_key.to_ascii_lowercase();
+            match index.get(&key) {
+                // Richer capability wins: a vision=false entry is superseded
+                // by a vision=true entry for the same id.
+                Some(existing) if existing.vision || !vision => {}
+                _ => {
+                    index.insert(key, CapabilitySnapshotEntry { vision });
+                }
+            }
+        }
+    }
+    index
+}
+
 pub struct ProviderRegistry {
     providers: HashMap<&'static str, Arc<dyn LlmProvider>>,
     provider_order: Vec<&'static str>,
     model_metadata: HashMap<(String, String), ModelRoutingMetadata>,
+    /// Optional offline capability registry used to auto-derive per-model
+    /// capabilities (vision today) when operator metadata does not declare
+    /// them. `None` keeps the legacy optimistic defaults.
+    capability_registry: Option<Arc<dyn CapabilityRegistry>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -637,6 +809,16 @@ pub struct ModelRoutingMetadata {
     pub context_window: Option<u32>,
     pub supports_tools: bool,
     pub supports_streaming: bool,
+    pub supports_vision: bool,
+    /// Whether `supports_vision` was explicitly declared by the operator
+    /// (via `with_vision_support`) rather than left at the optimistic default.
+    /// When `false`, `resolve_for_request` consults the capability registry
+    /// to auto-derive vision before falling back to the optimistic `true`.
+    /// This carries the "operator did not declare vision" signal that the
+    /// `bool` field alone cannot represent, mirroring the TS precedence where
+    /// a configured `capabilities.modalities` overrides the `models.dev`
+    /// registry but an absent config defers to it.
+    pub vision_declared: bool,
 }
 
 impl ModelRoutingMetadata {
@@ -649,6 +831,17 @@ impl ModelRoutingMetadata {
             context_window: None,
             supports_tools: true,
             supports_streaming: true,
+            // Default true (optimistic): a provider whose metadata does not
+            // declare vision capability is assumed to accept image input, so
+            // existing unconfigured providers keep working. Operators opt a
+            // non-vision model out by setting this to false explicitly, which
+            // makes `resolve_for_request` filter it out for image requests.
+            // This mirrors the tools/streaming defaulting policy.
+            supports_vision: true,
+            // Vision not yet declared → `resolve_for_request` may auto-derive
+            // it from the capability registry (models.dev snapshot) before
+            // applying the optimistic default.
+            vision_declared: false,
         }
     }
 
@@ -673,6 +866,14 @@ impl ModelRoutingMetadata {
         self
     }
 
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        // An explicit operator declaration takes precedence over any
+        // capability-registry auto-derivation in `resolve_for_request`.
+        self.vision_declared = true;
+        self
+    }
+
     fn estimated_unit_cost(&self) -> Option<f64> {
         Some(self.input_cost_per_million.unwrap_or(0.0) + self.output_cost_per_million?)
     }
@@ -684,7 +885,16 @@ impl ProviderRegistry {
             providers: HashMap::new(),
             provider_order: Vec::new(),
             model_metadata: HashMap::new(),
+            capability_registry: None,
         }
+    }
+
+    /// Attach an offline capability registry (e.g. `ModelsDevRegistry`) used to
+    /// auto-derive per-model capabilities when operator metadata does not
+    /// declare them. Explicit operator metadata always takes precedence.
+    pub fn with_capability_registry(mut self, registry: Arc<dyn CapabilityRegistry>) -> Self {
+        self.capability_registry = Some(registry);
+        self
     }
 
     pub fn register(&mut self, provider: Arc<dyn LlmProvider>) {
@@ -722,10 +932,40 @@ impl ProviderRegistry {
             .find(|provider| provider.supports_model(model_id))
     }
 
+    /// Resolve the effective `supports_vision` flag for `(provider_id,
+    /// model_id)` following the R-4 precedence:
+    ///   1. Explicit operator declaration (`vision_declared`) → use
+    ///      `supports_vision` verbatim. This is the runtime.json override and
+    ///      always wins, matching TS where configured `capabilities.modalities`
+    ///      overrides the models.dev registry.
+    ///   2. Capability-registry auto-derivation (models.dev snapshot) when the
+    ///      operator did not declare vision. A registry hit is authoritative:
+    ///      `Some(false)` filters the provider out for image requests, `Some(true)`
+    ///      keeps it. This closes the R-4 PARTIAL gap — operators no longer have
+    ///      to set `supports_vision` per model to get correct vision gating.
+    ///   3. Registry miss (`None`) → optimistic default `true`, preserving the
+    ///      legacy behavior so unconfigured/unknown providers keep working.
+    ///
+    /// Pure-text requests never reach this (the caller short-circuits when
+    /// `!needs_vision`), so the optimistic default only affects image-bearing
+    /// requests against models the registry has never heard of.
+    fn provider_supports_vision(&self, provider_id: &str, model_id: &str) -> bool {
+        match self.model_metadata(provider_id, model_id) {
+            Some(metadata) if metadata.vision_declared => metadata.supports_vision,
+            _ => self
+                .capability_registry
+                .as_ref()
+                .and_then(|registry| registry.vision_for(model_id))
+                .unwrap_or(true),
+        }
+    }
+
     pub fn resolve_for_request(
         &self,
         model_id: &str,
         needs_tools: bool,
+        needs_streaming: bool,
+        needs_vision: bool,
     ) -> Option<&Arc<dyn LlmProvider>> {
         let candidates: Vec<&Arc<dyn LlmProvider>> = self
             .provider_order
@@ -739,6 +979,20 @@ impl ProviderRegistry {
                 self.model_metadata(provider.provider_id(), model_id)
                     .map(|metadata| metadata.supports_tools)
                     .unwrap_or(true)
+            })
+            .filter(|provider| {
+                if !needs_streaming {
+                    return true;
+                }
+                self.model_metadata(provider.provider_id(), model_id)
+                    .map(|metadata| metadata.supports_streaming)
+                    .unwrap_or(true)
+            })
+            .filter(|provider| {
+                if !needs_vision {
+                    return true;
+                }
+                self.provider_supports_vision(provider.provider_id(), model_id)
             })
             .collect();
         if candidates.is_empty() {
@@ -877,17 +1131,18 @@ impl LlmRouter {
             format!("No provider found for model '{}'", request.model),
         );
 
+        let needs_vision = request.needs_vision();
+
         for model_id in &model_chain {
-            let provider = match self
-                .registry
-                .resolve_for_request(model_id, !request.tools.is_empty())
-            {
+            let provider = match self.registry.resolve_for_request(
+                model_id,
+                !request.tools.is_empty(),
+                request.stream,
+                needs_vision,
+            ) {
                 Some(p) => p,
                 None => {
-                    last_err = ProviderError::new(
-                        ProviderErrorCode::UnsupportedModel,
-                        format!("No provider for model '{model_id}'"),
-                    );
+                    last_err = self.no_provider_error(model_id, needs_vision, &request);
                     continue;
                 }
             };
@@ -987,6 +1242,40 @@ impl LlmRouter {
 
         Err(last_err)
     }
+
+    /// Build the error returned when `resolve_for_request` found no provider
+    /// for `model_id`. When the request carries an image and the model has a
+    /// provider that was filtered out *only* because it does not support
+    /// vision, surface a vision-specific message so callers can distinguish a
+    /// capability mismatch from a genuinely unregistered model.
+    fn no_provider_error(
+        &self,
+        model_id: &str,
+        needs_vision: bool,
+        request: &GenerateRequest,
+    ) -> ProviderError {
+        if needs_vision {
+            // Would the model resolve if we ignored the vision requirement?
+            // If yes, the only reason it was filtered is vision capability.
+            let resolves_without_vision = self
+                .registry
+                .resolve_for_request(model_id, !request.tools.is_empty(), request.stream, false)
+                .is_some();
+            if resolves_without_vision {
+                return ProviderError::new(
+                    ProviderErrorCode::UnsupportedModel,
+                    format!(
+                        "Model '{model_id}' does not support vision input; \
+                         no vision-capable provider is registered for an image-bearing request"
+                    ),
+                );
+            }
+        }
+        ProviderError::new(
+            ProviderErrorCode::UnsupportedModel,
+            format!("No provider for model '{model_id}'"),
+        )
+    }
 }
 
 fn normalize_stream(
@@ -1037,7 +1326,7 @@ fn estimate_request_tokens(request: &GenerateRequest) -> u64 {
     request
         .messages
         .iter()
-        .map(|message| estimate_text_tokens(&message.content).saturating_add(4))
+        .map(|message| estimate_text_tokens(&message.plain_text_content()).saturating_add(4))
         .sum::<u64>()
         .saturating_add(request.tools.len() as u64 * 8)
         .max(1)
@@ -1186,6 +1475,383 @@ mod tests {
         router.route_stream(request).unwrap();
         assert_eq!(tool_capable.call_count(), 1);
         assert_eq!(text_only.call_count(), 0);
+    }
+
+    #[test]
+    fn test_model_routing_metadata_filters_stream_incompatible_provider() {
+        let blocking_only = Arc::new(PlannedLlmProvider::new(
+            "blocking-only",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let streaming = Arc::new(PlannedLlmProvider::new(
+            "streaming",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(blocking_only.clone());
+        registry.register(streaming.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("blocking-only", "shared/model")
+                .with_cost(1.0, 1.0)
+                .with_streaming_support(false),
+        );
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("streaming", "shared/model").with_cost(5.0, 5.0),
+        );
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request("shared/model"))
+            .unwrap();
+
+        assert_eq!(streaming.call_count(), 1);
+        assert_eq!(blocking_only.call_count(), 0);
+    }
+
+    #[test]
+    fn test_model_routing_metadata_filters_vision_incompatible_provider_for_image_request() {
+        // R-4: an image-bearing request must skip providers whose metadata
+        // declares supports_vision=false and route to a vision-capable one.
+        let text_only = Arc::new(PlannedLlmProvider::new(
+            "text-only",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let vision_capable = Arc::new(PlannedLlmProvider::new(
+            "vision-capable",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(text_only.clone());
+        registry.register(vision_capable.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("text-only", "shared/model")
+                .with_cost(1.0, 1.0)
+                .with_vision_support(false),
+        );
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("vision-capable", "shared/model").with_cost(5.0, 5.0),
+        );
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request_with_image("shared/model"))
+            .unwrap();
+
+        assert_eq!(vision_capable.call_count(), 1);
+        assert_eq!(text_only.call_count(), 0);
+    }
+
+    #[test]
+    fn test_model_routing_vision_request_returns_clear_error_when_no_vision_provider() {
+        // R-4: when every candidate provider is supports_vision=false and the
+        // request carries an image, routing must fail with a vision-specific
+        // error rather than silently dropping the image onto a text model.
+        let text_only = Arc::new(PlannedLlmProvider::new(
+            "text-only",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(text_only.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("text-only", "shared/model")
+                .with_cost(1.0, 1.0)
+                .with_vision_support(false),
+        );
+
+        let router = LlmRouter::new(registry);
+        let err = router
+            .route_stream(sample_router_request_with_image("shared/model"))
+            .unwrap_err();
+
+        assert_eq!(err.code, ProviderErrorCode::UnsupportedModel);
+        assert!(
+            err.message.contains("vision"),
+            "error should name vision: got {}",
+            err.message
+        );
+        // The non-vision provider must never have been called.
+        assert_eq!(text_only.call_count(), 0);
+    }
+
+    #[test]
+    fn test_model_routing_vision_gate_does_not_affect_plain_text_request() {
+        // R-4: a text-only request must still route to a supports_vision=false
+        // provider when no image is present — the vision gate only applies to
+        // image-bearing requests.
+        let text_only = Arc::new(PlannedLlmProvider::new(
+            "text-only",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(text_only.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("text-only", "shared/model")
+                .with_cost(1.0, 1.0)
+                .with_vision_support(false),
+        );
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request("shared/model"))
+            .unwrap();
+
+        assert_eq!(text_only.call_count(), 1);
+    }
+
+    #[test]
+    fn test_model_routing_vision_default_true_keeps_unconfigured_provider() {
+        // R-4 default policy: a provider whose metadata omits supports_vision
+        // is assumed vision-capable (optimistic, mirroring tools/streaming), so
+        // an image request still routes to it instead of being rejected.
+        let unconfigured = Arc::new(PlannedLlmProvider::new(
+            "unconfigured",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(unconfigured.clone());
+        // No metadata registered at all → supports_vision defaults to true.
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request_with_image("shared/model"))
+            .unwrap();
+
+        assert_eq!(unconfigured.call_count(), 1);
+    }
+
+    /// In-test `CapabilityRegistry` that maps a fixed set of model ids to an
+    /// auto-derived `vision` flag. Used to exercise the R-4 capability-registry
+    /// auto-derivation path without depending on the embedded 5 MB models.dev
+    /// snapshot (whose contents change over time and would make assertions
+    /// brittle).
+    struct StubCapabilityRegistry {
+        entries: HashMap<String, bool>,
+    }
+
+    impl StubCapabilityRegistry {
+        fn new(entries: &[(&str, bool)]) -> Self {
+            Self {
+                entries: entries
+                    .iter()
+                    .map(|(id, v)| (id.to_ascii_lowercase(), *v))
+                    .collect(),
+            }
+        }
+    }
+
+    impl CapabilityRegistry for StubCapabilityRegistry {
+        fn vision_for(&self, model_id: &str) -> Option<bool> {
+            self.entries.get(&model_id.to_ascii_lowercase()).copied()
+        }
+    }
+
+    #[test]
+    fn test_capability_registry_vision_explicit_false_overrides_registry_true() {
+        // R-4 precedence #1: an explicit operator `supports_vision=false`
+        // declaration wins even when the capability registry says the model
+        // supports vision. The image request must NOT route to this provider.
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "declared-text-only",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new().with_capability_registry(Arc::new(
+            StubCapabilityRegistry::new(&[("shared/model", true)]),
+        ));
+        registry.register(provider.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("declared-text-only", "shared/model")
+                .with_vision_support(false),
+        );
+
+        let router = LlmRouter::new(registry);
+        let err = router
+            .route_stream(sample_router_request_with_image("shared/model"))
+            .unwrap_err();
+        assert_eq!(err.code, ProviderErrorCode::UnsupportedModel);
+        assert!(err.message.contains("vision"), "got: {}", err.message);
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[test]
+    fn test_capability_registry_vision_false_filters_out_image_request() {
+        // R-4 precedence #2 (auto-derive, no explicit declaration): the registry
+        // reports vision=false for the model, so an image request must fail
+        // with the vision-specific error instead of routing to the provider.
+        // Operator registered metadata (cost) but did NOT declare supports_vision,
+        // so the registry value is authoritative.
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "undeclared",
+            vec!["text-only-model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new().with_capability_registry(Arc::new(
+            StubCapabilityRegistry::new(&[("text-only-model", false)]),
+        ));
+        registry.register(provider.clone());
+        // Metadata registered but vision left undeclared (no with_vision_support).
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("undeclared", "text-only-model").with_cost(1.0, 1.0),
+        );
+
+        let router = LlmRouter::new(registry);
+        let err = router
+            .route_stream(sample_router_request_with_image("text-only-model"))
+            .unwrap_err();
+        assert_eq!(err.code, ProviderErrorCode::UnsupportedModel);
+        assert!(err.message.contains("vision"), "got: {}", err.message);
+        assert_eq!(provider.call_count(), 0);
+    }
+
+    #[test]
+    fn test_capability_registry_vision_true_routes_image_request() {
+        // R-4 precedence #2 (auto-derive, no explicit declaration): the registry
+        // reports vision=true, so an image request routes to the provider even
+        // though the operator never declared supports_vision.
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "undeclared-vision",
+            vec!["vision-model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new().with_capability_registry(Arc::new(
+            StubCapabilityRegistry::new(&[("vision-model", true)]),
+        ));
+        registry.register(provider.clone());
+        // No metadata at all — registry auto-derive is the only signal.
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request_with_image("vision-model"))
+            .unwrap();
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn test_capability_registry_miss_keeps_optimistic_default_true() {
+        // R-4 precedence #3 (registry miss): when neither an explicit
+        // declaration nor a registry entry exists, the optimistic default
+        // `true` keeps the provider working for image requests (legacy
+        // behavior, mirrors tools/streaming). This is the safety net so an
+        // unknown model is never silently rejected.
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "unknown-model-provider",
+            vec!["some/novel-model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        // Registry is attached but has no entry for this model.
+        let mut registry = ProviderRegistry::new().with_capability_registry(Arc::new(
+            StubCapabilityRegistry::new(&[("other-model", false)]),
+        ));
+        registry.register(provider.clone());
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request_with_image("some/novel-model"))
+            .unwrap();
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn test_capability_registry_does_not_affect_plain_text_request() {
+        // R-4: the vision gate only applies to image-bearing requests. A pure
+        // text request must still route to a provider whose registry entry
+        // reports vision=false (the gate is skipped when !needs_vision).
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "text-ok",
+            vec!["text-only-model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new().with_capability_registry(Arc::new(
+            StubCapabilityRegistry::new(&[("text-only-model", false)]),
+        ));
+        registry.register(provider.clone());
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request("text-only-model"))
+            .unwrap();
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn test_capability_registry_vision_false_does_not_affect_routing_without_registry() {
+        // R-4 backward-compat: a `ProviderRegistry` with NO capability registry
+        // attached (e.g. unit tests, embedded callers) keeps the original
+        // optimistic default. An undeclared provider still serves an image
+        // request — auto-derivation is strictly opt-in via
+        // `with_capability_registry`.
+        let provider = Arc::new(PlannedLlmProvider::new(
+            "no-registry",
+            vec!["shared/model"],
+            vec![Ok(MockLlmProvider::standard_stream())],
+        ));
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider.clone());
+        registry.register_model_metadata(
+            ModelRoutingMetadata::new("no-registry", "shared/model").with_cost(1.0, 1.0),
+        );
+
+        let router = LlmRouter::new(registry);
+        router
+            .route_stream(sample_router_request_with_image("shared/model"))
+            .unwrap();
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn test_models_dev_registry_embeds_and_parses_snapshot() {
+        // Smoke test that the embedded models.dev snapshot parses and that the
+        // canonical multimodal models are present with vision=true, while a
+        // known text-only embedding model reports vision=false. This guards the
+        // `include_str!` path and the `parse_models_dev_snapshot` logic against
+        // a corrupt/truncated snapshot.
+        let registry = ModelsDevRegistry::new();
+        // Anthropic Claude models are multimodal (attachment=true / image in
+        // modalities.input). Use a prefix-free canonical id present in the
+        // snapshot.
+        assert_eq!(
+            registry.vision_for("claude-opus-4-5"),
+            Some(true),
+            "claude-opus-4-5 should be vision-capable per models.dev"
+        );
+        // OpenAI text-embedding-3-large is text-only (attachment=false, no image
+        // in modalities.input) → vision=false.
+        assert_eq!(
+            registry.vision_for("text-embedding-3-large"),
+            Some(false),
+            "text-embedding-3-large should be vision=false per models.dev"
+        );
+        // Unknown model → None (caller falls back to optimistic default).
+        assert_eq!(registry.vision_for("definitely-not-a-real-model-xyz"), None);
+    }
+
+    #[test]
+    fn test_models_dev_registry_prefix_match_resolves_family_alias() {
+        // The TS `getModelInfo` falls back to a longest-prefix match so a
+        // versioned/deployment id (e.g. "gpt-5-2025-08-07") still resolves to
+        // the base family entry ("gpt-5"). Rust mirrors this. gpt-5 is
+        // vision-capable in the snapshot, so any id prefixed by "gpt-5" that
+        // has no exact entry resolves to vision=true via prefix match.
+        let registry = ModelsDevRegistry::new();
+        // Exact entry must exist for the base id.
+        assert_eq!(registry.vision_for("gpt-5"), Some(true));
+        // A prefixed id with no exact match resolves via the base entry.
+        let prefixed = registry.vision_for("gpt-5-deployment-alias-12345");
+        // The snapshot key "gpt-5" is a prefix of the query → resolves to its
+        // vision flag. (If the snapshot ever adds an exact "gpt-5-*" entry this
+        // still passes because exact match takes precedence; we assert the
+        // prefix path returns a concrete bool, not None.)
+        assert!(
+            prefixed.is_some(),
+            "prefix match should resolve a gpt-5-* alias to a concrete vision flag"
+        );
     }
 
     #[test]
@@ -1861,6 +2527,35 @@ mod tests {
             messages: vec![Message {
                 role: "user".into(),
                 content: "test".into(),
+                ..Default::default()
+            }],
+            tools: vec![],
+            stream: true,
+            auth_context: AuthContext::None,
+            options: RequestOptions::default(),
+        }
+    }
+
+    /// Like `sample_router_request` but the user message carries an `image_url`
+    /// content part, so `request.needs_vision()` is true. Used by the R-4
+    /// vision-capability gating tests.
+    fn sample_router_request_with_image(model: &str) -> GenerateRequest {
+        GenerateRequest {
+            model: model.into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: String::new(),
+                content_parts: vec![
+                    MessageContentPart::Text {
+                        text: "what is in this image?".into(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrlContentPart {
+                            url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                            detail: None,
+                        },
+                    },
+                ],
                 ..Default::default()
             }],
             tools: vec![],

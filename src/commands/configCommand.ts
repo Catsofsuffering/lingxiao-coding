@@ -22,6 +22,7 @@ const CATEGORY_MAP: Record<string, string[]> = {
     'llm.enable_streaming', 'llm.max_retries',
     'llm.request_timeout_s', 'llm.connect_timeout_s',
     'llm.first_token_timeout_s', 'llm.first_token_timeout_thinking_s',
+    'llm.stream_chunk_timeout_s',
     'llm.context_max_tokens', 'llm.capped_max_tokens', 'llm.escalated_max_tokens',
     'llm.thinking_budget_tokens', 'llm.reasoning_effort', 'llm.show_thinking_content',
     'llm.enable_thinking_instruction', 'llm.enable_extended_thinking',

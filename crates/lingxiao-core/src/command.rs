@@ -1,4 +1,7 @@
-use crate::agent::{AgentConfig, AgentEvent, AgentLlmExecutor, AgentPool, AgentToolExecutor};
+use crate::agent::{
+    escalation_auto_response, AgentConfig, AgentEvent, AgentLlmExecutor, AgentPool,
+    AgentToolExecutor, EscalationAction,
+};
 use crate::bus::{Message as BusMessage, MessageBus, Priority};
 use crate::document_tools::{
     document_error_message, document_error_payload, DocumentToolError, DocumentToolRunner,
@@ -286,15 +289,6 @@ impl AgentToolExecutor for RouterAgentToolExecutor {
         if !self.tool_registry.is_registered(&tool_call.name) {
             return ToolResult::err(format!("Tool not found: {}", tool_call.name));
         }
-        if let Err(error) = preflight_native_tool_call(
-            &self.db,
-            self.tool_registry.as_ref(),
-            session_id,
-            &tool_call.name,
-            &tool_call.arguments,
-        ) {
-            return ToolResult::err(error.message);
-        }
         let execution_args = match workspace_scoped_tool_args(
             &self.db,
             session_id,
@@ -304,10 +298,19 @@ impl AgentToolExecutor for RouterAgentToolExecutor {
             Ok(args) => args,
             Err(error) => return ToolResult::err(error.message),
         };
+        if let Err(error) = preflight_native_tool_call(
+            &self.db,
+            self.tool_registry.as_ref(),
+            session_id,
+            &tool_call.name,
+            &execution_args,
+        ) {
+            return ToolResult::err(error.message);
+        }
 
         let slot_id = format!("{session_id}:{agent_id}:{}", tool_call.id);
         let estimated_file_write_bytes =
-            estimated_native_file_write_bytes(&tool_call.name, &tool_call.arguments);
+            estimated_native_file_write_bytes(&tool_call.name, &execution_args);
         let mut runtime = self.runtime_manager.lock().unwrap();
         let slot = match runtime.try_acquire_tool(slot_id) {
             Ok(slot) => slot,
@@ -1643,11 +1646,7 @@ impl CommandRouter {
             }
         }
 
-        let mut messages = vec![Message {
-            role: "user".into(),
-            content: content.clone(),
-            ..Default::default()
-        }];
+        let mut messages = coding_agent_initial_messages(&content);
         let max_rounds = cmd
             .params
             .get("max_rounds")
@@ -3496,11 +3495,7 @@ impl CommandRouter {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(8);
-        let mut messages = vec![Message {
-            role: "user".into(),
-            content: objective.clone(),
-            ..Default::default()
-        }];
+        let mut messages = coding_agent_initial_messages(&objective);
         append_leader_conversation_outside(&self.db, &session_id, "user", &objective, None);
 
         let mut all_events = Vec::new();
@@ -3593,11 +3588,53 @@ impl CommandRouter {
                     break;
                 }
 
-                if let Some(ToolPermission::RequiresGrant { tool_name, .. }) = self
+                let tool_arguments = match workspace_scoped_tool_args(
+                    &self.db,
+                    &session_id,
+                    &tool_call.name,
+                    &tool_call.arguments,
+                ) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        let tool_resp = CommandResponse::err(
+                            format!("{request_id}_tool_scope_{}_{}", round, tool_call.id),
+                            error,
+                        );
+                        let observation = leader_tool_observation(&tool_call, &tool_resp);
+                        observations.push(observation.clone());
+                        append_leader_conversation_outside(
+                            &self.db,
+                            &session_id,
+                            "tool",
+                            &observation.to_string(),
+                            Some(&tool_call.id),
+                        );
+                        messages.push(Message {
+                            role: "tool".into(),
+                            content: observation.to_string(),
+                            tool_call_id: Some(tool_call.id.clone()),
+                            name: Some(tool_call.name.clone()),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                };
+
+                if let Some(ToolPermission::RequiresGrant {
+                    tool_name,
+                    path_scope,
+                }) = self
                     .tool_registry
-                    .required_permission_for_call(&tool_call.name, &tool_call.arguments)
+                    .required_permission_for_call(&tool_call.name, &tool_arguments)
                 {
-                    if !has_permission_grant(&self.db, &session_id, &tool_name) {
+                    if require_scoped_permission_grant(
+                        &self.db,
+                        &session_id,
+                        &tool_name,
+                        path_scope.as_deref(),
+                    )
+                    .is_err()
+                    {
                         let permission_request_id =
                             format!("leader_perm_{}_{}", session_id, tool_call.id);
                         let permission_resp = self.dispatch(CommandEnvelope {
@@ -3607,7 +3644,7 @@ impl CommandRouter {
                                 "permission_request_id": permission_request_id,
                                 "tool_name": tool_name,
                                 "mode": "leader_tool",
-                                "args": tool_call.arguments,
+                                "args": tool_arguments.clone(),
                             }),
                             actor: cmd.actor.clone(),
                             session_id: Some(session_id.clone()),
@@ -3631,7 +3668,7 @@ impl CommandRouter {
                         "tool_call_id": tool_call.id,
                         "tool_name": tool_call.name,
                         "tool_type": "native",
-                        "args": tool_call.arguments,
+                        "args": tool_arguments.clone(),
                     }),
                     actor: cmd.actor.clone(),
                     session_id: Some(session_id.clone()),
@@ -4654,7 +4691,6 @@ impl CommandRouter {
             .unwrap_or(64);
         let mut runtime_budget_denied = false;
         let mut native_runtime_denied = false;
-        let estimated_file_write_bytes = estimated_native_file_write_bytes(&tool_name, &args);
 
         if let Some(ref key) = idempotency_key {
             if let Some(cached) = lookup_idempotent_outside_tx(&self.db, key, TOOL_CALL) {
@@ -4663,22 +4699,26 @@ impl CommandRouter {
         }
 
         let execution_args = if !sidecar && self.tool_registry.is_registered(&tool_name) {
+            let scoped_args =
+                match workspace_scoped_tool_args(&self.db, &session_id, &tool_name, &args) {
+                    Ok(args) => args,
+                    Err(error) => return CommandResponse::err(request_id, error),
+                };
             if let Err(error) = preflight_native_tool_call(
                 &self.db,
                 self.tool_registry.as_ref(),
                 &session_id,
                 &tool_name,
-                &args,
+                &scoped_args,
             ) {
                 return CommandResponse::err(request_id, error);
             }
-            match workspace_scoped_tool_args(&self.db, &session_id, &tool_name, &args) {
-                Ok(args) => args,
-                Err(error) => return CommandResponse::err(request_id, error),
-            }
+            scoped_args
         } else {
             args.clone()
         };
+        let estimated_file_write_bytes =
+            estimated_native_file_write_bytes(&tool_name, &execution_args);
 
         // Native tool dispatch: if the tool is registered and not sidecar, execute it.
         if !sidecar && outcome_kind == "success" && self.tool_registry.is_registered(&tool_name) {
@@ -5396,7 +5436,7 @@ impl CommandRouter {
                         "llm_call_id": llm_call_id,
                         "tool_call_id": call.id,
                         "tool_name": call.name,
-                        "args": call.arguments,
+                        "args": sanitized_persistence_value(&call.arguments),
                         "status": "model_tool_request",
                     }));
                     events.push(simple_event(
@@ -6127,10 +6167,18 @@ impl CommandRouter {
             .unwrap_or_else(|| format!("terminal_{}", now_ms()));
         let shell = string_param(&cmd, &["shell", "program"]);
         let args = string_array_param(&cmd, "args");
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let cwd_scope = cwd.as_ref().map(|path| path.to_string_lossy().to_string());
+        let cwd = match session_scoped_cwd(
+            &self.db,
+            &session_id,
+            string_param(&cmd, &["cwd"]),
+            "Terminal",
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return CommandResponse::err(request_id, error),
+        };
+        let cwd_scope = cwd.to_string_lossy().to_string();
         if let Err(error) =
-            require_scoped_permission_grant(&self.db, &session_id, "terminal", cwd_scope.as_deref())
+            require_scoped_permission_grant(&self.db, &session_id, "terminal", Some(&cwd_scope))
         {
             return CommandResponse::err(request_id, error);
         }
@@ -6138,7 +6186,7 @@ impl CommandRouter {
             terminal_id: terminal_id.clone(),
             shell: shell.clone(),
             args,
-            cwd: cwd.clone(),
+            cwd: Some(cwd.clone()),
         }) {
             Ok(created) => created,
             Err(error) => {
@@ -6423,10 +6471,14 @@ impl CommandRouter {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(5_000);
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let cwd_scope = cwd.as_ref().map(|path| path.to_string_lossy().to_string());
+        let cwd =
+            match session_scoped_cwd(&self.db, &session_id, string_param(&cmd, &["cwd"]), "REPL") {
+                Ok(cwd) => cwd,
+                Err(error) => return CommandResponse::err(request_id, error),
+            };
+        let cwd_scope = cwd.to_string_lossy().to_string();
         if let Err(error) =
-            require_scoped_permission_grant(&self.db, &session_id, "repl", cwd_scope.as_deref())
+            require_scoped_permission_grant(&self.db, &session_id, "repl", Some(&cwd_scope))
         {
             return CommandResponse::err(request_id, error);
         }
@@ -6435,7 +6487,7 @@ impl CommandRouter {
             eval_id: eval_id.clone(),
             language: language.clone(),
             code,
-            cwd,
+            cwd: Some(cwd),
             timeout_ms,
         }) {
             Ok(result) => result,
@@ -6521,10 +6573,14 @@ impl CommandRouter {
             string_param(&cmd, &["repl_id", "id"]).unwrap_or_else(|| format!("repl_{}", now_ms()));
         let language =
             string_param(&cmd, &["language", "runtime"]).unwrap_or_else(|| "python".into());
-        let cwd = string_param(&cmd, &["cwd"]).map(std::path::PathBuf::from);
-        let cwd_scope = cwd.as_ref().map(|path| path.to_string_lossy().to_string());
+        let cwd =
+            match session_scoped_cwd(&self.db, &session_id, string_param(&cmd, &["cwd"]), "REPL") {
+                Ok(cwd) => cwd,
+                Err(error) => return CommandResponse::err(request_id, error),
+            };
+        let cwd_scope = cwd.to_string_lossy().to_string();
         if let Err(error) =
-            require_scoped_permission_grant(&self.db, &session_id, "repl", cwd_scope.as_deref())
+            require_scoped_permission_grant(&self.db, &session_id, "repl", Some(&cwd_scope))
         {
             return CommandResponse::err(request_id, error);
         }
@@ -6546,7 +6602,7 @@ impl CommandRouter {
             terminal_id: repl_id.clone(),
             shell: Some(program.clone()),
             args,
-            cwd: cwd.clone(),
+            cwd: Some(cwd.clone()),
         }) {
             Ok(created) => created,
             Err(error) => {
@@ -9493,15 +9549,27 @@ fn enforce_workspace_read_boundary(
 
 fn read_tool_requested_scope(tool_name: &str, args: &Value) -> Option<String> {
     let key = read_tool_scope_key(tool_name)?;
-    args.get(key).and_then(Value::as_str).map(str::to_string)
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| default_tool_scope(tool_name).map(str::to_string))
 }
 
 fn read_tool_scope_key(tool_name: &str) -> Option<&'static str> {
     Some(match tool_name {
-        "file_read" | "list_dir" | "code_search" => "path",
+        "file_read" | "list_dir" | "code_search" | "file_write" | "file_create"
+        | "structured_patch" => "path",
         "glob" => "base_dir",
+        "shell" => "cwd",
         _ => return None,
     })
+}
+
+fn default_tool_scope(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "code_search" | "glob" | "shell" => Some("."),
+        _ => None,
+    }
 }
 
 fn workspace_scope_allows(workspace: &str, requested_scope: &str) -> bool {
@@ -9560,7 +9628,11 @@ fn workspace_scoped_tool_args(
     let Some(key) = read_tool_scope_key(tool_name) else {
         return Ok(args.clone());
     };
-    let Some(raw_scope) = args.get(key).and_then(Value::as_str) else {
+    let raw_scope = args
+        .get(key)
+        .and_then(Value::as_str)
+        .or_else(|| default_tool_scope(tool_name));
+    let Some(raw_scope) = raw_scope else {
         return Ok(args.clone());
     };
     if raw_scope.chars().any(char::is_control) {
@@ -9658,6 +9730,56 @@ fn ensure_path_inside_session_workspace(
     }
 }
 
+fn session_workspace_root(
+    db: &DbOwner,
+    session_id: &str,
+) -> std::result::Result<std::path::PathBuf, CoreError> {
+    let workspace = db
+        .conn()
+        .query_row(
+            "SELECT workspace FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| CoreError::internal(format!("workspace lookup failed: {error}")))?
+        .ok_or_else(|| CoreError::session_not_found(session_id.to_string()))?;
+    if workspace.trim().is_empty() {
+        return Err(CoreError::permission_denied(
+            "Session requires a workspace scope",
+        ));
+    }
+    Ok(normalize_permission_path(&workspace))
+}
+
+fn session_scoped_cwd(
+    db: &DbOwner,
+    session_id: &str,
+    requested_cwd: Option<String>,
+    label: &str,
+) -> std::result::Result<std::path::PathBuf, CoreError> {
+    let workspace_root = session_workspace_root(db, session_id)?;
+    let raw_cwd = requested_cwd.unwrap_or_else(|| workspace_root.display().to_string());
+    if raw_cwd.chars().any(char::is_control) {
+        return Err(CoreError::permission_denied(format!(
+            "{label} cwd contains control characters"
+        )));
+    }
+    let raw_path = std::path::Path::new(&raw_cwd);
+    let requested = if raw_path.is_absolute() {
+        normalize_permission_path(raw_path)
+    } else {
+        normalize_permission_path(workspace_root.join(raw_path))
+    };
+    if requested == workspace_root || requested.strip_prefix(&workspace_root).is_ok() {
+        Ok(requested)
+    } else {
+        Err(CoreError::permission_denied(format!(
+            "{label} cwd is outside the session workspace"
+        )))
+    }
+}
+
 fn mcp_cwd_for_session(
     db: &DbOwner,
     session_id: &str,
@@ -9700,10 +9822,26 @@ fn normalize_permission_path(path: impl AsRef<std::path::Path>) -> std::path::Pa
     if let Ok(canonical) = std::fs::canonicalize(raw) {
         return canonical;
     }
-    if let (Some(parent), Some(file_name)) = (raw.parent(), raw.file_name()) {
-        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-            return lexical_normalize_path(canonical_parent.join(file_name));
+    let mut cursor = raw;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(cursor) {
+            let mut normalized = canonical;
+            for component in suffix.iter().rev() {
+                normalized.push(component);
+            }
+            return lexical_normalize_path(normalized);
         }
+        if let Some(file_name) = cursor.file_name() {
+            suffix.push(file_name.to_os_string());
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        if parent == cursor || parent.as_os_str().is_empty() {
+            break;
+        }
+        cursor = parent;
     }
     lexical_normalize_path(raw)
 }
@@ -9744,6 +9882,31 @@ fn workflow_execution_context(params: &Value) -> Value {
     })
 }
 
+fn coding_agent_system_prompt() -> &'static str {
+    "You are Lingxiao Rust Core running as a coding agent inside the user's workspace. \
+The next user message is the task to execute, even when it is short, broad, or written in Chinese. \
+Do not say that no task was provided when the user message contains a request. \
+For implementation requests, make reasonable product and design choices, use the available file tools, \
+and create or edit concrete project files instead of asking for clarification or only describing the work. \
+When asked to build or generate a frontend page, produce a directly usable HTML/CSS/JavaScript implementation in the workspace. \
+Ask a clarifying question only when the task is impossible or unsafe without missing information."
+}
+
+fn coding_agent_initial_messages(user_content: &str) -> Vec<Message> {
+    vec![
+        Message {
+            role: "system".into(),
+            content: coding_agent_system_prompt().into(),
+            ..Default::default()
+        },
+        Message {
+            role: "user".into(),
+            content: user_content.to_string(),
+            ..Default::default()
+        },
+    ]
+}
+
 fn estimated_native_file_write_bytes(tool_name: &str, args: &Value) -> Option<u64> {
     match tool_name {
         "file_write" | "file_create" => args
@@ -9760,6 +9923,7 @@ fn estimated_native_file_write_bytes(tool_name: &str, args: &Value) -> Option<u6
                         operation
                             .get("new")
                             .or_else(|| operation.get("content"))
+                            .or_else(|| operation.get("replace"))
                             .and_then(Value::as_str)
                             .map(|content| content.len() as u64)
                     })
@@ -9767,17 +9931,6 @@ fn estimated_native_file_write_bytes(tool_name: &str, args: &Value) -> Option<u6
             }),
         _ => None,
     }
-}
-
-fn has_permission_grant(db: &DbOwner, session_id: &str, tool_name: &str) -> bool {
-    let conn = db.conn();
-    conn.query_row(
-        "SELECT COUNT(*) FROM permission_grants WHERE session_id = ?1 AND tool_name = ?2",
-        params![session_id, tool_name],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count > 0)
-    .unwrap_or(false)
 }
 
 fn require_scoped_permission_grant(
@@ -9933,6 +10086,23 @@ fn start_agent_pool_event_bridge(
                             "agent.llm_round_completed",
                             &assistant_message,
                         );
+                    }
+                    // R-7 follow-up: durable/canonical Leader-bus escalation
+                    // signal. When the ToolFailureLoopGuard trips on a
+                    // state-class error, write it both to `agent_logs` (operator
+                    // log) and to the durable `event_log` (canonical
+                    // `EventEnvelope`, replayable by the session / Leader layer)
+                    // — reusing the existing persistence/emit paths, no new DB
+                    // schema. This is the Rust equivalent of the TS
+                    // `agent:tool_failure_loop` event +
+                    // `tool_failure_loop_escalation` MessageBus message; Rust
+                    // has no worker bus, so the signal is durable-and-observable
+                    // rather than handled in place.
+                    AgentEvent::ToolFailureLoopEscalated {
+                        agent_id,
+                        escalation,
+                    } => {
+                        persist_agent_pool_escalation(&db, &agent_id, &escalation);
                     }
                 }
             }
@@ -10152,6 +10322,410 @@ fn persist_agent_pool_log(db: &DbOwner, agent_id: &str, event_type: &str, conten
         )?;
         Ok(())
     });
+}
+
+/// R-7 follow-up: persist a ToolFailureLoopGuard state-class trip as a
+/// durable/canonical Leader-bus escalation signal. Writes both the `agent_logs`
+/// operator log (event_type `agent.tool_failure_loop_escalation`, content =
+/// sanitized JSON) and the durable `event_log` (canonical `EventEnvelope`, same
+/// event_type) — replayable by the session / Leader layer so the trip is
+/// observable beyond the in-process LLM-facing recovery error.
+///
+/// Reuses `append_event_in_tx`, which runs `redact_persistence_secrets` over
+/// the payload as defense-in-depth (the payload already omits raw args,
+/// carrying only the stable `args_hash`). Idempotent via the `event_id` (one
+/// row per trip even if the bridge sees the event twice).
+fn persist_agent_pool_escalation(
+    db: &DbOwner,
+    agent_id: &str,
+    escalation: &crate::agent::ToolFailureLoopEscalation,
+) {
+    let Ok(Some(row)) = load_active_agent_row(db, agent_id) else {
+        // No active agent_state row (test harness without DB-backed spawn): fall
+        // back to the escalation's own session_id so the durable event is still
+        // recorded under the right session.
+        persist_agent_pool_escalation_unattached(db, escalation);
+        return;
+    };
+    let payload = serde_json::to_value(escalation).unwrap_or_else(|_| json!({}));
+    let content = payload.to_string();
+    let occurred_at = now_ms();
+    let _ = db.with_transaction(|tx| {
+        insert_agent_log(
+            tx,
+            &row.session_id,
+            agent_id,
+            &row.agent_name,
+            &row.agent_role,
+            &row.task_id,
+            "agent.tool_failure_loop_escalation",
+            &content,
+            occurred_at,
+        )?;
+        // The agent pool always runs under a session created via `session.create`
+        // (which initializes the meta row), but the bridge must be self-sufficient
+        // too: `ensure_meta` is idempotent (`INSERT OR IGNORE`) and mirrors what
+        // `append_event_in_tx` does internally, so the durable write succeeds even
+        // if a test harness (or the unattached fallback) drives the bridge before
+        // any session-meta row exists. Without this, `get_current_generation`
+        // hits `QueryReturnedNoRows` and the whole transaction rolls back
+        // silently (the `let _ =` here swallows it) — so the escalation signal
+        // would be lost in exactly the pool-less harness the unattached path
+        // exists to serve.
+        ensure_meta(tx, &Some(row.session_id.clone()))?;
+        let generation = get_current_generation(tx, &Some(row.session_id.clone()))?;
+        append_event_in_tx(
+            tx,
+            Some(row.session_id.clone()),
+            generation,
+            "agent.tool_failure_loop_escalation",
+            Actor::with_id(ActorKind::Runtime, "agent-pool"),
+            payload,
+            occurred_at,
+            None,
+            None,
+            format!(
+                "agent_tool_failure_loop_escalation_{}_{}_{}_{}",
+                escalation.session_id, escalation.agent_id, escalation.args_hash, occurred_at
+            ),
+        )?;
+        // R-7 deferred LeaderPermissionManager auto-response parity: persist the
+        // deterministic errorKind → action decision record in the same
+        // transaction (canonical event + session_state row). Actual live
+        // permission-mode mutation is deferred; the record carries
+        // from_mode/target_mode so it is fully actionable. See
+        // `persist_escalation_auto_response_decision_in_tx`.
+        persist_escalation_auto_response_decision_in_tx(
+            tx,
+            &row.session_id,
+            escalation,
+            occurred_at,
+        )?;
+        Ok(())
+    });
+}
+
+/// Fallback path when there is no active `agent_state` row (e.g. a unit test
+/// driving `AgentLoop` directly without a DB-backed spawn). Still records the
+/// durable `event_log` + `agent_logs` row under the escalation's own
+/// `session_id`/`agent_id` so the signal is observable without the pool
+/// bookkeeping.
+fn persist_agent_pool_escalation_unattached(
+    db: &DbOwner,
+    escalation: &crate::agent::ToolFailureLoopEscalation,
+) {
+    let payload = serde_json::to_value(escalation).unwrap_or_else(|_| json!({}));
+    let content = payload.to_string();
+    let occurred_at = now_ms();
+    let _ = db.with_transaction(|tx| {
+        insert_agent_log(
+            tx,
+            &escalation.session_id,
+            &escalation.agent_id,
+            &escalation.agent_name,
+            "",
+            &escalation.task_id,
+            "agent.tool_failure_loop_escalation",
+            &content,
+            occurred_at,
+        )?;
+        // See `persist_agent_pool_escalation`: the unattached path exists for
+        // pool-less harnesses that may not have a session-meta row yet, so
+        // `ensure_meta` first (`append_event_in_tx` re-runs it harmlessly).
+        ensure_meta(tx, &Some(escalation.session_id.clone()))?;
+        let generation = get_current_generation(tx, &Some(escalation.session_id.clone()))?;
+        append_event_in_tx(
+            tx,
+            Some(escalation.session_id.clone()),
+            generation,
+            "agent.tool_failure_loop_escalation",
+            Actor::with_id(ActorKind::Runtime, "agent-pool"),
+            payload,
+            occurred_at,
+            None,
+            None,
+            format!(
+                "agent_tool_failure_loop_escalation_{}_{}_{}_{}",
+                escalation.session_id, escalation.agent_id, escalation.args_hash, occurred_at
+            ),
+        )?;
+        // R-7 deferred LeaderPermissionManager auto-response parity: persist the
+        // deterministic decision record in the same transaction (canonical event
+        // + session_state row). See
+        // `persist_escalation_auto_response_decision_in_tx`.
+        persist_escalation_auto_response_decision_in_tx(
+            tx,
+            &escalation.session_id,
+            escalation,
+            occurred_at,
+        )?;
+        Ok(())
+    });
+}
+
+/// Apply a live permission-mode mutation *inside the same transaction* as the
+/// escalation decision record, reusing the `handle_permission_set_mode`
+/// semantics: read the current mode/generation, upsert `permission_modes` with
+/// `generation + 1`, revoke stale `permission_grants` (a mode change invalidates
+/// grants scoped to the prior mode), and emit the canonical
+/// `permission.mode_changed` + per-grant `permission.grant_revoked` events.
+///
+/// This is the live-mutation analog the deferred decision record previously
+/// only *described*. It does **not** do command-envelope-level concerns
+/// (`ensure_session_active`, idempotency-key cache, the `CommandResponse`) —
+/// those belong to the `permission.set_mode` command path; the bridge is an
+/// internal in-transaction caller that already holds a live session (the agent
+/// pool runs under a `session.create`-made session) and shares one `occurred_at`
+/// with the escalation + decision events so the mutation is causally linked.
+///
+/// Returns the number of grant-revocation events emitted (0 when no grants
+/// existed) so the caller can record an auditable `revoked_grants` count. The
+/// `mutation_event_id_prefix` is used to build deterministic event ids (one per
+/// mode change + one per revoked grant) so a duplicate dispatch dedups via
+/// `try_fetch_event_by_id` rather than double-applying.
+fn apply_permission_mode_mutation_in_tx(
+    tx: &Transaction,
+    session_id: &str,
+    new_mode: &str,
+    occurred_at: Timestamp,
+    mutation_event_id_prefix: &str,
+) -> Result<usize> {
+    let actor = Actor::with_id(ActorKind::Runtime, "agent-pool");
+    // Read the mode/generation inside the same tx so the mutation is consistent
+    // with the decision record's `from_mode` (both observe the pre-mutation row).
+    let old_mode = current_permission_mode(tx, session_id)?.unwrap_or_else(|| "dev".to_string());
+    let mode_generation = current_permission_generation(tx, session_id)? + 1;
+    tx.execute(
+        "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+         mode = excluded.mode, generation = excluded.generation, updated_at = excluded.updated_at",
+        params![session_id, new_mode, mode_generation, occurred_at],
+    )?;
+
+    // A mode change invalidates grants scoped to the prior mode — revoke them,
+    // mirroring `handle_permission_set_mode`. Collect the tool names first so
+    // each can get its own `permission.grant_revoked` event (the full command
+    // path does this exact collect-then-delete-then-emit loop).
+    let grants: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT tool_name FROM permission_grants WHERE session_id = ?1 ORDER BY tool_name",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<String>>>()?
+    };
+    tx.execute(
+        "DELETE FROM permission_grants WHERE session_id = ?1",
+        params![session_id],
+    )?;
+
+    let session_generation = get_current_generation(tx, &Some(session_id.to_string()))?;
+    append_event_in_tx(
+        tx,
+        Some(session_id.to_string()),
+        session_generation,
+        "permission.mode_changed",
+        actor.clone(),
+        json!({
+            "session_id": session_id,
+            "old_mode": old_mode,
+            "new_mode": new_mode,
+            "generation": mode_generation,
+            "source": "tool_failure_loop_escalation_auto_response",
+        }),
+        occurred_at,
+        None,
+        None,
+        format!("{mutation_event_id_prefix}_mode_changed_{mode_generation}"),
+    )?;
+    for tool_name in &grants {
+        append_event_in_tx(
+            tx,
+            Some(session_id.to_string()),
+            session_generation,
+            "permission.grant_revoked",
+            actor.clone(),
+            json!({
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "reason": "mode_changed_by_tool_failure_loop_escalation",
+            }),
+            occurred_at,
+            None,
+            None,
+            format!("{mutation_event_id_prefix}_grant_revoked_{tool_name}_{mode_generation}"),
+        )?;
+    }
+    Ok(grants.len())
+}
+
+/// Persist the deterministic auto-response *decision* for an escalation, in the
+/// same transaction as the escalation signal itself. Mirrors the errorKind →
+/// action decision the TS `LeaderPermissionManager.handleToolFailureLoopEscalation`
+/// (src/agents/LeaderPermissionManager.ts:199-225) would apply when it receives
+/// the `tool_failure_loop_escalation` bus message:
+///   permission/network ⇒ 'approved' (auto-escalate permission mode + approve);
+///   sandbox/mode/write_scope/schema ⇒ 'rejected';
+///   execution/timeout/aborted/other ⇒ 'interactive'.
+///
+/// Rust `AgentLoop` runs in-process under the `AgentPool` (no Leader MessageBus),
+/// so the TS "respond by mutating live permission state + sending a
+/// permission_response to the worker" loop has no in-process analog. The minimal
+/// verifiable equivalent is a *durable decision record* computed from the same
+/// policy table (`escalation_auto_response`, in `agent.rs`) and persisted as:
+///   (1) a canonical `agent.tool_failure_loop_escalation_decision` event in
+///       `event_log` (via `append_event_in_tx`, which runs
+///       `redact_persistence_secrets` over the payload as defense-in-depth); and
+///   (2) a `session_state` row keyed
+///       `tool_failure_loop_escalation_decision:{agent_id}:{tool_name}:{args_hash}`
+///       so an operator / Leader layer can read the latest decision for a given
+///       trip.
+///
+/// Live permission-mode *mutation*: for an `approved` decision whose
+/// `target_mode` differs from `from_mode`, the helper *applies* the mutation
+/// in the same transaction via `apply_permission_mode_mutation_in_tx`
+/// (upsert `permission_modes` + generation bump + revoke stale grants + emit
+/// `permission.mode_changed`/`permission.grant_revoked`), mirroring the live
+/// `handle_permission_set_mode` semantics the TS handler drives. The decision
+/// record's `mutation` field records the auditable outcome:
+///   - `"applied"`: approved and target_mode != from_mode (mode mutated);
+///   - `"noop"`: approved but target_mode == from_mode (yolo→yolo, no mutation
+///     needed, decision still recorded);
+///   - `"not_applicable"`: rejected/interactive (no mode mutation).
+///
+/// Rejected/interactive decisions never mutate. `from_mode`/`target_mode`
+/// always reflect the *decision intent*; `mutated_to` records the actually
+/// applied mode (present only when `applied`).
+///
+/// Secret-safety: the record carries `args_hash` (the stable SHA-1 fingerprint,
+/// never the raw args), and `last_error_message` is truncated + the persisted
+/// event is run through `redact_persistence_secrets`. Idempotent via the
+/// `event_id` (deterministic per escalation occurrence, so a duplicate bridge
+/// dispatch writes exactly one decision row).
+fn persist_escalation_auto_response_decision_in_tx(
+    tx: &Transaction,
+    session_id: &str,
+    escalation: &crate::agent::ToolFailureLoopEscalation,
+    occurred_at: Timestamp,
+) -> Result<()> {
+    let auto = escalation_auto_response(escalation.error_kind);
+    // Ensure the event_log_meta row exists before any `get_current_generation`
+    // read (the mutation helper + the decision event both read it). The bridge
+    // path already calls `ensure_meta` for the escalation signal, but this
+    // helper must be self-sufficient when invoked directly (e.g. a test driving
+    // it in isolation, mirroring the §10j fix for pool-less harnesses). It is a
+    // no-op (`INSERT OR IGNORE`) when the row already exists.
+    ensure_meta(tx, &Some(session_id.to_string()))?;
+    // The mode the session is currently in (read inside the same tx so the
+    // decision record is consistent with the escalation). Defaults to "dev" to
+    // mirror the `handle_permission_set_mode` default when no row exists.
+    let from_mode = current_permission_mode(tx, session_id)?.unwrap_or_else(|| "dev".to_string());
+    let target_mode = auto.target_mode(&from_mode);
+    // Truncate the last error message for the durable record (the bridge's
+    // `redact_persistence_secrets` defense-in-depth still runs on the whole
+    // payload, but we keep the stored fragment small and free of the full
+    // error text). Mirrors the TS `lastErrorMessage.slice(0, 200)` audit line.
+    let last_error_snippet: String = escalation.last_error_message.chars().take(200).collect();
+
+    // Apply the live permission-mode mutation for an approved decision whose
+    // target differs from the current mode. `mutation` records the auditable
+    // outcome; `mutated_to`/`revoked_grants` carry the applied-mutation facts.
+    // Rejected/interactive decisions never mutate (target_mode is None).
+    let mut mutation = "not_applicable";
+    let mut mutated_to: Option<String> = None;
+    let mut revoked_grants: Option<usize> = None;
+    if auto.action == EscalationAction::Approved {
+        if let Some(ref target) = target_mode {
+            if target != &from_mode {
+                // Deterministic prefix shared with the decision event id so a
+                // duplicate dispatch dedups the mode-changed/grant-revoked
+                // events via `try_fetch_event_by_id` (same prefix + same
+                // occurred_at ⇒ same event ids), not double-applies.
+                let mutation_prefix = format!(
+                    "agent_tool_failure_loop_escalation_mutation_{}_{}_{}_{}",
+                    session_id, escalation.agent_id, escalation.args_hash, occurred_at
+                );
+                let revoked = apply_permission_mode_mutation_in_tx(
+                    tx,
+                    session_id,
+                    target,
+                    occurred_at,
+                    &mutation_prefix,
+                )?;
+                mutation = "applied";
+                mutated_to = Some(target.clone());
+                revoked_grants = Some(revoked);
+            } else {
+                // approved but target == from_mode (yolo already at yolo): no
+                // mutation needed, but the decision is still recorded.
+                mutation = "noop";
+            }
+        }
+    }
+
+    let decision_payload = json!({
+        "session_id": session_id,
+        "agent_id": escalation.agent_id,
+        "agent_name": escalation.agent_name,
+        "task_id": escalation.task_id,
+        "tool_name": escalation.tool_name,
+        // Stable fingerprint only — raw args are deliberately absent.
+        "args_hash": escalation.args_hash,
+        "error_kind": escalation.error_kind,
+        "error_code": escalation.error_code,
+        "count": escalation.count,
+        "threshold": escalation.threshold,
+        "action": auto.action,
+        "decision": auto.decision,
+        "reason": auto.reason,
+        "from_mode": from_mode,
+        "target_mode": target_mode,
+        // Auditable mutation outcome (applied/noop/not_applicable) — supersedes
+        // the prior `"deferred"` marker now that live mutation lands.
+        "mutation": mutation,
+        "mutated_to": mutated_to,
+        "revoked_grants": revoked_grants,
+        "last_error_message": last_error_snippet,
+    });
+    let generation = get_current_generation(tx, &Some(session_id.to_string()))?;
+    append_event_in_tx(
+        tx,
+        Some(session_id.to_string()),
+        generation,
+        "agent.tool_failure_loop_escalation_decision",
+        Actor::with_id(ActorKind::Runtime, "agent-pool"),
+        decision_payload.clone(),
+        occurred_at,
+        None,
+        None,
+        // Deterministic per escalation occurrence (shares `occurred_at` with the
+        // escalation signal, which is computed once per bridge dispatch), so a
+        // duplicate dispatch dedups to one decision row via `try_fetch_event_by_id`.
+        format!(
+            "agent_tool_failure_loop_escalation_decision_{}_{}_{}_{}",
+            session_id, escalation.agent_id, escalation.args_hash, occurred_at
+        ),
+    )?;
+    // session_state row so an operator / Leader layer can read the latest
+    // decision for a given trip and act on it (e.g. issue a real
+    // `permission.set_mode`). Upsert keeps the latest decision under the key.
+    let key = format!(
+        "tool_failure_loop_escalation_decision:{}:{}:{}",
+        escalation.agent_id, escalation.tool_name, escalation.args_hash
+    );
+    tx.execute(
+        "INSERT INTO session_state (session_id, key, value, timestamp) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(session_id, key) DO UPDATE SET \
+         value = excluded.value, timestamp = excluded.timestamp",
+        params![
+            session_id,
+            key,
+            decision_payload.to_string(),
+            occurred_at as f64 / 1000.0
+        ],
+    )?;
+    Ok(())
 }
 
 fn load_task_content_outside(db: &DbOwner, session_id: &str, task_id: &str) -> Option<String> {
@@ -11492,7 +12066,7 @@ fn estimate_text_tokens(text: &str) -> u64 {
 fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
-        .map(|message| estimate_text_tokens(&message.content))
+        .map(|message| estimate_text_tokens(&message.plain_text_content()))
         .sum::<u64>()
         .max(1)
 }
@@ -11758,11 +12332,28 @@ fn redact_persistence_secrets(value: &Value) -> Value {
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .map(|(key, value)| (key.clone(), redact_persistence_secrets(value)))
+                .map(|(key, value)| {
+                    let redacted = if is_sensitive_persistence_key(key) {
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        redact_persistence_secrets(value)
+                    };
+                    (key.clone(), redacted)
+                })
                 .collect(),
         ),
         other => other.clone(),
     }
+}
+
+fn is_sensitive_persistence_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("authorization")
 }
 
 fn redact_secret_text(text: &str) -> String {
@@ -11770,6 +12361,16 @@ fn redact_secret_text(text: &str) -> String {
     redacted = redact_prefixed_secret(&redacted, "sk-ant-");
     redacted = redact_prefixed_secret(&redacted, "AKIA");
     redacted = redact_prefixed_secret(&redacted, "ASIA");
+    redacted = redact_prefixed_secret(&redacted, "ghp_");
+    redacted = redact_prefixed_secret(&redacted, "gho_");
+    redacted = redact_prefixed_secret(&redacted, "ghs_");
+    redacted = redact_prefixed_secret(&redacted, "glpat-");
+    redacted = redact_prefixed_secret(&redacted, "xoxb-");
+    redacted = redact_prefixed_secret(&redacted, "xoxp-");
+    redacted = redact_prefixed_secret(&redacted, "xoxa-");
+    redacted = redact_prefixed_secret(&redacted, "xoxs-");
+    redacted = redact_prefixed_secret(&redacted, "AIza");
+    redacted = redact_prefixed_secret(&redacted, "eyJ");
     redact_bearer_token(&redacted)
 }
 
@@ -12192,6 +12793,52 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct MessageCapturingProvider {
+        model: &'static str,
+        seen_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl LlmProvider for MessageCapturingProvider {
+        fn provider_id(&self) -> &'static str {
+            "message-capturing"
+        }
+
+        fn supports_model(&self, model_id: &str) -> bool {
+            model_id == self.model
+        }
+
+        fn generate(
+            &self,
+            _request: GenerateRequest,
+        ) -> std::result::Result<GenerateResponse, ProviderError> {
+            Ok(GenerateResponse {
+                content: "ok".into(),
+                finish_reason: "stop".into(),
+                usage: TokenUsage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            })
+        }
+
+        fn generate_stream(
+            &self,
+            request: GenerateRequest,
+        ) -> std::result::Result<Vec<std::result::Result<StreamEvent, ProviderError>>, ProviderError>
+        {
+            self.seen_messages.lock().unwrap().push(request.messages);
+            Ok(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::Finished(crate::llm::FinishReason::Stop)),
+            ])
+        }
+    }
+
+    #[derive(Debug)]
     struct ToolReadThenFinalProvider {
         path: String,
         calls: AtomicUsize,
@@ -12414,6 +13061,36 @@ mod tests {
             json!({"permission_request_id": request_id, "decision": "allow"}),
             None,
         )));
+    }
+
+    fn create_test_dir_link(
+        link: &std::path::Path,
+        target: &std::path::Path,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_dir(target, link) {
+                Ok(()) => Ok(()),
+                Err(first_error) => {
+                    let status = std::process::Command::new("cmd")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(link)
+                        .arg(target)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    match status {
+                        Ok(status) if status.success() => Ok(()),
+                        _ => Err(first_error),
+                    }
+                }
+            }
+        }
     }
 
     fn runtime_available(program: &str) -> bool {
@@ -12650,29 +13327,25 @@ Start-Sleep -Seconds 5
 
     #[test]
     fn test_terminal_session_create_send_read_kill_and_registry() {
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
-        assert_success(&router.dispatch(make_cmd(
-            "session.create",
-            None,
-            json!({"session_id": "sess-terminal", "workspace": "/tmp/ws"}),
-            None,
-        )));
+        let sid = create_session_with_workspace(&router, workspace.path());
         assert_success(&router.dispatch(make_cmd(
             "permission.request",
-            Some("sess-terminal"),
+            Some(&sid),
             json!({"permission_request_id": "perm-terminal", "tool_name": "terminal"}),
             None,
         )));
         assert_success(&router.dispatch(make_cmd(
             "permission.resolve",
-            Some("sess-terminal"),
+            Some(&sid),
             json!({"permission_request_id": "perm-terminal", "decision": "allow"}),
             None,
         )));
 
         let create = router.dispatch(make_cmd(
             "terminal.create",
-            Some("sess-terminal"),
+            Some(&sid),
             json!({"terminal_id": "term-live"}),
             None,
         ));
@@ -12682,7 +13355,7 @@ Start-Sleep -Seconds 5
 
         let send = router.dispatch(make_cmd(
             "terminal.send",
-            Some("sess-terminal"),
+            Some(&sid),
             json!({"terminal_id": "term-live", "input": "echo LX_ROUTER_TERMINAL\n"}),
             None,
         ));
@@ -12694,7 +13367,7 @@ Start-Sleep -Seconds 5
         for _ in 0..20 {
             let read = router.dispatch(make_cmd(
                 "terminal.read",
-                Some("sess-terminal"),
+                Some(&sid),
                 json!({"terminal_id": "term-live", "max_bytes": 4096}),
                 None,
             ));
@@ -12725,7 +13398,7 @@ Start-Sleep -Seconds 5
 
         let kill = router.dispatch(make_cmd(
             "terminal.kill",
-            Some("sess-terminal"),
+            Some(&sid),
             json!({"terminal_id": "term-live"}),
             None,
         ));
@@ -12805,17 +13478,13 @@ Start-Sleep -Seconds 5
         if !runtime_available("python") && !runtime_available("py") {
             return;
         }
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
-        assert_success(&router.dispatch(make_cmd(
-            "session.create",
-            None,
-            json!({"session_id": "sess-repl-python", "workspace": "/tmp/ws"}),
-            None,
-        )));
-        grant_tool(&router, "sess-repl-python", "repl", "perm-repl-python");
+        let sid = create_session_with_workspace(&router, workspace.path());
+        grant_tool(&router, &sid, "repl", "perm-repl-python");
         let eval = router.dispatch(make_cmd(
             "repl.eval",
-            Some("sess-repl-python"),
+            Some(&sid),
             json!({
                 "eval_id": "repl-python",
                 "language": "python",
@@ -12875,17 +13544,13 @@ Start-Sleep -Seconds 5
         if !runtime_available("python") {
             return;
         }
+        let workspace = tempfile::tempdir().unwrap();
         let router = setup_router();
-        assert_success(&router.dispatch(make_cmd(
-            "session.create",
-            None,
-            json!({"session_id": "sess-repl-session", "workspace": "/tmp/ws"}),
-            None,
-        )));
-        grant_tool(&router, "sess-repl-session", "repl", "perm-repl-session");
+        let sid = create_session_with_workspace(&router, workspace.path());
+        grant_tool(&router, &sid, "repl", "perm-repl-session");
         let created = router.dispatch(make_cmd(
             "repl.create",
-            Some("sess-repl-session"),
+            Some(&sid),
             json!({"repl_id": "repl-live", "language": "python"}),
             None,
         ));
@@ -12894,7 +13559,7 @@ Start-Sleep -Seconds 5
 
         let sent = router.dispatch(make_cmd(
             "repl.send",
-            Some("sess-repl-session"),
+            Some(&sid),
             json!({"repl_id": "repl-live", "input": "print('LX_REPL_SESSION_OK')\n"}),
             None,
         ));
@@ -12908,7 +13573,7 @@ Start-Sleep -Seconds 5
         for _ in 0..30 {
             let read = router.dispatch(make_cmd(
                 "repl.read",
-                Some("sess-repl-session"),
+                Some(&sid),
                 json!({"repl_id": "repl-live", "max_bytes": 4096}),
                 None,
             ));
@@ -12927,7 +13592,7 @@ Start-Sleep -Seconds 5
 
         let killed = router.dispatch(make_cmd(
             "repl.kill",
-            Some("sess-repl-session"),
+            Some(&sid),
             json!({"repl_id": "repl-live"}),
             None,
         ));
@@ -12975,7 +13640,7 @@ Start-Sleep -Seconds 5
         assert_success(&router.dispatch(make_cmd(
             "session.create",
             None,
-            json!({"session_id": "sess-scope", "workspace": "/tmp/ws"}),
+            json!({"session_id": "sess-scope", "workspace": dir.path().display().to_string()}),
             None,
         )));
         assert_success(&router.dispatch(make_cmd(
@@ -13202,6 +13867,117 @@ Start-Sleep -Seconds 5
         let process_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM owned_processes WHERE owner_id IN ('term-out', 'repl-out', 'mcp-out')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(process_count, 0);
+    }
+
+    #[test]
+    fn test_shell_omitted_cwd_uses_workspace_scope_for_grant() {
+        let workspace = tempfile::tempdir().unwrap();
+        let allowed = workspace.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let router = setup_router();
+        let sid = create_session_with_workspace(&router, workspace.path());
+        assert_success(&router.dispatch(make_cmd(
+            "permission.request",
+            Some(&sid),
+            json!({
+                "permission_request_id": "perm-shell-narrow-default-cwd",
+                "tool_name": "shell",
+                "args": {"scope": allowed.display().to_string()}
+            }),
+            None,
+        )));
+        assert_success(&router.dispatch(make_cmd(
+            "permission.resolve",
+            Some(&sid),
+            json!({"permission_request_id": "perm-shell-narrow-default-cwd", "decision": "allow"}),
+            None,
+        )));
+
+        let resp = router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-shell-default-cwd-narrow",
+                "tool_name": "shell",
+                "tool_type": "native",
+                "args": {"command": "echo should-not-run"}
+            }),
+            None,
+        ));
+
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
+        let process_count: i64 = router
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM owned_processes WHERE owner_id = 'tc-shell-default-cwd-narrow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(process_count, 0);
+    }
+
+    #[test]
+    fn test_terminal_and_repl_omitted_cwd_use_workspace_scope_for_grant() {
+        let workspace = tempfile::tempdir().unwrap();
+        let allowed = workspace.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let router = setup_router();
+        let sid = create_session_with_workspace(&router, workspace.path());
+
+        for (tool, request_id) in [
+            ("terminal", "perm-terminal-narrow-default-cwd"),
+            ("repl", "perm-repl-narrow-default-cwd"),
+        ] {
+            assert_success(&router.dispatch(make_cmd(
+                "permission.request",
+                Some(&sid),
+                json!({
+                    "permission_request_id": request_id,
+                    "tool_name": tool,
+                    "args": {"scope": allowed.display().to_string()}
+                }),
+                None,
+            )));
+            assert_success(&router.dispatch(make_cmd(
+                "permission.resolve",
+                Some(&sid),
+                json!({"permission_request_id": request_id, "decision": "allow"}),
+                None,
+            )));
+        }
+
+        let terminal = router.dispatch(make_cmd(
+            "terminal.create",
+            Some(&sid),
+            json!({"terminal_id": "term-default-cwd-narrow"}),
+            None,
+        ));
+        assert_error_code(&terminal, ErrorCode::PermissionDenied);
+
+        let repl = router.dispatch(make_cmd(
+            "repl.eval",
+            Some(&sid),
+            json!({
+                "eval_id": "repl-default-cwd-narrow",
+                "language": "definitely-not-a-runtime",
+                "code": "1"
+            }),
+            None,
+        ));
+        assert_error_code(&repl, ErrorCode::PermissionDenied);
+
+        let process_count: i64 = router
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM owned_processes WHERE owner_id IN ('term-default-cwd-narrow', 'repl-default-cwd-narrow')",
                 [],
                 |row| row.get(0),
             )
@@ -15066,7 +15842,7 @@ Start-Sleep -Seconds 5
             path: file_path.display().to_string(),
         }));
         let router = CommandRouter::new(db).with_llm_router(LlmRouter::new(registry));
-        let sid = create_session(&router);
+        let sid = create_session_with_workspace(&router, dir.path());
 
         let ran = router.dispatch(make_cmd(
             "leader.run",
@@ -15084,6 +15860,64 @@ Start-Sleep -Seconds 5
         assert_eq!(result["blocked_by"], "permission");
         assert_eq!(result["permission"]["tool_name"], "file_write");
         assert!(!file_path.exists());
+        assert!(ran
+            .events
+            .iter()
+            .any(|event| event.event_type == "permission.request_created"));
+    }
+
+    #[test]
+    fn test_leader_run_requests_permission_when_existing_grant_scope_is_too_narrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed_dir = dir.path().join("allowed");
+        let denied_dir = dir.path().join("denied");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(&denied_dir).unwrap();
+        let denied_file = denied_dir.join("leader-denied.txt");
+
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(WriteThenFinalProvider {
+            path: denied_file.display().to_string(),
+        }));
+        let router = CommandRouter::new(db).with_llm_router(LlmRouter::new(registry));
+        let sid = create_session_with_workspace(&router, dir.path());
+
+        assert_success(&router.dispatch(make_cmd(
+            "permission.request",
+            Some(&sid),
+            json!({
+                "permission_request_id": "perm-leader-narrow",
+                "tool_name": "file_write",
+                "args": {"path": allowed_dir.display().to_string()}
+            }),
+            None,
+        )));
+        assert_success(&router.dispatch(make_cmd(
+            "permission.resolve",
+            Some(&sid),
+            json!({"permission_request_id": "perm-leader-narrow", "decision": "allow"}),
+            None,
+        )));
+
+        let ran = router.dispatch(make_cmd(
+            "leader.run",
+            Some(&sid),
+            json!({
+                "model": "write/model",
+                "objective": "Write the file.",
+                "max_rounds": 1
+            }),
+            None,
+        ));
+
+        assert_success(&ran);
+        let result = ran.result.unwrap();
+        assert_eq!(result["status"], "blocked");
+        assert_eq!(result["blocked_by"], "permission");
+        assert_eq!(result["permission"]["tool_name"], "file_write");
+        assert!(!denied_file.exists());
         assert!(ran
             .events
             .iter()
@@ -15877,7 +16711,7 @@ Start-Sleep -Seconds 5
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("denied.txt");
         let router = setup_router();
-        let sid = create_session(&router);
+        let sid = create_session_with_workspace(&router, dir.path());
 
         let resp = router.dispatch(make_cmd(
             "tool.call",
@@ -15903,7 +16737,7 @@ Start-Sleep -Seconds 5
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("allowed.txt");
         let router = setup_router();
-        let sid = create_session(&router);
+        let sid = create_session_with_workspace(&router, dir.path());
 
         assert_success(&router.dispatch(make_cmd(
             "permission.request",
@@ -15952,7 +16786,7 @@ Start-Sleep -Seconds 5
                 max_tool_concurrency: 8,
             },
         ));
-        let sid = create_session(&router);
+        let sid = create_session_with_workspace(&router, dir.path());
         assert_success(&router.dispatch(make_cmd(
             "permission.request",
             Some(&sid),
@@ -15997,6 +16831,165 @@ Start-Sleep -Seconds 5
                 .file_write_bytes,
             0
         );
+    }
+
+    #[test]
+    fn test_structured_patch_replace_budget_counts_replace_field_before_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("patch-budget-denied.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\n").unwrap();
+        let router = setup_router().with_runtime_manager(RuntimeManager::with_budget(
+            crate::runtime::RuntimeBudget {
+                max_sidecars: 1,
+                max_workers: 8,
+                max_memory_mb: 128,
+                max_tokens: 100_000,
+                max_file_write_bytes: 4,
+                max_tool_concurrency: 8,
+            },
+        ));
+        let sid = create_session_with_workspace(&router, dir.path());
+        assert_success(&router.dispatch(make_cmd(
+            "permission.request",
+            Some(&sid),
+            json!({
+                "permission_request_id": "perm-patch-budget",
+                "tool_name": "file_write",
+                "args": {"path": file_path.display().to_string()}
+            }),
+            None,
+        )));
+        assert_success(&router.dispatch(make_cmd(
+            "permission.resolve",
+            Some(&sid),
+            json!({"permission_request_id": "perm-patch-budget", "decision": "allow"}),
+            None,
+        )));
+
+        let resp = router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-patch-budget-denied",
+                "tool_name": "structured_patch",
+                "tool_type": "native",
+                "args": {
+                    "path": file_path.display().to_string(),
+                    "operations": [
+                        {"type": "line_replace", "start_line": 2, "end_line": 2, "replace": "too large"}
+                    ]
+                },
+            }),
+            None,
+        ));
+
+        assert_success(&resp);
+        assert!(resp
+            .events
+            .iter()
+            .any(|event| event.event_type == "resource.budget_exceeded"));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+    }
+
+    #[test]
+    fn test_file_create_denies_nonexistent_target_under_workspace_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = workspace.path().join("outside-link");
+        create_test_dir_link(&link, outside.path()).unwrap();
+        let requested_path = link.join("created-outside.txt");
+        let outside_path = outside.path().join("created-outside.txt");
+
+        let router = setup_router();
+        let sid = create_session_with_workspace(&router, workspace.path());
+        grant_tool(&router, &sid, "file_write", "perm-symlink-file-create");
+
+        let resp = router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-symlink-create-denied",
+                "tool_name": "file_create",
+                "tool_type": "native",
+                "args": {
+                    "path": requested_path.display().to_string(),
+                    "content": "must not escape"
+                },
+            }),
+            None,
+        ));
+
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
+        assert!(
+            !outside_path.exists(),
+            "file_create must not create nonexistent targets through a workspace symlink"
+        );
+    }
+
+    #[test]
+    fn test_file_read_denies_target_under_workspace_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside secret").unwrap();
+        let link = workspace.path().join("outside-link-read");
+        create_test_dir_link(&link, outside.path()).unwrap();
+
+        let router = setup_router();
+        let sid = create_session_with_workspace(&router, workspace.path());
+        let resp = router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-symlink-read-denied",
+                "tool_name": "file_read",
+                "tool_type": "native",
+                "args": {"path": link.join("secret.txt").display().to_string()},
+            }),
+            None,
+        ));
+
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
+        assert!(resp
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("outside the session workspace"));
+    }
+
+    #[test]
+    fn test_shell_cwd_outside_workspace_is_denied_before_spawn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let router = setup_router();
+        let sid = create_session_with_workspace(&router, workspace.path());
+        grant_tool(&router, &sid, "shell", "perm-shell");
+
+        let resp = router.dispatch(make_cmd(
+            "tool.call",
+            Some(&sid),
+            json!({
+                "tool_call_id": "tc-shell-outside-cwd",
+                "tool_name": "shell",
+                "tool_type": "native",
+                "args": {
+                    "command": "echo should-not-run",
+                    "cwd": outside.path().display().to_string()
+                },
+            }),
+            None,
+        ));
+
+        assert_error_code(&resp, ErrorCode::PermissionDenied);
+        assert!(resp
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("outside the session workspace"));
     }
 
     #[test]
@@ -16408,6 +17401,53 @@ Start-Sleep -Seconds 5
         assert!(seen[0].iter().any(|name| name == "file_read"));
         assert!(seen[0].iter().any(|name| name == "send_message"));
         assert!(seen[0].iter().any(|name| name == "attempt_completion"));
+    }
+
+    #[test]
+    fn test_task_entrypoints_inject_coding_agent_system_prompt() {
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(MessageCapturingProvider {
+            model: "capture/model",
+            seen_messages: Arc::clone(&seen_messages),
+        }));
+        let router = setup_router().with_llm_router(LlmRouter::new(registry));
+
+        let task = router.dispatch(make_cmd(
+            "session.run_task",
+            None,
+            json!({
+                "content": "生成一个有趣的前端页面",
+                "workspace": "/tmp/ws",
+                "model": "capture/model"
+            }),
+            None,
+        ));
+        assert_success(&task);
+
+        let sid = create_session(&router);
+        let leader = router.dispatch(make_cmd(
+            "leader.run",
+            Some(&sid),
+            json!({
+                "objective": "生成一个有趣的前端页面",
+                "model": "capture/model"
+            }),
+            None,
+        ));
+        assert_success(&leader);
+
+        let seen = seen_messages.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for messages in seen.iter() {
+            assert_eq!(messages[0].role, "system");
+            assert!(messages[0]
+                .content
+                .contains("create or edit concrete project files"));
+            assert!(messages[0].content.contains("frontend page"));
+            assert_eq!(messages[1].role, "user");
+            assert_eq!(messages[1].content, "生成一个有趣的前端页面");
+        }
     }
 
     #[test]
@@ -17675,6 +18715,15 @@ Start-Sleep -Seconds 5
             "llm.call must NOT emit tool.call_completed for model-requested tools, \
              got events: {durable_types:?}"
         );
+        let response_tool_requests = resp.result.as_ref().unwrap()["model_tool_requests"]
+            .as_array()
+            .expect("model_tool_requests array");
+        assert!(
+            response_tool_requests
+                .iter()
+                .all(|request| request["args"]["redaction"] == "omitted"),
+            "llm.call response must not expose raw model tool args: {response_tool_requests:?}"
+        );
 
         // Every tool_calls row inserted by llm.call must have status = 'model_tool_request',
         // never 'completed' or any other terminal status.
@@ -17757,6 +18806,39 @@ Start-Sleep -Seconds 5
             context.contains("omitted"),
             "expected 'omitted' redaction marker in context, got: {context}"
         );
+    }
+
+    #[test]
+    fn test_persistence_redaction_covers_common_secret_prefixes_and_keys() {
+        let redacted = redact_persistence_secrets(&json!({
+            "api_key": "plain-key-value",
+            "nested": {
+                "github": "ghp_abcdefghijklmnopqrstuvwxyz",
+                "gitlab": "glpat-abcdefghijklmnopqrstuvwxyz",
+                "slack": "xoxb-abcdefghijklmnopqrstuvwxyz",
+                "google": "AIzaabcdefghijklmnopqrstuvwxyz",
+                "jwt": "eyJabcdefghijklmnopqrstuvwxyz"
+            },
+            "authorization": "Bearer bearer-secret-value"
+        }));
+        let serialized = redacted.to_string();
+
+        assert_eq!(redacted["api_key"], "[redacted]");
+        assert_eq!(redacted["authorization"], "[redacted]");
+        for raw in [
+            "ghp_",
+            "glpat-",
+            "xoxb-",
+            "AIza",
+            "eyJabcdefghijklmnopqrstuvwxyz",
+            "bearer-secret-value",
+            "plain-key-value",
+        ] {
+            assert!(
+                !serialized.contains(raw),
+                "redacted payload leaked {raw}: {serialized}"
+            );
+        }
     }
 
     #[test]
@@ -18102,6 +19184,1148 @@ $data = "{large_line}"
             calls_after_second, calls_after_first,
             "provider must not be called for a cached idempotency key: \
              first={calls_after_first}, second={calls_after_second}"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // R-7 follow-up: ToolFailureLoopGuard Leader-bus escalation signal —
+    // command.rs bridge persistence coverage.
+    //
+    // The agent-module tests verify only that `AgentLoop` *emits*
+    // `AgentEvent::ToolFailureLoopEscalated` over the mpsc channel. The bridge
+    // that turns that in-process event into a durable record —
+    // `persist_agent_pool_escalation` / `persist_agent_pool_escalation_unattached`
+    // (command.rs) — runs only under default-disabled E2E, so it had no live-DB
+    // regression coverage. These tests drive the persist helpers directly with a
+    // constructed `ToolFailureLoopEscalation` (the minimal stable surface) and
+    // assert the bridge's durable behaviors: double-write to `agent_logs` +
+    // `event_log`, canonical event_type, args-secret non-leak (defense-in-depth
+    // via `redact_persistence_secrets`), `event_id` idempotency, and the
+    // unattached fallback. The helpers stay private — the `#[cfg(test)] mod
+    // tests` block is in the same file, so it can call them without exposing
+    // production API.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Build a realistic state-class escalation (permission error) carrying a
+    /// fake secret token only inside the (intentionally-absent-from-payload) raw
+    /// args reference point — the durable payload stores the `args_hash`, never
+    /// the raw args.
+    fn sample_escalation() -> crate::agent::ToolFailureLoopEscalation {
+        crate::agent::ToolFailureLoopEscalation {
+            session_id: "sess-escalation".to_string(),
+            agent_id: "agent-escalation".to_string(),
+            agent_name: "Worker".to_string(),
+            task_id: "task-escalation".to_string(),
+            tool_name: "shell".to_string(),
+            // Stable 16-char SHA-1 truncation (TS `hashArgs` parity); the raw
+            // args (which contained a secret token) are NOT carried.
+            args_hash: "deadbeefdeadbeef".to_string(),
+            error_kind: crate::agent::ToolFailureErrorKind::Permission,
+            error_code: "PERMISSION_REQUIRED".to_string(),
+            count: 3,
+            threshold: 3,
+            requires_escalation: true,
+            // last_error_message embeds a fake secret token so the redaction
+            // defense-in-depth can be asserted.
+            last_error_message:
+                "permission denied: curl -H 'Authorization: Bearer sk-secret-leak-12345'"
+                    .to_string(),
+        }
+    }
+
+    #[test]
+    fn test_persist_agent_pool_escalation_double_writes_agent_logs_and_event_log() {
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        // Active agent_state row so the bridge takes the attached path.
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO agent_state \
+                 (session_id, agent_id, agent_name, agent_role, task_id, status, stopped, iteration, timestamp) \
+                 VALUES ('sess-escalation', 'agent-escalation', 'Worker', 'impl', 'task-escalation', 'running', 0, 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let conn = db.conn();
+        // agent_logs operator row, canonical event_type.
+        let log_row: (String, String) = conn
+            .query_row(
+                "SELECT event_type, content FROM agent_logs \
+                 WHERE session_id = 'sess-escalation' AND agent_id = 'agent-escalation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(log_row.0, "agent.tool_failure_loop_escalation");
+        let log_payload: serde_json::Value = serde_json::from_str(&log_row.1).unwrap();
+        assert_eq!(log_payload["tool_name"], "shell");
+        assert_eq!(log_payload["error_kind"], "permission");
+        assert_eq!(log_payload["requires_escalation"], true);
+        assert_eq!(log_payload["args_hash"], "deadbeefdeadbeef");
+        // The durable payload schema has no raw args/arguments field.
+        assert!(log_payload.get("arguments").is_none());
+        assert!(log_payload.get("args").is_none());
+
+        // Durable canonical event_log row, same event_type.
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let event_payload: serde_json::Value = conn
+            .query_row(
+                "SELECT payload FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| {
+                    let text: String = row.get(0)?;
+                    Ok(serde_json::from_str(&text).unwrap())
+                },
+            )
+            .unwrap();
+        assert_eq!(event_payload["error_kind"], "permission");
+        assert_eq!(event_payload["args_hash"], "deadbeefdeadbeef");
+        assert!(event_payload.get("arguments").is_none());
+    }
+
+    #[test]
+    fn test_persist_agent_pool_escalation_payload_redacts_args_secret_in_event_log() {
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO agent_state \
+                 (session_id, agent_id, agent_name, agent_role, task_id, status, stopped, iteration, timestamp) \
+                 VALUES ('sess-escalation', 'agent-escalation', 'Worker', 'impl', 'task-escalation', 'running', 0, 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // The escalation's last_error_message embeds a fake sk- token + a
+        // Bearer token. The payload already omits raw args, but the bridge runs
+        // `redact_persistence_secrets` over the persisted event_log payload as
+        // defense-in-depth; the agent_logs content is the pre-redaction JSON.
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let conn = db.conn();
+        let event_payload: String = conn
+            .query_row(
+                "SELECT payload FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Defense-in-depth: neither the sk- token nor the Bearer token leaks
+        // into the durable event_log payload.
+        assert!(
+            !event_payload.contains("sk-secret-leak-12345"),
+            "durable event_log payload must redact sk- token: {event_payload}"
+        );
+        assert!(
+            !event_payload.contains("Bearer sk-secret-leak-12345"),
+            "durable event_log payload must redact the Bearer token: {event_payload}"
+        );
+        // The stable args_hash (which is NOT a secret) IS still carried so the
+        // Leader can de-dup trips.
+        assert!(
+            event_payload.contains("deadbeefdeadbeef"),
+            "event_log payload must carry the args_hash: {event_payload}"
+        );
+    }
+
+    #[test]
+    fn test_persist_agent_pool_escalation_event_id_is_idempotent() {
+        // The bridge computes the event_id as
+        // `agent_tool_failure_loop_escalation_{session}_{agent}_{args_hash}_{occurred_at}`
+        // and reuses `append_event_in_tx`, which short-circuits via
+        // `try_fetch_event_by_id` when an event_id already exists (one row per
+        // trip even if the bridge observes the same event twice). Since the
+        // bridge recomputes `now_ms()` per call, the idempotency primitive is
+        // exercised here at the `append_event_in_tx` boundary with a fixed
+        // event_id — the exact mechanism `persist_agent_pool_escalation` relies
+        // on. This guards against a regression that drops the dedup short-circuit.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let occurred_at = now_ms();
+        let event_id =
+            "agent_tool_failure_loop_escalation_sess-idem_agent-idem_hash_idem_12345".to_string();
+        let payload = serde_json::to_value(sample_escalation()).unwrap();
+
+        db.with_transaction(|tx| {
+            let generation =
+                get_current_generation(tx, &Some("sess-idem".to_string())).or_else(|_| {
+                    ensure_meta(tx, &Some("sess-idem".to_string()))?;
+                    get_current_generation(tx, &Some("sess-idem".to_string()))
+                })?;
+            append_event_in_tx(
+                tx,
+                Some("sess-idem".to_string()),
+                generation,
+                "agent.tool_failure_loop_escalation",
+                Actor::with_id(ActorKind::Runtime, "agent-pool"),
+                payload.clone(),
+                occurred_at,
+                None,
+                None,
+                event_id.clone(),
+            )?;
+            // Second append with the SAME event_id must be a dedup no-op.
+            append_event_in_tx(
+                tx,
+                Some("sess-idem".to_string()),
+                generation,
+                "agent.tool_failure_loop_escalation",
+                Actor::with_id(ActorKind::Runtime, "agent-pool"),
+                payload,
+                occurred_at,
+                None,
+                None,
+                event_id,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let conn = db.conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-idem' AND event_id = ?1",
+                params!["agent_tool_failure_loop_escalation_sess-idem_agent-idem_hash_idem_12345"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate event_id must produce exactly one row");
+    }
+
+    #[test]
+    fn test_persist_agent_pool_escalation_unattached_writes_event_log_without_agent_state() {
+        // No agent_state row: the bridge must fall back to the escalation's own
+        // session_id/agent_id so the durable signal is still observable in a
+        // test harness (or any pool-less driver) that runs `AgentLoop` directly.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let conn = db.conn();
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let log_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_logs \
+                 WHERE session_id = 'sess-escalation' \
+                   AND agent_id = 'agent-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(log_count, 1);
+        // The unattached row carries the escalation's own agent_name (not the
+        // empty pool bookkeeping name), proving it used the fallback path.
+        let agent_name: String = conn
+            .query_row(
+                "SELECT agent_name FROM agent_logs \
+                 WHERE session_id = 'sess-escalation' AND agent_id = 'agent-escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_name, "Worker");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // R-7 deferred LeaderPermissionManager auto-response parity — durable
+    // decision record coverage.
+    //
+    // The bridge now persists a deterministic errorKind → action decision
+    // alongside the escalation signal (a canonical
+    // `agent.tool_failure_loop_escalation_decision` event + a `session_state`
+    // row), mirroring TS `LeaderPermissionManager.handleToolFailureLoopEscalation`
+    // (decision only; actual live mode mutation is deferred — see the matrix
+    // R-7 row). These tests assert the decision record's policy branches, its
+    // durability in `event_log` + `session_state`, secret non-leak, and
+    // idempotency. The decision helper stays private (same-file test block).
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Read the persisted decision event payload for a session (canonical
+    /// `event_log` row, event_type
+    /// `agent.tool_failure_loop_escalation_decision`).
+    fn decision_event_payload(db: &DbOwner, session_id: &str) -> serde_json::Value {
+        let conn = db.conn();
+        let text: String = conn
+            .query_row(
+                "SELECT payload FROM event_log \
+                 WHERE session_id = ?1 \
+                   AND event_type = 'agent.tool_failure_loop_escalation_decision'",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Read the persisted decision `session_state` row value for a given trip
+    /// (key `tool_failure_loop_escalation_decision:{agent}:{tool}:{args_hash}`).
+    fn decision_session_state(
+        db: &DbOwner,
+        session_id: &str,
+        agent_id: &str,
+        tool_name: &str,
+        args_hash: &str,
+    ) -> Option<serde_json::Value> {
+        let key = format!(
+            "tool_failure_loop_escalation_decision:{}:{}:{}",
+            agent_id, tool_name, args_hash
+        );
+        let conn = db.conn();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT value FROM session_state WHERE session_id = ?1 AND key = ?2",
+                params![session_id, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        text.map(|t| serde_json::from_str(&t).unwrap())
+    }
+
+    #[test]
+    fn test_escalation_decision_permission_approves_and_records_mode_target() {
+        // TS: permission ⇒ 'approved', mode escalates (dev → networked). With live
+        // mutation landed, the decision is *applied* in the same transaction.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        // Seed a permission_modes row so from_mode is read as "dev" (not the
+        // "dev" default fallback — proves the bridge reads the live mode).
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'dev', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["action"], "approved");
+        assert_eq!(payload["decision"], "approved");
+        assert_eq!(payload["error_kind"], "permission");
+        assert_eq!(payload["from_mode"], "dev");
+        assert_eq!(payload["target_mode"], "networked");
+        // Live mutation: approved + target (networked) != from (dev) ⇒ applied.
+        assert_eq!(payload["mutation"], "applied");
+        assert_eq!(payload["mutated_to"], "networked");
+        assert_eq!(payload["tool_name"], "shell");
+        assert_eq!(payload["args_hash"], "deadbeefdeadbeef");
+        // The durable decision record carries only the args_hash, never raw args.
+        assert!(payload.get("arguments").is_none());
+        assert!(payload.get("args").is_none());
+
+        // The session_state row mirrors the decision and is keyed by the trip.
+        let state = decision_session_state(
+            &db,
+            "sess-escalation",
+            "agent-escalation",
+            "shell",
+            "deadbeefdeadbeef",
+        )
+        .expect("decision session_state row must exist");
+        assert_eq!(state["action"], "approved");
+        assert_eq!(state["target_mode"], "networked");
+        assert_eq!(state["mutation"], "applied");
+
+        // Live mutation actually changed the permission mode: generation bumped
+        // (1 → 2) and the row now holds "networked" — proving the in-transaction
+        // `apply_permission_mode_mutation_in_tx` upsert ran.
+        let (mode, generation): (String, i64) = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT mode, generation FROM permission_modes WHERE session_id = 'sess-escalation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(mode, "networked");
+        assert_eq!(generation, 2);
+
+        // The canonical `permission.mode_changed` event was emitted in the same
+        // transaction (reuses `handle_permission_set_mode` semantics).
+        let mode_changed_count: i64 = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'permission.mode_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(mode_changed_count, 1);
+    }
+
+    #[test]
+    fn test_escalation_decision_permission_keeps_yolo_when_already_yolo() {
+        // TS: if mode === 'yolo', the target stays 'yolo' (no further bump). With
+        // live mutation, target == from ⇒ noop (no mutation, decision recorded).
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'yolo', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["action"], "approved");
+        assert_eq!(payload["from_mode"], "yolo");
+        assert_eq!(payload["target_mode"], "yolo");
+        // approved but target == from_mode ⇒ noop (no mutation applied).
+        assert_eq!(payload["mutation"], "noop");
+        assert!(
+            payload["mutated_to"].is_null(),
+            "noop must not record a mutated_to: {}",
+            payload["mutated_to"]
+        );
+
+        // Mode unchanged: still yolo, generation still 1 (no upsert ran).
+        let (mode, generation): (String, i64) = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT mode, generation FROM permission_modes WHERE session_id = 'sess-escalation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(mode, "yolo");
+        assert_eq!(generation, 1);
+        // No mode_changed event emitted on a noop.
+        let mode_changed_count: i64 = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'permission.mode_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(mode_changed_count, 0);
+    }
+
+    #[test]
+    fn test_escalation_decision_network_approves() {
+        // TS: network ⇒ 'approved' (same branch as permission). No seeded mode ⇒
+        // from_mode defaults to "dev", so the live mutation applies dev→networked.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let mut esc = sample_escalation();
+        esc.error_kind = crate::agent::ToolFailureErrorKind::Network;
+        persist_agent_pool_escalation(&db, "agent-escalation", &esc);
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["action"], "approved");
+        assert_eq!(payload["error_kind"], "network");
+        assert_eq!(payload["target_mode"], "networked");
+        assert_eq!(payload["mutation"], "applied");
+        assert_eq!(payload["mutated_to"], "networked");
+    }
+
+    #[test]
+    fn test_escalation_decision_write_scope_schema_sandbox_reject() {
+        // TS: write_scope/schema/mode/sandbox ⇒ 'rejected' (no target_mode).
+        for kind in [
+            crate::agent::ToolFailureErrorKind::WriteScope,
+            crate::agent::ToolFailureErrorKind::Schema,
+            crate::agent::ToolFailureErrorKind::Sandbox,
+            crate::agent::ToolFailureErrorKind::Mode,
+        ] {
+            let db = DbOwner::open_in_memory().unwrap();
+            db.initialize().unwrap();
+            let mut esc = sample_escalation();
+            esc.error_kind = kind;
+            // Vary args_hash so each iteration's decision event_id is distinct.
+            esc.args_hash = format!("hash-{kind:?}");
+            persist_agent_pool_escalation(&db, "agent-escalation", &esc);
+
+            let payload = decision_event_payload(&db, "sess-escalation");
+            assert_eq!(payload["action"], "rejected", "kind {kind:?}");
+            assert_eq!(payload["decision"], "rejected", "kind {kind:?}");
+            assert_eq!(payload["mutation"], "not_applicable", "kind {kind:?}");
+            assert!(
+                payload
+                    .get("target_mode")
+                    .map(|v| v.is_null())
+                    .unwrap_or(true),
+                "reject must not propose a target_mode: kind {kind:?}, got {}",
+                payload["target_mode"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_escalation_decision_timeout_other_interactive() {
+        // TS: execution/timeout/aborted/other/default ⇒ 'interactive'.
+        for kind in [
+            crate::agent::ToolFailureErrorKind::Timeout,
+            crate::agent::ToolFailureErrorKind::Other,
+            crate::agent::ToolFailureErrorKind::Execution,
+        ] {
+            let db = DbOwner::open_in_memory().unwrap();
+            db.initialize().unwrap();
+            let mut esc = sample_escalation();
+            esc.error_kind = kind;
+            esc.args_hash = format!("hash-{kind:?}");
+            persist_agent_pool_escalation(&db, "agent-escalation", &esc);
+
+            let payload = decision_event_payload(&db, "sess-escalation");
+            assert_eq!(payload["action"], "interactive", "kind {kind:?}");
+            assert_eq!(payload["decision"], "interactive", "kind {kind:?}");
+            assert_eq!(payload["mutation"], "not_applicable", "kind {kind:?}");
+            assert!(
+                payload
+                    .get("target_mode")
+                    .map(|v| v.is_null())
+                    .unwrap_or(true),
+                "interactive must not propose a target_mode: kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escalation_decision_event_is_durable_in_event_log() {
+        // The decision is a canonical event_log row (replayable), separate from
+        // the escalation signal event.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let conn = db.conn();
+        let decision_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            decision_count, 1,
+            "exactly one decision event must be written"
+        );
+        // The escalation signal event is also still present (double-write).
+        let signal_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            signal_count, 1,
+            "escalation signal event must still be written"
+        );
+    }
+
+    #[test]
+    fn test_escalation_decision_record_omits_raw_args_and_redacts_secrets() {
+        // The decision record carries args_hash only (no raw args), and the
+        // bridge runs redact_persistence_secrets over the event_log payload —
+        // so the fake sk-/Bearer token in last_error_message must not leak.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let conn = db.conn();
+        let payload_text: String = conn
+            .query_row(
+                "SELECT payload FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !payload_text.contains("sk-secret-leak-12345"),
+            "decision event_log payload must redact the sk- token: {payload_text}"
+        );
+        assert!(
+            !payload_text.contains("Bearer sk-secret-leak-12345"),
+            "decision event_log payload must redact the Bearer token: {payload_text}"
+        );
+        // The args_hash (not a secret) is still carried for de-dup.
+        assert!(
+            payload_text.contains("deadbeefdeadbeef"),
+            "decision payload must carry the args_hash: {payload_text}"
+        );
+        // No raw args field on the decision shape.
+        assert!(
+            !payload_text.contains("\"arguments\"") && !payload_text.contains("\"args\":"),
+            "decision payload must not have an args/arguments field: {payload_text}"
+        );
+    }
+
+    #[test]
+    fn test_escalation_decision_idempotent_when_same_trip_processed_twice() {
+        // `persist_agent_pool_escalation` recomputes `now_ms()` per call, so two
+        // genuinely separate bridge dispatches of the *same* escalation are two
+        // distinct occurrences. But within one dispatch the decision event_id is
+        // derived from the same `occurred_at` as the escalation signal, so a
+        // duplicate *intra-dispatch* write dedups. This test exercises the dedup
+        // primitive at the decision-event boundary with a fixed event_id — the
+        // exact mechanism `persist_escalation_auto_response_decision_in_tx`
+        // relies on (try_fetch_event_by_id short-circuit).
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        let occurred_at = now_ms();
+        let event_id = format!(
+            "agent_tool_failure_loop_escalation_decision_sess-idem2_agent-idem2_hash_idem2_{occurred_at}"
+        );
+        let payload = json!({"action": "approved", "decision": "approved"});
+        db.with_transaction(|tx| {
+            let generation =
+                get_current_generation(tx, &Some("sess-idem2".to_string())).or_else(|_| {
+                    ensure_meta(tx, &Some("sess-idem2".to_string()))?;
+                    get_current_generation(tx, &Some("sess-idem2".to_string()))
+                })?;
+            append_event_in_tx(
+                tx,
+                Some("sess-idem2".to_string()),
+                generation,
+                "agent.tool_failure_loop_escalation_decision",
+                Actor::with_id(ActorKind::Runtime, "agent-pool"),
+                payload.clone(),
+                occurred_at,
+                None,
+                None,
+                event_id.clone(),
+            )?;
+            // Second append with the SAME event_id must be a dedup no-op.
+            append_event_in_tx(
+                tx,
+                Some("sess-idem2".to_string()),
+                generation,
+                "agent.tool_failure_loop_escalation_decision",
+                Actor::with_id(ActorKind::Runtime, "agent-pool"),
+                payload,
+                occurred_at,
+                None,
+                None,
+                event_id,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let conn = db.conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-idem2' \
+                   AND event_type = 'agent.tool_failure_loop_escalation_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "duplicate decision event_id must produce one row");
+    }
+
+    #[test]
+    fn test_escalation_decision_unattached_path_also_writes_decision_record() {
+        // The unattached fallback (no agent_state row) must still write the
+        // decision record so a pool-less harness driving AgentLoop directly
+        // gets the auto-response decision, not just the escalation signal.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        // No agent_state row → unattached path.
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        // Query the decision count on a short-lived conn guard (released before
+        // the decision_session_state helper borrows `db` again — `conn()` returns
+        // a MutexGuard, so holding it across another `conn()` call would deadlock).
+        let decision_count: i64 = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE session_id = 'sess-escalation' \
+                   AND event_type = 'agent.tool_failure_loop_escalation_decision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            decision_count, 1,
+            "unattached path must write the decision event"
+        );
+        let state = decision_session_state(
+            &db,
+            "sess-escalation",
+            "agent-escalation",
+            "shell",
+            "deadbeefdeadbeef",
+        )
+        .expect("unattached path must write the decision session_state row");
+        assert_eq!(state["action"], "approved");
+        // Unattached path also applies the live mutation (permission, no seeded
+        // mode ⇒ dev → networked), proving the mutation helper runs regardless
+        // of whether an agent_state row exists.
+        assert_eq!(state["mutation"], "applied");
+        assert_eq!(state["mutated_to"], "networked");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // R-7 follow-up: live permission-mode mutation coverage.
+    //
+    // The decision record now *applies* the in-transaction mode mutation for an
+    // approved decision (via `apply_permission_mode_mutation_in_tx`, reusing
+    // `handle_permission_set_mode` semantics). These tests assert the live
+    // mutation behaviors: strict→networked mutates + emits mode_changed;
+    // grants are revoked (deleted + grant_revoked events); rejected/interactive
+    // never mutate; yolo approved is a noop; and a duplicate dispatch of the
+    // same trip does not double-apply (event_id dedup keeps one mutation).
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Read the current permission mode + generation for a session.
+    fn permission_mode_row(db: &DbOwner, session_id: &str) -> (String, i64) {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT mode, generation FROM permission_modes WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or_else(|_| ("__absent__".to_string(), 0))
+    }
+
+    /// Count event_log rows of a given event_type for a session.
+    fn event_count(db: &DbOwner, session_id: &str, event_type: &str) -> i64 {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT COUNT(*) FROM event_log WHERE session_id = ?1 AND event_type = ?2",
+            params![session_id, event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_strict_to_networked_mutates_mode_and_emits_event() {
+        // permission error, from_mode = "strict" ⇒ approved, target = "networked".
+        // Live mutation: mode row upserted, generation bumped, mode_changed emitted.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'strict', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let (mode, generation) = permission_mode_row(&db, "sess-escalation");
+        assert_eq!(mode, "networked");
+        assert_eq!(generation, 2, "generation must bump 1 → 2 on the mutation");
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["from_mode"], "strict");
+        assert_eq!(payload["target_mode"], "networked");
+        assert_eq!(payload["mutation"], "applied");
+        assert_eq!(payload["mutated_to"], "networked");
+
+        // The mode_changed event carries old/new mode + the bumped generation,
+        // mirroring handle_permission_set_mode.
+        let mode_event: serde_json::Value = {
+            let conn = db.conn();
+            let text: String = conn
+                .query_row(
+                    "SELECT payload FROM event_log \
+                     WHERE session_id = 'sess-escalation' \
+                       AND event_type = 'permission.mode_changed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        assert_eq!(mode_event["old_mode"], "strict");
+        assert_eq!(mode_event["new_mode"], "networked");
+        assert_eq!(mode_event["generation"], 2);
+        assert_eq!(
+            mode_event["source"],
+            "tool_failure_loop_escalation_auto_response"
+        );
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_revokes_stale_grants_and_emits_grant_revoked() {
+        // A mode change invalidates grants scoped to the prior mode — the
+        // mutation helper deletes them and emits one grant_revoked event each,
+        // exactly as handle_permission_set_mode does.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'dev', 1, 11)",
+                [],
+            )
+            .unwrap();
+            // Seed two grants under the pre-mutation mode.
+            conn.execute(
+                "INSERT INTO permission_grants (session_id, tool_name, mode, scope, granted_at) \
+                 VALUES ('sess-escalation', 'file_write', 'dev', '.', 10), \
+                        ('sess-escalation', 'shell', 'dev', '.', 10)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        // Both grants deleted (a mode change revokes all session grants).
+        let remaining_grants: i64 = {
+            let conn = db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM permission_grants WHERE session_id = 'sess-escalation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(remaining_grants, 0, "all session grants must be revoked");
+
+        // One grant_revoked event per seeded grant, naming each tool.
+        let revoked_count = event_count(&db, "sess-escalation", "permission.grant_revoked");
+        assert_eq!(
+            revoked_count, 2,
+            "one grant_revoked event per revoked grant"
+        );
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["mutation"], "applied");
+        assert_eq!(payload["revoked_grants"], 2);
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_no_grants_emits_no_grant_revoked() {
+        // No grants to revoke ⇒ revoked_grants = 0, no grant_revoked events, but
+        // the mode_changed event is still emitted.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'strict', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["mutation"], "applied");
+        assert_eq!(payload["revoked_grants"], 0);
+        assert_eq!(
+            event_count(&db, "sess-escalation", "permission.grant_revoked"),
+            0
+        );
+        assert_eq!(
+            event_count(&db, "sess-escalation", "permission.mode_changed"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_rejected_does_not_mutate() {
+        // rejected (sandbox/mode/write_scope/schema) never mutates: mode row
+        // unchanged, generation unchanged, no mode_changed / grant_revoked.
+        for kind in [
+            crate::agent::ToolFailureErrorKind::Sandbox,
+            crate::agent::ToolFailureErrorKind::Mode,
+            crate::agent::ToolFailureErrorKind::WriteScope,
+            crate::agent::ToolFailureErrorKind::Schema,
+        ] {
+            let db = DbOwner::open_in_memory().unwrap();
+            db.initialize().unwrap();
+            {
+                let conn = db.conn();
+                conn.execute(
+                    "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                     VALUES ('sess-escalation', 'strict', 7, 11)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO permission_grants \
+                     (session_id, tool_name, mode, scope, granted_at) \
+                     VALUES ('sess-escalation', 'file_write', 'strict', '.', 10)",
+                    [],
+                )
+                .unwrap();
+            }
+            let mut esc = sample_escalation();
+            esc.error_kind = kind;
+            esc.args_hash = format!("hash-{kind:?}");
+            persist_agent_pool_escalation(&db, "agent-escalation", &esc);
+
+            let payload = decision_event_payload(&db, "sess-escalation");
+            assert_eq!(payload["action"], "rejected", "kind {kind:?}");
+            assert_eq!(payload["mutation"], "not_applicable", "kind {kind:?}");
+
+            // Mode + generation untouched; grant still present.
+            let (mode, generation) = permission_mode_row(&db, "sess-escalation");
+            assert_eq!(
+                mode, "strict",
+                "rejected must not change mode: kind {kind:?}"
+            );
+            assert_eq!(
+                generation, 7,
+                "rejected must not bump generation: kind {kind:?}"
+            );
+            assert_eq!(
+                event_count(&db, "sess-escalation", "permission.mode_changed"),
+                0,
+                "kind {kind:?}"
+            );
+            assert_eq!(
+                event_count(&db, "sess-escalation", "permission.grant_revoked"),
+                0,
+                "kind {kind:?}"
+            );
+            let grants: i64 = {
+                let conn = db.conn();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM permission_grants WHERE session_id = 'sess-escalation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(grants, 1, "rejected must not revoke grants: kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_interactive_does_not_mutate() {
+        // interactive (execution/timeout/aborted/other) never mutates.
+        for kind in [
+            crate::agent::ToolFailureErrorKind::Execution,
+            crate::agent::ToolFailureErrorKind::Timeout,
+            crate::agent::ToolFailureErrorKind::Aborted,
+            crate::agent::ToolFailureErrorKind::Other,
+        ] {
+            let db = DbOwner::open_in_memory().unwrap();
+            db.initialize().unwrap();
+            {
+                let conn = db.conn();
+                conn.execute(
+                    "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                     VALUES ('sess-escalation', 'dev', 3, 11)",
+                    [],
+                )
+                .unwrap();
+            }
+            let mut esc = sample_escalation();
+            esc.error_kind = kind;
+            esc.args_hash = format!("hash-{kind:?}");
+            persist_agent_pool_escalation(&db, "agent-escalation", &esc);
+
+            let payload = decision_event_payload(&db, "sess-escalation");
+            assert_eq!(payload["action"], "interactive", "kind {kind:?}");
+            assert_eq!(payload["mutation"], "not_applicable", "kind {kind:?}");
+
+            let (mode, generation) = permission_mode_row(&db, "sess-escalation");
+            assert_eq!(
+                mode, "dev",
+                "interactive must not change mode: kind {kind:?}"
+            );
+            assert_eq!(
+                generation, 3,
+                "interactive must not bump generation: kind {kind:?}"
+            );
+            assert_eq!(
+                event_count(&db, "sess-escalation", "permission.mode_changed"),
+                0,
+                "kind {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_yolo_approved_is_noop() {
+        // approved but from_mode == target_mode (yolo → yolo): no mutation. Mode
+        // and generation stay, no mode_changed event, mutation records "noop".
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'yolo', 5, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        let payload = decision_event_payload(&db, "sess-escalation");
+        assert_eq!(payload["action"], "approved");
+        assert_eq!(payload["mutation"], "noop");
+        assert!(payload["mutated_to"].is_null());
+
+        let (mode, generation) = permission_mode_row(&db, "sess-escalation");
+        assert_eq!(mode, "yolo");
+        assert_eq!(generation, 5, "noop must not bump generation");
+        assert_eq!(
+            event_count(&db, "sess-escalation", "permission.mode_changed"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_idempotent_on_duplicate_dispatch() {
+        // The mutation event ids are deterministic per escalation occurrence
+        // (prefix + occurred_at). `persist_agent_pool_escalation` recomputes
+        // `now_ms()` per call, so two *separate* dispatches are two occurrences
+        // — each is a genuinely separate trip that legitimately re-applies. This
+        // test instead exercises the dedup primitive the mutation relies on:
+        // calling the decision helper twice with the *same* `occurred_at` (the
+        // intra-dispatch duplicate case) must produce exactly one mode_changed
+        // event and bump the generation exactly once, because the second
+        // mode_changed event_id short-circuits via try_fetch_event_by_id and the
+        // permission_modes upsert is idempotent (ON CONFLICT → same row).
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-idem-mut', 'dev', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        let mut esc = sample_escalation();
+        esc.session_id = "sess-idem-mut".to_string();
+        let occurred_at = now_ms();
+        // Drive the decision helper directly twice in one tx with the SAME
+        // occurred_at (the intra-dispatch duplicate the event_id dedup guards).
+        db.with_transaction(|tx| {
+            persist_escalation_auto_response_decision_in_tx(
+                tx,
+                "sess-idem-mut",
+                &esc,
+                occurred_at,
+            )?;
+            persist_escalation_auto_response_decision_in_tx(
+                tx,
+                "sess-idem-mut",
+                &esc,
+                occurred_at,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Exactly one mode_changed event (dedup), generation bumped once (1 → 2).
+        assert_eq!(
+            event_count(&db, "sess-idem-mut", "permission.mode_changed"),
+            1,
+            "duplicate intra-dispatch must dedup the mode_changed event"
+        );
+        let (_mode, generation) = permission_mode_row(&db, "sess-idem-mut");
+        assert_eq!(
+            generation, 2,
+            "generation must reflect a single applied mutation"
+        );
+        // The decision event itself also dedups (same event_id ⇒ one row).
+        assert_eq!(
+            event_count(
+                &db,
+                "sess-idem-mut",
+                "agent.tool_failure_loop_escalation_decision"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn test_escalation_live_mutation_event_log_contains_mode_changed_and_decision() {
+        // End-to-end via the bridge: event_log carries both the canonical
+        // decision event and the mode_changed event for an applied mutation.
+        let db = DbOwner::open_in_memory().unwrap();
+        db.initialize().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO permission_modes (session_id, mode, generation, updated_at) \
+                 VALUES ('sess-escalation', 'strict', 1, 11)",
+                [],
+            )
+            .unwrap();
+        }
+        persist_agent_pool_escalation(&db, "agent-escalation", &sample_escalation());
+
+        assert_eq!(
+            event_count(
+                &db,
+                "sess-escalation",
+                "agent.tool_failure_loop_escalation_decision"
+            ),
+            1
+        );
+        assert_eq!(
+            event_count(&db, "sess-escalation", "permission.mode_changed"),
+            1
+        );
+        // The escalation signal event is still present alongside the mutation.
+        assert_eq!(
+            event_count(&db, "sess-escalation", "agent.tool_failure_loop_escalation"),
+            1
         );
     }
 }

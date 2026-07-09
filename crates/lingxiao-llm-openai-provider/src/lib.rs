@@ -3,19 +3,22 @@ use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAiFinishReason, FunctionCall, FunctionObject, ToolChoiceOptions,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionTools,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAiFinishReason, FunctionCall,
+    FunctionObject, ImageDetail, ImageUrl, ToolChoiceOptions,
 };
 use async_openai::Client;
 use futures_util::StreamExt;
 use lingxiao_llm_host_protocol::{
-    AuthContext, FinishReason, GenerateRequest, Message, ProviderError, ProviderErrorCode,
-    StreamEvent, TokenUsage, ToolCall, ToolCallAccumulator,
+    message_rehydrates_blob_at, retain_rounds_from_metadata, AuthContext, FinishReason,
+    GenerateRequest, Message, ProviderError, ProviderErrorCode, StreamEvent, TokenUsage, ToolCall,
+    ToolCallAccumulator,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use secrecy::SecretString;
@@ -268,17 +271,20 @@ where
 }
 
 fn responses_input(request: &GenerateRequest) -> Value {
+    let retain_rounds = retain_rounds_from_metadata(request.options.metadata.as_ref());
     let mut input = Vec::new();
-    for message in &request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         if message.role == "tool" {
+            let content = message.plain_text_content();
             input.push(json!({
                 "type": "function_call_output",
                 "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                "output": message.content,
+                "output": content,
             }));
             continue;
         }
         if message.role == "assistant" && !message.tool_calls.is_empty() {
+            let content = message.plain_text_content();
             for call in &message.tool_calls {
                 input.push(json!({
                     "type": "function_call",
@@ -287,17 +293,33 @@ fn responses_input(request: &GenerateRequest) -> Value {
                     "arguments": call.arguments.to_string(),
                 }));
             }
-            if !message.content.is_empty() {
+            if !content.is_empty() {
                 input.push(json!({
                     "role": "assistant",
-                    "content": message.content,
+                    "content": content,
                 }));
             }
             continue;
         }
+        // Multimodal user/system messages carry real image parts as a
+        // Responses-API content array (`input_text`/`input_image`) so vision
+        // models receive the image bytes instead of a flattened placeholder.
+        // Mirrors TS `toOpenAIContentParts` over the Responses wire format.
+        // Blob-ref rehydration is gated by the retain-rounds window: only the
+        // recent N user rounds rehydrate real image bytes; older blobs degrade
+        // to the safe text placeholder (TS `rehydrateRecentImageBlobRefs`).
+        let rehydrate = message_rehydrates_blob_at(&request.messages, index, retain_rounds);
+        if let Some(parts) = message.openai_responses_content_parts_with_rehydrate(rehydrate) {
+            input.push(json!({
+                "role": message.role,
+                "content": parts,
+            }));
+            continue;
+        }
+        let content = message.plain_text_content();
         input.push(json!({
             "role": message.role,
-            "content": message.content,
+            "content": content,
         }));
     }
     Value::Array(input)
@@ -456,10 +478,15 @@ impl Config for ResolvedOpenAiConfig {
 fn to_chat_completion_request(
     request: &GenerateRequest,
 ) -> Result<CreateChatCompletionRequest, OpenAiProviderError> {
+    let retain_rounds = retain_rounds_from_metadata(request.options.metadata.as_ref());
     let messages = request
         .messages
         .iter()
-        .map(to_chat_message)
+        .enumerate()
+        .map(|(index, message)| {
+            let rehydrate = message_rehydrates_blob_at(&request.messages, index, retain_rounds);
+            to_chat_message(message, rehydrate)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut builder = CreateChatCompletionRequestArgs::default();
     builder.model(request.model.clone()).messages(messages);
@@ -484,21 +511,38 @@ fn to_chat_completion_request(
         .map_err(|e| OpenAiProviderError::RequestBuild(e.to_string()))
 }
 
-fn to_chat_message(message: &Message) -> Result<ChatCompletionRequestMessage, OpenAiProviderError> {
+fn to_chat_message(
+    message: &Message,
+    rehydrate: bool,
+) -> Result<ChatCompletionRequestMessage, OpenAiProviderError> {
+    // User messages can carry multimodal content parts (text + image_url /
+    // image_blob_ref). When they do, emit a real content-part array so the
+    // provider receives the image bytes instead of a flattened "[image]"
+    // placeholder. Mirrors TS `toOpenAIContentParts`. Blob-ref rehydration is
+    // gated by the retain-rounds window (`rehydrate`): only the recent N user
+    // rounds send real image bytes; older blobs degrade to the safe text
+    // placeholder (TS `rehydrateRecentImageBlobRefs`).
+    if message.role == "user" {
+        if let Some(parts) = user_message_content_parts(message, rehydrate) {
+            return Ok(ChatCompletionRequestUserMessageArgs::default()
+                .content(ChatCompletionRequestUserMessageContent::Array(parts))
+                .build()
+                .map_err(|e| OpenAiProviderError::RequestBuild(e.to_string()))?
+                .into());
+        }
+    }
+
+    let content = message.plain_text_content();
     match message.role.as_str() {
         "system" => Ok(ChatCompletionRequestSystemMessageArgs::default()
-            .content(ChatCompletionRequestSystemMessageContent::Text(
-                message.content.clone(),
-            ))
+            .content(ChatCompletionRequestSystemMessageContent::Text(content))
             .build()
             .map_err(|e| OpenAiProviderError::RequestBuild(e.to_string()))?
             .into()),
         "assistant" => {
             let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-            if !message.content.is_empty() || message.tool_calls.is_empty() {
-                builder.content(ChatCompletionRequestAssistantMessageContent::Text(
-                    message.content.clone(),
-                ));
+            if !content.is_empty() || message.tool_calls.is_empty() {
+                builder.content(ChatCompletionRequestAssistantMessageContent::Text(content));
             }
             if !message.tool_calls.is_empty() {
                 builder.tool_calls(
@@ -515,20 +559,78 @@ fn to_chat_message(message: &Message) -> Result<ChatCompletionRequestMessage, Op
                 .into())
         }
         "tool" => Ok(ChatCompletionRequestToolMessageArgs::default()
-            .content(ChatCompletionRequestToolMessageContent::Text(
-                message.content.clone(),
-            ))
+            .content(ChatCompletionRequestToolMessageContent::Text(content))
             .tool_call_id(message.tool_call_id.clone().unwrap_or_default())
             .build()
             .map_err(|e| OpenAiProviderError::RequestBuild(e.to_string()))?
             .into()),
         _ => Ok(ChatCompletionRequestUserMessageArgs::default()
-            .content(ChatCompletionRequestUserMessageContent::Text(
-                message.content.clone(),
-            ))
+            .content(ChatCompletionRequestUserMessageContent::Text(content))
             .build()
             .map_err(|e| OpenAiProviderError::RequestBuild(e.to_string()))?
             .into()),
+    }
+}
+
+/// Build an OpenAI Chat-Completions user content-part array when the message
+/// carries structured content. Returns `None` when the message has no
+/// `content_parts`, so callers fall back to plain-text content. Image blob
+/// refs are rehydrated from disk when `rehydrate` is true (i.e. the message is
+/// inside the retain-rounds window); otherwise they degrade to a text
+/// placeholder. Missing blobs always degrade to a text placeholder.
+fn user_message_content_parts(
+    message: &Message,
+    rehydrate: bool,
+) -> Option<Vec<ChatCompletionRequestUserMessageContentPart>> {
+    let json_parts = message.openai_chat_content_parts_with_rehydrate(rehydrate)?;
+    let mut parts = Vec::with_capacity(json_parts.len());
+    for part in json_parts {
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "text" => {
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text },
+                ));
+            }
+            "image_url" => {
+                let url = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let detail = part
+                    .get("image_url")
+                    .and_then(|v| v.get("detail"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_image_detail);
+                let image = ChatCompletionRequestMessageContentPartImage {
+                    image_url: ImageUrl { url, detail },
+                };
+                parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(image));
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+fn parse_image_detail(detail: &str) -> Option<ImageDetail> {
+    match detail {
+        "auto" => Some(ImageDetail::Auto),
+        "low" => Some(ImageDetail::Low),
+        "high" => Some(ImageDetail::High),
+        "original" => Some(ImageDetail::Original),
+        _ => None,
     }
 }
 
@@ -1315,6 +1417,121 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
     }
 
     #[test]
+    fn test_to_chat_message_emits_image_url_content_part_for_user() {
+        use async_openai::types::chat::{
+            ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        };
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                lingxiao_llm_host_protocol::MessageContentPart::Text {
+                    text: "describe this".into(),
+                },
+                lingxiao_llm_host_protocol::MessageContentPart::ImageUrl {
+                    image_url: lingxiao_llm_host_protocol::ImageUrlContentPart {
+                        url: "data:image/png;base64,iVBOR".into(),
+                        detail: Some("high".into()),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let built = to_chat_message(&message, true).unwrap();
+        let ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content, ..
+        }) = built
+        else {
+            panic!("expected a user message, got {:?}", built);
+        };
+        let parts = match content {
+            ChatCompletionRequestUserMessageContent::Array(parts) => parts,
+            other => panic!("expected multimodal content array, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(
+            &parts[0],
+            ChatCompletionRequestUserMessageContentPart::Text(t) if t.text == "describe this"
+        ));
+        match &parts[1] {
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(image) => {
+                assert_eq!(image.image_url.url, "data:image/png;base64,iVBOR");
+                assert_eq!(image.image_url.detail, Some(ImageDetail::High));
+            }
+            other => panic!("expected image_url part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_chat_message_rehydrates_blob_ref_into_image_url() {
+        use async_openai::types::chat::{
+            ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("shot.png");
+        std::fs::write(&blob_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                lingxiao_llm_host_protocol::MessageContentPart::ImageBlobRef {
+                    image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                        blob_id: "blob_rehydrate_chat".into(),
+                        mime: "image/png".into(),
+                        size: 4,
+                        blob_path: blob_path.display().to_string(),
+                        source: None,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let built = to_chat_message(&message, true).unwrap();
+        let ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content, ..
+        }) = built
+        else {
+            panic!("expected a user message");
+        };
+        let parts = match content {
+            ChatCompletionRequestUserMessageContent::Array(parts) => parts,
+            other => panic!("expected multimodal content array, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            ChatCompletionRequestUserMessageContentPart::ImageUrl(image) => {
+                assert!(
+                    image.image_url.url.starts_with("data:image/png;base64,"),
+                    "got: {}",
+                    image.image_url.url
+                );
+                assert!(image.image_url.url.contains("iVBORw=="));
+            }
+            other => panic!("expected rehydrated image_url part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_to_chat_message_text_only_user_stays_plain_text() {
+        use async_openai::types::chat::ChatCompletionRequestUserMessageContent;
+        let message = Message {
+            role: "user".into(),
+            content: "just text".into(),
+            content_parts: Vec::new(),
+            ..Default::default()
+        };
+        let built = to_chat_message(&message, true).unwrap();
+        let content = match built {
+            async_openai::types::chat::ChatCompletionRequestMessage::User(m) => m.content,
+            other => panic!("expected user message, got {other:?}"),
+        };
+        assert!(matches!(
+            content,
+            ChatCompletionRequestUserMessageContent::Text(ref t) if t == "just text"
+        ));
+    }
+
+    #[test]
     fn test_responses_input_replays_function_call_before_tool_output() {
         let mut request = sample_request("http://localhost:1234/v1");
         request.messages = vec![
@@ -1347,6 +1564,216 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         assert_eq!(input[1]["name"], "file_read");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_123");
+    }
+
+    #[test]
+    fn test_responses_input_emits_multimodal_content_array() {
+        let mut request = sample_request("http://localhost:1234/v1");
+        request.messages = vec![Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                lingxiao_llm_host_protocol::MessageContentPart::Text {
+                    text: "inspect this".into(),
+                },
+                lingxiao_llm_host_protocol::MessageContentPart::ImageUrl {
+                    image_url: lingxiao_llm_host_protocol::ImageUrlContentPart {
+                        url: "https://example.test/image.png".into(),
+                        detail: Some("low".into()),
+                    },
+                },
+                lingxiao_llm_host_protocol::MessageContentPart::ImageBlobRef {
+                    image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                        blob_id: "blob_1234567890abcdef".into(),
+                        mime: "image/png".into(),
+                        size: 2048,
+                        // Missing backing file -> degrades to a text placeholder
+                        // that must NOT leak the blob filesystem path.
+                        blob_path: "C:/secret/blob.png".into(),
+                        source: Some("screenshot".into()),
+                    },
+                },
+            ],
+            ..Default::default()
+        }];
+        let input = responses_input(&request);
+        // User message is emitted as a content-parts array, not flattened text.
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "inspect this");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "https://example.test/image.png");
+        // Missing blob -> placeholder text part, never an image_url, never the path.
+        assert_eq!(content[2]["type"], "input_text");
+        let placeholder = content[2]["text"].as_str().unwrap();
+        assert!(placeholder.contains("blob_123456"));
+        assert!(!placeholder.contains("C:/secret/blob.png"));
+    }
+
+    #[test]
+    fn test_responses_input_rehydrates_blob_ref_to_data_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("blob.png");
+        // 2 transparent PNG bytes -> known base64 "iVBORw0KGgo=".
+        std::fs::write(&blob_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+
+        let mut request = sample_request("http://localhost:1234/v1");
+        request.messages = vec![Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                lingxiao_llm_host_protocol::MessageContentPart::Text {
+                    text: "look at this".into(),
+                },
+                lingxiao_llm_host_protocol::MessageContentPart::ImageBlobRef {
+                    image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                        blob_id: "blob_rehydrate".into(),
+                        mime: "image/png".into(),
+                        size: 4,
+                        blob_path: blob_path.display().to_string(),
+                        source: None,
+                    },
+                },
+            ],
+            ..Default::default()
+        }];
+        let input = responses_input(&request);
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "look at this");
+        assert_eq!(content[1]["type"], "input_image");
+        let url = content[1]["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
+        assert!(
+            url.contains("iVBORw=="),
+            "rehydrated data URI must carry the real base64 bytes, got: {url}"
+        );
+    }
+
+    #[test]
+    fn test_responses_input_retain_window_degrades_old_blob_but_rehydrates_recent() {
+        // Two user rounds, each carrying a rehydratable blob. With the default
+        // retain window (2) both are eligible, but with retain=1 only the most
+        // recent round rehydrates; the older round's blob degrades to a text
+        // placeholder on the wire.
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.png");
+        let new_path = dir.path().join("new.png");
+        std::fs::write(&old_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        std::fs::write(&new_path, [0xFF, 0xD8, 0xFF]).unwrap();
+        let old_path_str = old_path.display().to_string();
+        let new_path_str = new_path.display().to_string();
+
+        let blob_ref =
+            |path: &str, id: &str| lingxiao_llm_host_protocol::MessageContentPart::ImageBlobRef {
+                image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                    blob_id: id.into(),
+                    mime: "image/png".into(),
+                    size: 4,
+                    blob_path: path.into(),
+                    source: None,
+                },
+            };
+        let user_with = |part| Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![part],
+            ..Default::default()
+        };
+        let assistant = |text: &str| Message {
+            role: "assistant".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+
+        let mut request = sample_request("http://localhost:1234/v1");
+        request.messages = vec![
+            user_with(blob_ref(&old_path_str, "blob_old")), // round 1 (index 0)
+            assistant("ack"),                               // index 1
+            user_with(blob_ref(&new_path_str, "blob_new")), // round 2 (index 2)
+        ];
+
+        // retain=1 → only the most recent user round (index 2) rehydrates.
+        request.options.metadata = Some(json!({
+            "base_url": "http://localhost:1234/v1",
+            "image_history_retain_rounds": 1
+        }));
+        let input = responses_input(&request);
+        let old_content = input[0]["content"].as_array().unwrap();
+        // Old round blob degrades to a text placeholder (never an image block,
+        // never the filesystem path).
+        assert_eq!(old_content[0]["type"], "input_text");
+        let old_placeholder = old_content[0]["text"].as_str().unwrap();
+        assert!(old_placeholder.contains("blob_old"));
+        assert!(!old_placeholder.contains(&old_path_str));
+        assert!(!old_content
+            .iter()
+            .any(|p| p["type"] == "input_image" || p.get("image_url").is_some()));
+        // Recent round blob rehydrates into a real input_image block.
+        let new_content = input[2]["content"].as_array().unwrap();
+        assert_eq!(new_content[0]["type"], "input_image");
+        let url = new_content[0]["image_url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "got: {url}");
+
+        // retain=2 → both rounds rehydrate (window covers everything from the
+        // 2nd user round from the end onward).
+        request.options.metadata = Some(json!({
+            "base_url": "http://localhost:1234/v1",
+            "image_history_retain_rounds": 2
+        }));
+        let input = responses_input(&request);
+        let old_content = input[0]["content"].as_array().unwrap();
+        assert_eq!(old_content[0]["type"], "input_image");
+    }
+
+    #[test]
+    fn test_to_chat_message_retain_window_degrades_old_blob_to_text() {
+        // Chat-Completions path: an old-round blob (outside retain=1 window)
+        // degrades to a text placeholder, never an image_url block.
+        use async_openai::types::chat::{
+            ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old_chat.png");
+        std::fs::write(&old_path, [0x89, 0x50, 0x4E, 0x47]).unwrap();
+        let old_path_str = old_path.display().to_string();
+        let message = Message {
+            role: "user".into(),
+            content: String::new(),
+            content_parts: vec![
+                lingxiao_llm_host_protocol::MessageContentPart::ImageBlobRef {
+                    image: lingxiao_llm_host_protocol::ImageBlobRefContentPart {
+                        blob_id: "blob_old_chat".into(),
+                        mime: "image/png".into(),
+                        size: 4,
+                        blob_path: old_path_str.clone(),
+                        source: None,
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let built = to_chat_message(&message, false).unwrap();
+        let ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content, ..
+        }) = built
+        else {
+            panic!("expected a user message");
+        };
+        let parts = match content {
+            ChatCompletionRequestUserMessageContent::Array(parts) => parts,
+            other => panic!("expected multimodal content array, got {other:?}"),
+        };
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            ChatCompletionRequestUserMessageContentPart::Text(text) => {
+                // plain_text() truncates the blob id to 12 chars.
+                assert!(text.text.contains("blob_old_cha"));
+                assert!(!text.text.contains(&old_path_str));
+            }
+            other => panic!("expected degraded text placeholder, got {other:?}"),
+        }
     }
 
     fn sample_request(base_url: &str) -> GenerateRequest {

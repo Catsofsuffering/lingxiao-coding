@@ -214,6 +214,7 @@ const LlmGroupSchema = z.object({
   max_retries: z.number().default(D.LLM.MAX_RETRIES),
   backoff_base_ms: z.number().default(D.LLM.BACKOFF_BASE_MS),
   first_token_timeout_s: z.number().default(D.LLM.FIRST_TOKEN_TIMEOUT_S),
+  stream_chunk_timeout_s: z.number().default(D.LLM.STREAM_CHUNK_TIMEOUT_S),
   first_token_timeout_thinking_s: z.number().default(D.LLM.FIRST_TOKEN_THINKING_TIMEOUT_S),
   context_max_tokens: z.number().default(D.LLM.CONTEXT_MAX_TOKENS),
   capped_max_tokens: z.number().default(D.LLM.CAPPED_MAX_TOKENS),
