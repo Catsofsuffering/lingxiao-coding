@@ -129,6 +129,25 @@ pub fn rehydrate_image_blob_ref_if(
     }
 }
 
+/// Parsed `data:<media-type>;base64,<data>` image URI payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Base64DataUri<'a> {
+    pub media_type: &'a str,
+    pub data: &'a str,
+}
+
+/// Parse a base64 data URI into its media type and payload. Returns `None` for
+/// remote URLs, non-base64 data URIs, or empty media/payload segments so callers
+/// can degrade to their provider-specific text fallback.
+pub fn parse_base64_data_uri(url: &str) -> Option<Base64DataUri<'_>> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some(Base64DataUri { media_type, data })
+}
+
 /// Default number of trailing user rounds whose `image_blob_ref` parts are
 /// rehydrated to real image bytes. Mirrors TS
 /// `DEFAULT_RETAIN_IMAGE_ROUNDS` (`src/llm/image_blob_store.ts`). Older blobs
@@ -953,6 +972,18 @@ mod tests {
             retain_rounds_from_metadata(None),
             DEFAULT_RETAIN_IMAGE_ROUNDS
         );
+    }
+
+    #[test]
+    fn test_parse_base64_data_uri_rejects_non_data_or_empty_segments() {
+        let parsed = parse_base64_data_uri("data:image/png;base64,Zm9v").unwrap();
+        assert_eq!(parsed.media_type, "image/png");
+        assert_eq!(parsed.data, "Zm9v");
+
+        assert!(parse_base64_data_uri("https://example.com/image.png").is_none());
+        assert!(parse_base64_data_uri("data:image/png,Zm9v").is_none());
+        assert!(parse_base64_data_uri("data:;base64,Zm9v").is_none());
+        assert!(parse_base64_data_uri("data:image/png;base64,").is_none());
     }
 
     #[test]

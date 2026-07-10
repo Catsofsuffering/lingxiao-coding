@@ -1,6 +1,6 @@
 use crate::process::{configure_command_for_process_tree, kill_child_tree, ProcessRegistry};
 use serde_json::{json, Value};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
@@ -235,11 +235,6 @@ fn wait_child(
             })
         }
     }
-}
-
-#[allow(dead_code)]
-fn pathbuf(path: impl Into<PathBuf>) -> PathBuf {
-    path.into()
 }
 
 #[cfg(test)]

@@ -7,9 +7,9 @@ use anthropic_sdk::{
 use futures::StreamExt;
 use futures_util::StreamExt as FuturesStreamExt;
 use lingxiao_llm_host_protocol::{
-    message_rehydrates_blob_at, rehydrate_image_blob_ref_if, retain_rounds_from_metadata,
-    AuthContext, FinishReason, GenerateRequest, Message, MessageContentPart, ProviderError,
-    ProviderErrorCode, StreamEvent, TokenUsage,
+    message_rehydrates_blob_at, parse_base64_data_uri, rehydrate_image_blob_ref_if,
+    retain_rounds_from_metadata, AuthContext, FinishReason, GenerateRequest, Message,
+    MessageContentPart, ProviderError, ProviderErrorCode, StreamEvent, TokenUsage,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
@@ -609,15 +609,11 @@ fn anthropic_user_message_content(message: &Message, rehydrate: bool) -> Message
 /// block. Returns `None` for any non-data URI so callers can degrade to a text
 /// marker. Mirrors TS `parseDataUrl`.
 fn anthropic_image_block_from_url(url: &str) -> Option<ContentBlockParam> {
-    let rest = url.strip_prefix("data:")?;
-    let (media_type, data) = rest.split_once(";base64,")?;
-    if media_type.is_empty() || data.is_empty() {
-        return None;
-    }
+    let data_uri = parse_base64_data_uri(url)?;
     Some(ContentBlockParam::Image {
         source: ImageSource::Base64 {
-            media_type: media_type.to_string(),
-            data: data.to_string(),
+            media_type: data_uri.media_type.to_string(),
+            data: data_uri.data.to_string(),
         },
     })
 }

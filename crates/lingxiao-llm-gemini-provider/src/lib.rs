@@ -6,9 +6,10 @@ use gemini_rust::{
     Role as GeminiRole,
 };
 use lingxiao_llm_host_protocol::{
-    message_rehydrates_blob_at, rehydrate_image_blob_ref_if, retain_rounds_from_metadata,
-    AuthContext, FinishReason, GenerateRequest, Message, MessageContentPart, ProviderError,
-    ProviderErrorCode, StreamEvent, TokenUsage, ToolCall, ToolCallDelta,
+    message_rehydrates_blob_at, parse_base64_data_uri, rehydrate_image_blob_ref_if,
+    retain_rounds_from_metadata, AuthContext, FinishReason, GenerateRequest, Message,
+    MessageContentPart, ProviderError, ProviderErrorCode, StreamEvent, TokenUsage, ToolCall,
+    ToolCallDelta,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -288,12 +289,8 @@ fn text_part(text: String) -> GeminiPart {
 /// a Gemini `inlineData` part. Returns `None` for any non-data URI so callers
 /// can degrade to a text marker. Mirrors TS `parseDataUrl`.
 fn gemini_inline_data_from_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (mime_type, data) = rest.split_once(";base64,")?;
-    if mime_type.is_empty() || data.is_empty() {
-        return None;
-    }
-    Some((mime_type.to_string(), data.to_string()))
+    let data_uri = parse_base64_data_uri(url)?;
+    Some((data_uri.media_type.to_string(), data_uri.data.to_string()))
 }
 
 fn response_to_stream_events(response: GenerationResponse) -> Vec<StreamEvent> {

@@ -2,7 +2,7 @@ use crate::process::{configure_command_for_process_tree, kill_child_tree, Proces
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -278,11 +278,6 @@ fn contains_terminal_escape(input: &str) -> bool {
     input
         .chars()
         .any(|ch| matches!(ch, '\u{001b}' | '\u{009b}'))
-}
-
-#[allow(dead_code)]
-fn default_cwd() -> &'static Path {
-    Path::new(".")
 }
 
 #[cfg(test)]

@@ -5,9 +5,10 @@ use aws_sdk_bedrockruntime::{Client, Config};
 use aws_smithy_types::retry::RetryConfig;
 use aws_smithy_types::Blob;
 use lingxiao_llm_host_protocol::{
-    message_rehydrates_blob_at, rehydrate_image_blob_ref_if, retain_rounds_from_metadata,
-    AuthContext, FinishReason, GenerateRequest, Message, MessageContentPart, ProviderError,
-    ProviderErrorCode, StreamEvent, TokenUsage, ToolCall, ToolCallDelta,
+    message_rehydrates_blob_at, parse_base64_data_uri, rehydrate_image_blob_ref_if,
+    retain_rounds_from_metadata, AuthContext, FinishReason, GenerateRequest, Message,
+    MessageContentPart, ProviderError, ProviderErrorCode, StreamEvent, TokenUsage, ToolCall,
+    ToolCallDelta,
 };
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -437,15 +438,11 @@ fn bedrock_user_content(message: &Message, rehydrate: bool) -> Vec<Value> {
 /// non-data URI so callers can degrade to a text marker. Mirrors the
 /// OpenAI/Anthropic/Gemini `parseDataUrl` helpers.
 fn bedrock_image_source_from_url(url: &str) -> Option<Value> {
-    let rest = url.strip_prefix("data:")?;
-    let (media_type, data) = rest.split_once(";base64,")?;
-    if media_type.is_empty() || data.is_empty() {
-        return None;
-    }
+    let data_uri = parse_base64_data_uri(url)?;
     Some(json!({
         "type": "base64",
-        "media_type": media_type,
-        "data": data,
+        "media_type": data_uri.media_type,
+        "data": data_uri.data,
     }))
 }
 
