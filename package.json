@@ -91,7 +91,7 @@
     "@ast-grep/lang-rust": "^0.0.7",
     "@ast-grep/napi": "^0.42.2",
     "@fastify/cors": "^11.2.0",
-    "@fastify/static": "^9.1.1",
+    "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@langfuse/client": "^5.5.3",
     "@langfuse/otel": "^5.5.3",
