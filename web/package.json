@@ -18,7 +18,7 @@
     "dompurify": "^3.4.2",
     "i18next": "^24.0.0",
     "lucide-react": "^0.470.0",
-    "mermaid": "^11.14.0",
+    "mermaid": "^11.16.1",
     "pixi.js": "^8.19.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
