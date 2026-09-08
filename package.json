@@ -77,10 +77,10 @@
     "typescript": "^6.0.2"
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "^3.0.101",
-    "@ai-sdk/anthropic": "^2.0.81",
-    "@ai-sdk/google": "^2.0.74",
-    "@ai-sdk/openai": "^2.0.106",
+    "@ai-sdk/amazon-bedrock": "^3.0.129",
+    "@ai-sdk/anthropic": "^2.0.101",
+    "@ai-sdk/google": "^2.0.96",
+    "@ai-sdk/openai": "^2.0.125",
     "@anthropic-ai/sdk": "^0.82.0",
     "@ast-grep/lang-c": "^0.0.6",
     "@ast-grep/lang-cpp": "^0.0.6",
@@ -105,7 +105,7 @@
     "@slidev/cli": "^52.15.2",
     "@xterm/headless": "5.5.0",
     "acorn": "^8.16.0",
-    "ai": "^5.0.198",
+    "ai": "^5.0.253",
     "chalk": "^5.6.2",
     "chokidar": "^5.0.0",
     "commander": "^14.0.3",
